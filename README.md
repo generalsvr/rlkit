@@ -59,3 +59,7 @@ Notes:
 - Config example: `freqtrade_userdir/config.example.json`
 - Set `RL_MODEL_PATH` env var to override default model path.
 
+
+# Download and install TA-Lib C library
+
+apt update && apt install build-essential wget && cd /tmp && wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && tar -xzf ta-lib-0.4.0-src.tar.gz && cd ta-lib/ && ./configure --prefix=/usr && make && make install && ldconfig

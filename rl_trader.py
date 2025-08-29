@@ -96,7 +96,8 @@ def backtest(
             "stake_amount": "unlimited",
             "dry_run": True,
             "max_open_trades": 1,
-            "trading_mode": "spot"
+            "trading_mode": "spot",
+            "dataformat_ohlcv": "parquet"
         }
         os.makedirs(userdir, exist_ok=True)
         with open(config_path, "w") as f:
@@ -109,8 +110,6 @@ def backtest(
         "--timeframe", timeframe,
         "--pairs", pair,
         "--timerange", timerange,
-        "--stake-currency", "USDT",
-        "--stake-amount", "unlimited",
     ]
     typer.echo(f"Running: {' '.join(cmd)}")
     subprocess.run(cmd, check=True, env=env)

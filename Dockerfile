@@ -26,5 +26,3 @@ COPY . /app
 
 # Default command shows CLI help
 CMD ["python", "rl_trader.py", "--help"]
-
-
