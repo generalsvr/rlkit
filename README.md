@@ -63,3 +63,16 @@ Notes:
 # Download and install TA-Lib C library
 
 apt update && apt install build-essential wget && cd /tmp && wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && tar -xzf ta-lib-0.4.0-src.tar.gz && cd ta-lib/ && ./configure --prefix=/usr && make && make install && ldconfig
+
+
+export RL_MODEL_PATH=/workspace/rlkit/models/rl_ppo.zip
+export RL_WINDOW=128
+
+freqtrade backtesting \
+  --userdir /workspace/rlkit/freqtrade_userdir \
+  --config /workspace/rlkit/freqtrade_userdir/config.json \
+  --strategy RLStrategy \
+  --timeframe 1h \
+  --pairs BTC/USDT \
+  --timerange 20240101- \
+  --data-format-ohlcv parquet | cat

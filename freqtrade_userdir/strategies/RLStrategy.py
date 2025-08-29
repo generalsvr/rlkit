@@ -23,7 +23,7 @@ class RLStrategy(IStrategy):
     use_exit_signal = True
 
     # Disable TA; RL decides
-    process_only_new_candles = False
+    process_only_new_candles = True
     startup_candle_count = 128
 
     def __init__(self, config: dict) -> None:
@@ -34,26 +34,20 @@ class RLStrategy(IStrategy):
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         try:
             enriched = compute_rl_signals(dataframe, self.model_path, window=self.window)
-            dataframe["rl_buy"] = enriched["rl_buy"].values
-            dataframe["rl_sell"] = enriched["rl_sell"].values
+            dataframe["enter_long"] = enriched["enter_long"].values
+            dataframe["exit_long"] = enriched["exit_long"].values
         except Exception:
             # On failure default to no-op
-            dataframe["rl_buy"] = 0
-            dataframe["rl_sell"] = 0
+            dataframe["enter_long"] = 0
+            dataframe["exit_long"] = 0
         return dataframe
 
     def populate_buy_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        # legacy fields
-        dataframe.loc[:, 'buy'] = (dataframe['rl_buy'] == 1).astype('int')
-        # new fields
-        dataframe.loc[:, 'enter_long'] = (dataframe['rl_buy'] == 1).astype('int')
+        dataframe.loc[:, 'enter_long'] = (dataframe['enter_long'] == 1).astype('int')
         return dataframe
 
     def populate_sell_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
-        # legacy fields
-        dataframe.loc[:, 'sell'] = (dataframe['rl_sell'] == 1).astype('int')
-        # new fields
-        dataframe.loc[:, 'exit_long'] = (dataframe['rl_sell'] == 1).astype('int')
+        dataframe.loc[:, 'exit_long'] = (dataframe['exit_long'] == 1).astype('int')
         return dataframe
 
 

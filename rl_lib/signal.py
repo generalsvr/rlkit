@@ -27,11 +27,30 @@ def compute_rl_signals(df: pd.DataFrame, model_path: str, window: int = 128) -> 
         a, _ = model.predict(obs, deterministic=True)
         actions[t] = int(a[0])
 
+    # Derive stateful enter/exit for spot-only trading
+    enter_long = np.zeros(n, dtype=int)
+    exit_long = np.zeros(n, dtype=int)
+    position = 0
+    for t in range(window, n):
+        act = actions[t]
+        if position == 0:
+            if act == 1:  # take_long
+                enter_long[t] = 1
+                position = 1
+        elif position == 1:
+            if act == 3:  # close_position
+                exit_long[t] = 1
+                position = 0
+            # ignore take_short (act==2) in spot mode
+
     out = feats.copy()
-    # Map actions to buy/sell for spot-only trading
     out["rl_action"] = actions
-    out["rl_buy"] = (actions == 1).astype(int)
-    out["rl_sell"] = ((actions == 2) | (actions == 3)).astype(int)
+    # Backward-compatible columns
+    out["rl_buy"] = enter_long
+    out["rl_sell"] = exit_long
+    # Preferred modern interface for Freqtrade
+    out["enter_long"] = enter_long
+    out["exit_long"] = exit_long
     return out
 
 
