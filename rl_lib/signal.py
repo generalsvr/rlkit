@@ -14,25 +14,46 @@ def compute_rl_signals(df: pd.DataFrame, model_path: str, window: int = 128) -> 
 
     model = PPO.load(model_path, device="cpu")
 
+    # Optional: load VecNormalize stats for observation normalization
+    obs_mean = None
+    obs_var = None
+    clip_obs = 10.0
+    stats_path = os.path.join(os.path.dirname(model_path), "vecnormalize.pkl")
+    if os.path.exists(stats_path):
+        try:
+            import cloudpickle  # type: ignore
+            with open(stats_path, "rb") as f:
+                vec = cloudpickle.load(f)
+            # Expecting a VecNormalize instance
+            if hasattr(vec, "obs_rms") and hasattr(vec.obs_rms, "mean") and hasattr(vec.obs_rms, "var"):
+                obs_mean = np.asarray(vec.obs_rms.mean, dtype=np.float32)
+                obs_var = np.asarray(vec.obs_rms.var, dtype=np.float32)
+                clip_obs = float(getattr(vec, "clip_obs", 10.0))
+        except Exception:
+            pass
+
+    def _apply_norm(obs: np.ndarray) -> np.ndarray:
+        if obs_mean is None or obs_var is None:
+            return obs
+        return np.clip((obs - obs_mean) / (np.sqrt(obs_var + 1e-8)), -clip_obs, clip_obs)
+
     feats = make_features(df)
     feats = feats.reset_index(drop=True)
     n = len(feats)
     actions = np.zeros(n, dtype=int)
 
-    # Rolling inference, causal
-    for t in range(window, n):
-        window_slice = feats.iloc[t - window:t].values.astype(np.float32)
-        pos_feat = np.zeros((window, 1), dtype=np.float32)
-        obs = np.concatenate([window_slice, pos_feat], axis=1).reshape(1, -1)
-        a, _ = model.predict(obs, deterministic=True)
-        actions[t] = int(a[0])
-
-    # Derive stateful enter/exit for spot-only trading
+    # Rolling inference, causal, with position fed back into observation
+    position = 0
     enter_long = np.zeros(n, dtype=int)
     exit_long = np.zeros(n, dtype=int)
-    position = 0
     for t in range(window, n):
-        act = actions[t]
+        window_slice = feats.iloc[t - window:t].values.astype(np.float32)
+        pos_feat = np.full((window, 1), float(position), dtype=np.float32)
+        obs = np.concatenate([window_slice, pos_feat], axis=1).reshape(1, -1)
+        obs = _apply_norm(obs)
+        a, _ = model.predict(obs, deterministic=True)
+        act = int(a[0])
+        actions[t] = act
         if position == 0:
             if act == 1:  # take_long
                 enter_long[t] = 1
@@ -41,7 +62,7 @@ def compute_rl_signals(df: pd.DataFrame, model_path: str, window: int = 128) -> 
             if act == 3:  # close_position
                 exit_long[t] = 1
                 position = 0
-            # ignore take_short (act==2) in spot mode
+        # ignore take_short in spot mode
 
     out = feats.copy()
     out["rl_action"] = actions
