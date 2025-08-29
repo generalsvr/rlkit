@@ -16,7 +16,8 @@ except Exception:
 
 class RLStrategy(IStrategy):
     timeframe = '1h'
-    minimal_roi = {"0": 0}
+    # Disable ROI-based exits so RL controls exits exclusively
+    minimal_roi = {"0": 1000}
     stoploss = -0.99
     trailing_stop = False
     use_custom_stoploss = False
