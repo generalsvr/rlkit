@@ -1,0 +1,22 @@
+{
+  "timeframe": "1h",
+  "user_data_dir": "freqtrade_userdir",
+  "strategy": "RLStrategy",
+  "stake_currency": "USDT",
+  "stake_amount": "unlimited",
+  "dry_run": true,
+  "max_open_trades": 1,
+  "trading_mode": "spot",
+  "dataformat_ohlcv": "feather",
+  "entry_pricing": { "price_side": "bid", "use_order_book": false },
+  "exit_pricing":  { "price_side": "ask", "use_order_book": false },
+  "pairlists": [
+    { "method": "StaticPairList" }
+  ],
+  "exchange": {
+    "name": "binance",
+    "key": "",
+    "secret": "",
+    "pair_whitelist": ["BTC/USDT"]
+  }
+}

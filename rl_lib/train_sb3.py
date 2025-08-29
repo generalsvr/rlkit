@@ -1,0 +1,160 @@
+from __future__ import annotations
+
+import os
+import glob
+from dataclasses import dataclass
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+from stable_baselines3 import PPO
+from sb3_contrib import RecurrentPPO
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.callbacks import EvalCallback
+
+from .features import make_features
+from .transformer_extractor import TransformerExtractor
+from .env import FTTradingEnv, TradingConfig
+
+
+def _find_data_file(userdir: str, pair: str, timeframe: str) -> Optional[str]:
+    safe_pair = pair.replace("/", "_")
+    for ext in ("parquet", "feather"):
+        pattern = os.path.join(userdir, "data", "**", f"{safe_pair}-{timeframe}.{ext}")
+        hits = glob.glob(pattern, recursive=True)
+        if hits:
+            return hits[0]
+    return None
+
+
+def _load_ohlcv(path: str) -> pd.DataFrame:
+    if path.endswith(".feather"):
+        df = pd.read_feather(path)
+    else:
+        df = pd.read_parquet(path)
+    # Normalize columns
+    cols = {c.lower(): c for c in df.columns}
+    # Freqtrade parquet typically contains: date, open, high, low, close, volume
+    time_col = cols.get("date") or cols.get("time") or cols.get("datetime")
+    if time_col is not None:
+        df[time_col] = pd.to_datetime(df[time_col])
+        df = df.sort_values(time_col).set_index(time_col)
+    return df
+
+
+@dataclass
+class TrainParams:
+    userdir: str
+    pair: str
+    timeframe: str = "1h"
+    window: int = 128
+    total_timesteps: int = 200_000
+    seed: int = 42
+    model_out_path: str = "models/rl_ppo.zip"
+    fee_bps: float = 1.0
+    slippage_bps: float = 2.0
+    reward_scale: float = 1.0
+    pnl_on_close: bool = False
+    arch: str = "mlp"  # mlp | lstm | transformer
+
+
+def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
+    os.makedirs(os.path.dirname(params.model_out_path), exist_ok=True)
+
+    data_path = _find_data_file(params.userdir, params.pair, params.timeframe)
+    if not data_path:
+        raise FileNotFoundError(
+            f"No parquet found for {params.pair} {params.timeframe} under {params.userdir}/data. "
+            f"Run data download first."
+        )
+    raw = _load_ohlcv(data_path)
+    feats = make_features(raw)
+
+    # Simple split: 80/20 by time
+    n = len(feats)
+    cut = int(n * 0.8)
+    train_df = feats.iloc[:cut].copy()
+    eval_df = feats.iloc[cut - max(params.window, 1):].copy()  # include context
+
+    tcfg = TradingConfig(
+        window=params.window,
+        fee_bps=params.fee_bps,
+        slippage_bps=params.slippage_bps,
+        reward_scale=params.reward_scale,
+        pnl_on_close=params.pnl_on_close,
+    )
+
+    def make_train():
+        return FTTradingEnv(train_df, tcfg)
+
+    def make_eval():
+        return FTTradingEnv(eval_df, tcfg)
+
+    env = DummyVecEnv([make_train])
+    eval_env = DummyVecEnv([make_eval])
+
+    arch = params.arch.lower()
+    if arch == "lstm":
+        model = RecurrentPPO(
+            policy="MlpLstmPolicy",
+            env=env,
+            verbose=1,
+            seed=params.seed,
+            n_steps=1024,
+            batch_size=256,
+            learning_rate=3e-4,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            n_epochs=10,
+            policy_kwargs=dict(lstm_hidden_size=128, net_arch=[128]),
+        )
+    elif arch == "transformer":
+        model = PPO(
+            policy="MlpPolicy",
+            env=env,
+            verbose=1,
+            seed=params.seed,
+            n_steps=2048,
+            batch_size=256,
+            learning_rate=3e-4,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            n_epochs=10,
+            policy_kwargs=dict(
+                net_arch=[],
+                features_extractor_class=TransformerExtractor,
+                features_extractor_kwargs=dict(window=params.window, d_model=96, nhead=4, num_layers=2, ff_dim=192),
+            ),
+        )
+    else:
+        model = PPO(
+            policy="MlpPolicy",
+            env=env,
+            verbose=1,
+            seed=params.seed,
+            n_steps=2048,
+            batch_size=256,
+            learning_rate=3e-4,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            n_epochs=10,
+            policy_kwargs=dict(net_arch=[128, 128]),
+        )
+
+    eval_cb = EvalCallback(
+        eval_env,
+        best_model_save_path=os.path.dirname(params.model_out_path),
+        log_path=os.path.dirname(params.model_out_path),
+        eval_freq=10_000,
+        deterministic=True,
+        render=False,
+    )
+
+    model.learn(total_timesteps=int(params.total_timesteps), callback=eval_cb, progress_bar=True)
+    model.save(params.model_out_path)
+    return params.model_out_path
+
+

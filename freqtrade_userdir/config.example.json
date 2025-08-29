@@ -1,0 +1,19 @@
+{
+  "max_open_trades": 1,
+  "stake_currency": "USDT",
+  "stake_amount": "unlimited",
+  "dry_run": true,
+  "timeframe": "1h",
+  "exchange": {
+    "name": "binance",
+    "key": "",
+    "secret": "",
+    "ccxt_config": {},
+    "ccxt_async_config": {},
+    "pair_whitelist": ["BTC/USDT"],
+    "pair_blacklist": []
+  },
+  "user_data_dir": "freqtrade_userdir",
+  "strategy": "RLStrategy"
+}
+
