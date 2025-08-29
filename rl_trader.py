@@ -96,7 +96,8 @@ def backtest(
             "stake_amount": "unlimited",
             "dry_run": True,
             "max_open_trades": 1,
-            "trading_mode": "spot",
+            "trading_mode": "futures",
+            "margin_mode": "isolated",
             "dataformat_ohlcv": "parquet"
         }
         os.makedirs(userdir, exist_ok=True)

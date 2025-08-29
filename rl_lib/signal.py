@@ -46,6 +46,8 @@ def compute_rl_signals(df: pd.DataFrame, model_path: str, window: int = 128) -> 
     position = 0
     enter_long = np.zeros(n, dtype=int)
     exit_long = np.zeros(n, dtype=int)
+    enter_short = np.zeros(n, dtype=int)
+    exit_short = np.zeros(n, dtype=int)
     for t in range(window, n):
         window_slice = feats.iloc[t - window:t].values.astype(np.float32)
         pos_feat = np.full((window, 1), float(position), dtype=np.float32)
@@ -58,20 +60,28 @@ def compute_rl_signals(df: pd.DataFrame, model_path: str, window: int = 128) -> 
             if act == 1:  # take_long
                 enter_long[t] = 1
                 position = 1
+            elif act == 2:  # take_short
+                enter_short[t] = 1
+                position = -1
         elif position == 1:
             if act == 3:  # close_position
                 exit_long[t] = 1
                 position = 0
-        # ignore take_short in spot mode
+        elif position == -1:
+            if act == 3:  # close_position
+                exit_short[t] = 1
+                position = 0
 
     out = feats.copy()
     out["rl_action"] = actions
     # Backward-compatible columns
     out["rl_buy"] = enter_long
-    out["rl_sell"] = exit_long
+    out["rl_sell"] = (exit_long + exit_short).clip(0, 1)
     # Preferred modern interface for Freqtrade
     out["enter_long"] = enter_long
     out["exit_long"] = exit_long
+    out["enter_short"] = enter_short
+    out["exit_short"] = exit_short
     return out
 
 

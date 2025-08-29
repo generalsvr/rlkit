@@ -131,6 +131,26 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
                 features_extractor_kwargs=dict(window=params.window, d_model=96, nhead=4, num_layers=2, ff_dim=192),
             ),
         )
+    elif arch == "transformer_big":
+        model = PPO(
+            policy="MlpPolicy",
+            env=env,
+            verbose=1,
+            seed=params.seed,
+            n_steps=1024,
+            batch_size=128,
+            learning_rate=1e-4,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            n_epochs=10,
+            ent_coef=0.02,
+            policy_kwargs=dict(
+                net_arch=[],
+                features_extractor_class=TransformerExtractor,
+                features_extractor_kwargs=dict(window=params.window, d_model=192, nhead=8, num_layers=4, ff_dim=768),
+            ),
+        )
     else:
         model = PPO(
             policy="MlpPolicy",
