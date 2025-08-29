@@ -124,6 +124,7 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
             gae_lambda=0.95,
             clip_range=0.2,
             n_epochs=10,
+            ent_coef=0.02,
             policy_kwargs=dict(
                 net_arch=[],
                 features_extractor_class=TransformerExtractor,
