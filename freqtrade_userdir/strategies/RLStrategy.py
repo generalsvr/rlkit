@@ -58,4 +58,15 @@ class RLStrategy(IStrategy):
         dataframe.loc[:, 'exit_short'] = (dataframe['exit_short'] == 1).astype('int')
         return dataframe
 
+    # New unified API in newer Freqtrade versions
+    def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        dataframe.loc[:, 'enter_long'] = (dataframe.get('enter_long', 0) == 1).astype('int')
+        dataframe.loc[:, 'enter_short'] = (dataframe.get('enter_short', 0) == 1).astype('int')
+        return dataframe
+
+    def populate_exit_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        dataframe.loc[:, 'exit_long'] = (dataframe.get('exit_long', 0) == 1).astype('int')
+        dataframe.loc[:, 'exit_short'] = (dataframe.get('exit_short', 0) == 1).astype('int')
+        return dataframe
+
 
