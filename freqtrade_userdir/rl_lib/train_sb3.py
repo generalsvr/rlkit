@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from stable_baselines3 import PPO
 from sb3_contrib import RecurrentPPO
-from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import EvalCallback
 
 from .features import make_features
@@ -91,7 +91,9 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
         return FTTradingEnv(eval_df, tcfg)
 
     env = DummyVecEnv([make_train])
+    env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0)
     eval_env = DummyVecEnv([make_eval])
+    eval_env = VecNormalize(eval_env, training=False, norm_obs=True, norm_reward=False, clip_obs=10.0)
 
     arch = params.arch.lower()
     if arch == "lstm":
@@ -153,8 +155,16 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
         render=False,
     )
 
+    # Sync eval normalization stats with training env
+    if isinstance(env, VecNormalize) and isinstance(eval_env, VecNormalize):
+        eval_env.obs_rms = env.obs_rms
+
     model.learn(total_timesteps=int(params.total_timesteps), callback=eval_cb, progress_bar=True)
     model.save(params.model_out_path)
+    # Save normalization statistics alongside the model
+    if isinstance(env, VecNormalize):
+        stats_path = os.path.join(os.path.dirname(params.model_out_path), "vecnormalize.pkl")
+        env.save(stats_path)
     return params.model_out_path
 
 

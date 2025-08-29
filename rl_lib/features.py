@@ -60,6 +60,9 @@ def make_features(df: pd.DataFrame, feature_columns: List[str] | None = None) ->
         "vol_z": vol_z,
     }, index=base.index)
 
+    # Sanitize any residual NaN/Inf from source data
+    feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
     if feature_columns is not None:
         missing = [c for c in feature_columns if c not in feats.columns]
         if missing:

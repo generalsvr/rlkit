@@ -24,22 +24,28 @@ class TransformerExtractor(BaseFeaturesExtractor):
         super().__init__(observation_space, features_dim=d_model)
 
         self.inp = nn.Linear(self.feature_dim, d_model)
+        self.in_norm = nn.LayerNorm(d_model)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, nhead=nhead, dim_feedforward=ff_dim, dropout=dropout, batch_first=True, activation="gelu"
         )
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         self.pos = PositionalEncoding(d_model)
+        self.out_norm = nn.LayerNorm(d_model)
 
     def forward(self, observations: torch.Tensor) -> torch.Tensor:
         # observations: (B, window*features)
         b, d = observations.shape
         x = observations.view(b, self.window, self.feature_dim)
+        x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
         h = self.inp(x)
+        h = self.in_norm(h)
         h = self.pos(h)
         T = h.size(1)
         mask = torch.triu(torch.ones(T, T, device=h.device), diagonal=1).bool()
         z = self.encoder(h, mask=mask)
         last = z[:, -1, :]
+        last = self.out_norm(last)
+        last = torch.nan_to_num(last, nan=0.0, posinf=1e6, neginf=-1e6)
         return last
 
 

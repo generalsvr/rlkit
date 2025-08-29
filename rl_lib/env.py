@@ -63,6 +63,8 @@ class FTTradingEnv(gym.Env):
 
     def _obs(self):
         w = self.df.iloc[self.ptr - self.cfg.window:self.ptr][self.feature_cols].values.astype(np.float32)
+        # Replace NaN/Inf values defensively to avoid propagating invalid tensors
+        w = np.nan_to_num(w, nan=0.0, posinf=1e6, neginf=-1e6)
         pos = np.full((self.cfg.window, 1), float(self.position), dtype=np.float32)
         x = np.concatenate([w, pos], axis=1).astype(np.float32)
         return x.reshape(-1)
@@ -103,7 +105,7 @@ class FTTradingEnv(gym.Env):
         reward = 0.0
         if not self.cfg.pnl_on_close and not self.done:
             new_price = float(self.close[self.ptr - 1])
-            r = (new_price - prev_price) / prev_price
+            r = (new_price - prev_price) / (prev_price + 1e-12)
             if self.position == +1:
                 reward = r
                 self.equity *= (1.0 + r)
