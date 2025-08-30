@@ -12,12 +12,20 @@ echo "[+] Repo root: $ROOT_DIR"
 kill_port() {
   local PORT="$1"
   local PIDS
+  # Try lsof
   PIDS="$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+  # Fallback to ss if lsof not available
+  if [ -z "$PIDS" ] && command -v ss >/dev/null 2>&1; then
+    PIDS="$(ss -lntp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p {print $7}' | sed 's/\(^pid=\)\?\([0-9]\+\).*/\2/' | tr '\n' ' ')"
+  fi
   if [ -n "$PIDS" ]; then
     echo "[i] Freeing port :$PORT (pids: $PIDS)"
     kill $PIDS 2>/dev/null || true
     sleep 0.3
     PIDS="$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+    if [ -z "$PIDS" ] && command -v ss >/dev/null 2>&1; then
+      PIDS="$(ss -lntp 2>/dev/null | awk -v p=":$PORT" '$4 ~ p {print $7}' | sed 's/\(^pid=\)\?\([0-9]\+\).*/\2/' | tr '\n' ' ')"
+    fi
     if [ -n "$PIDS" ]; then
       kill -9 $PIDS 2>/dev/null || true
     fi
@@ -71,9 +79,21 @@ echo "[+] Starting frontend (Next.js) on :8501"
   fi
   # Ensure port is free, and kill prior saved PID if any
   [ -f .next.pid ] && kill "$(cat .next.pid)" 2>/dev/null || true
+  # Kill any lingering Next processes for this app path
+  pkill -f "next dev" 2>/dev/null || true
+  pkill -f "next start" 2>/dev/null || true
+  pkill -f "node .*backtest_terminal" 2>/dev/null || true
   kill_port 8501
-  npm install --silent >/dev/null 2>&1 || true
-  npm run build --silent >/dev/null 2>&1 || true
+  # Install deps (fail if install fails)
+  if ! npm install --silent >/dev/null 2>&1; then
+    echo "[!] npm install failed" >&2
+    exit 1
+  fi
+  # Build production assets (do not suppress errors)
+  if ! npm run build --silent; then
+    echo "[!] npm run build failed" >&2
+    exit 1
+  fi
   PORT=8501 npm run start --silent &
   echo $! > "$FRONT_DIR/.next.pid"
 )
@@ -92,6 +112,7 @@ echo "[+] Starting backend (FastAPI) on :8080 (this may take a minute on first r
   export RL_DEVICE="${RL_DEVICE:-cpu}"
   # Ensure port is free, and kill prior saved PID if any
   [ -f .uvicorn.pid ] && kill "$(cat .uvicorn.pid)" 2>/dev/null || true
+  pkill -f "uvicorn .*:8080" 2>/dev/null || true
   kill_port 8080
   uvicorn main:app --host 0.0.0.0 --port 8080 --reload &
   echo $! > "$BACK_DIR/.uvicorn.pid"
