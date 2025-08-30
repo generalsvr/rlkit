@@ -10,7 +10,8 @@ import pandas as pd
 from stable_baselines3 import PPO
 from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
-from stable_baselines3.common.callbacks import EvalCallback
+from stable_baselines3.common.callbacks import EvalCallback, BaseCallback, CallbackList
+from stable_baselines3.common.monitor import Monitor
 
 from .features import make_features
 from .transformer_extractor import TransformerExtractor, HybridLSTMTransformerExtractor
@@ -137,6 +138,26 @@ def _run_validation_rollout(model: PPO, eval_env: VecNormalize | DummyVecEnv, ma
     }
 
 
+class PnLEvalCallback(BaseCallback):
+    def __init__(self, eval_env: VecNormalize | DummyVecEnv, eval_freq: int, max_steps: int = 2000, deterministic: bool = True, verbose: int = 1):
+        super().__init__(verbose)
+        self.eval_env = eval_env
+        self.eval_freq = int(max(1, eval_freq))
+        self.max_steps = int(max_steps)
+        self.deterministic = bool(deterministic)
+
+    def _on_step(self) -> bool:
+        num = int(self.model.num_timesteps)
+        if num % self.eval_freq == 0:
+            report = _run_validation_rollout(self.model, self.eval_env, max_steps=self.max_steps, deterministic=self.deterministic)
+            final_eq = report.get("final_equity", float("nan"))
+            sharpe = report.get("sharpe", float("nan"))
+            self.logger.record("eval/final_equity", final_eq)
+            self.logger.record("eval/sharpe", sharpe)
+            if self.verbose:
+                print(f"EVAL_PNL: timesteps={num} final_equity={final_eq:.6f} sharpe={sharpe:.4f}")
+        return True
+
 
 def validate_trained_model(params: TrainParams, max_steps: int = 2000, deterministic: bool = True, timerange: Optional[str] = None) -> Dict[str, Any]:
     # Load data
@@ -208,7 +229,8 @@ def validate_trained_model(params: TrainParams, max_steps: int = 2000, determini
     )
 
     def make_eval():
-        return FTTradingEnv(eval_df, tcfg)
+        env = FTTradingEnv(eval_df, tcfg)
+        return Monitor(env)
 
     eval_env = DummyVecEnv([make_eval])
     eval_env = VecNormalize(eval_env, training=False, norm_obs=True, norm_reward=False, clip_obs=10.0)
@@ -264,6 +286,10 @@ class TrainParams:
     # Feature pipeline
     feature_mode: str = "full"  # full | basic
     basic_lookback: int = 64
+    # Evaluation
+    eval_freq: int = 100_000  # steps; <=0 disables eval
+    n_eval_episodes: int = 3
+    eval_max_steps: int = 2000
 
 
 
@@ -306,7 +332,8 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
         return FTTradingEnv(train_df, tcfg)
 
     def make_eval():
-        return FTTradingEnv(eval_df, tcfg)
+        env = FTTradingEnv(eval_df, tcfg)
+        return Monitor(env)
 
     env = DummyVecEnv([make_train])
     env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0)
@@ -419,20 +446,25 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
             policy_kwargs=dict(net_arch=[128, 128]),
         )
 
-    eval_cb = EvalCallback(
-        eval_env,
-        best_model_save_path=os.path.dirname(params.model_out_path),
-        log_path=os.path.dirname(params.model_out_path),
-        eval_freq=10_000,
-        deterministic=True,
-        render=False,
-    )
+    callbacks = []
+    if params.eval_freq and params.eval_freq > 0:
+        callbacks.append(EvalCallback(
+            eval_env,
+            best_model_save_path=os.path.dirname(params.model_out_path),
+            log_path=os.path.dirname(params.model_out_path),
+            eval_freq=params.eval_freq,
+            n_eval_episodes=int(params.n_eval_episodes),
+            deterministic=True,
+            render=False,
+        ))
+        callbacks.append(PnLEvalCallback(eval_env, eval_freq=params.eval_freq, max_steps=params.eval_max_steps, deterministic=True, verbose=1))
 
     # Sync eval normalization stats with training env
     if isinstance(env, VecNormalize) and isinstance(eval_env, VecNormalize):
         eval_env.obs_rms = env.obs_rms
 
-    model.learn(total_timesteps=int(params.total_timesteps), callback=eval_cb, progress_bar=True)
+    cb = CallbackList(callbacks) if callbacks else None
+    model.learn(total_timesteps=int(params.total_timesteps), callback=cb, progress_bar=True)
     model.save(params.model_out_path)
     # Persist training feature set for consistent inference
     try:
