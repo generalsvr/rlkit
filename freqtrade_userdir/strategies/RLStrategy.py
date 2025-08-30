@@ -1,5 +1,6 @@
 from freqtrade.strategy.interface import IStrategy
 from pandas import DataFrame
+from datetime import timedelta
 import os
 from pathlib import Path
 import logging
@@ -37,6 +38,19 @@ class RLStrategy(IStrategy):
         self.min_hold_bars = int(os.environ.get("RL_MIN_HOLD_BARS", "0"))
         self.cooldown_bars = int(os.environ.get("RL_COOLDOWN_BARS", "0"))
         self._cooldown_until = None
+        # Runtime gating state per pair
+        self._last_pos_change_time = {}
+        self._last_exit_time = {}
+        # Parse timeframe to bar duration
+        self._bar_seconds = 3600
+        try:
+            tf = str(getattr(self, 'timeframe', '1h')).lower()
+            if tf.endswith('h'):
+                self._bar_seconds = int(tf[:-1] or '1') * 3600
+            elif tf.endswith('d'):
+                self._bar_seconds = int(tf[:-1] or '1') * 86400
+        except Exception:
+            self._bar_seconds = 3600
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         try:
@@ -123,5 +137,50 @@ class RLStrategy(IStrategy):
             return float(max(0.0, proposed_stake * g))
         except Exception:
             return float(proposed_stake)
+
+    # Enforce min-hold and cooldown at execution time; prevent same-candle flip
+    def confirm_trade_entry(self, pair: str, order_type: str, amount: float, rate: float, time_in_force: str, current_time, **kwargs):
+        # Cooldown check
+        if self.cooldown_bars > 0 and self._cooldown_until is not None and current_time < self._cooldown_until:
+            return False, "Cooldown active"
+        # Min-hold check since last position change
+        last = self._last_pos_change_time.get(pair)
+        if self.min_hold_bars > 0 and last is not None:
+            min_dt = last + timedelta(seconds=self.min_hold_bars * self._bar_seconds)
+            if current_time < min_dt:
+                return False, "Min-hold not reached"
+        # Prevent immediate re-entry on the same candle after exit
+        lex = self._last_exit_time.get(pair)
+        if lex is not None and getattr(lex, 'ceil', None):
+            # Pandas Timestamp: treat same-bar as forbidden
+            if lex.floor(f"{self._bar_seconds}s") == getattr(current_time, 'floor', lambda x: current_time)(f"{self._bar_seconds}s"):
+                return False, "No same-bar flip"
+        # Record entry time as last position change moment
+        try:
+            self._last_pos_change_time[pair] = current_time
+        except Exception:
+            pass
+        return True, "OK"
+
+    def confirm_trade_exit(self, pair: str, trade, order_type: str, amount: float, rate: float, time_in_force: str, current_time, **kwargs):
+        # Min-hold before exit
+        last = self._last_pos_change_time.get(pair)
+        if self.min_hold_bars > 0 and last is not None:
+            min_dt = last + timedelta(seconds=self.min_hold_bars * self._bar_seconds)
+            if current_time < min_dt:
+                return False, "Min-hold not reached for exit"
+        # Record exit time and set cooldown window
+        try:
+            self._last_exit_time[pair] = current_time
+        except Exception:
+            pass
+        if self.cooldown_bars > 0:
+            try:
+                self._cooldown_until = current_time + timedelta(seconds=self.cooldown_bars * self._bar_seconds)
+            except Exception:
+                self._cooldown_until = None
+        # Update last position change time to current_time
+        self._last_pos_change_time[pair] = current_time
+        return True, "OK"
 
 
