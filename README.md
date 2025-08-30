@@ -7,72 +7,92 @@ pip install -r requirements.txt
 pip install freqtrade
 ```
 
-### Docker (official Freqtrade RL image)
-```bash
-# Pull image
-docker pull freqtradeorg/freqtrade:2025.7_freqairl
+### Futures Mode (USDT-M, offline OHLCV)
+- Strategy supports long/short via RL (`can_short=True`).
+- Backtesting uses local OHLCV parquet. No tickers/orderbooks needed.
 
-# Prepare userdir mapping
-mkdir -p freqtrade_userdir/models
-cp -R rl_lib freqtrade_userdir/
-
-# Download data to userdir
-docker run --rm -it \
-  -v "$PWD/freqtrade_userdir:/freqtrade/user_data" \
-  freqtradeorg/freqtrade:2025.7_freqairl \
-  download-data --userdir /freqtrade/user_data \
-  --exchange binance --pairs BTC/USDT --timeframes 1h --timerange 20140101-
-
-# Train locally (SB3) and save model to models/rl_ppo.zip
-python rl_trader.py train --pair BTC/USDT --timeframe 1h --window 128 --timesteps 200000 --arch mlp
-cp models/rl_ppo.zip freqtrade_userdir/models/
-
-# Backtest using the model inside the official container
-docker run --rm -it \
-  -v "$PWD/freqtrade_userdir:/freqtrade/user_data" \
-  -e RL_MODEL_PATH=/freqtrade/user_data/models/rl_ppo.zip \
-  freqtradeorg/freqtrade:2025.7_freqairl \
-  backtesting --userdir /freqtrade/user_data \
-  --config /freqtrade/user_data/config.json \
-  --strategy RLStrategy --timeframe 1h --pairs BTC/USDT \
-  --timerange 20240101-20250101
+Config (save to `freqtrade_userdir/config.json`):
+```json
+{
+  "timeframe": "1h",
+  "user_data_dir": "/workspace/rlkit/freqtrade_userdir",
+  "strategy": "RLStrategy",
+  "stake_currency": "USDT",
+  "stake_amount": "unlimited",
+  "dry_run": true,
+  "max_open_trades": 1,
+  "trading_mode": "futures",
+  "margin_mode": "isolated",
+  "dataformat_ohlcv": "parquet",
+  "entry_pricing": { "price_side": "same", "use_order_book": false },
+  "exit_pricing": { "price_side": "same", "use_order_book": false },
+  "pairlists": [ { "method": "StaticPairList" } ],
+  "exchange": {
+    "name": "bybit",
+    "key": "",
+    "secret": "",
+    "pair_whitelist": ["BTC/USDT:USDT"],
+    "use_exchange": false
+  }
+}
 ```
 
-### 1) Download data with Freqtrade
+- Alternative exchange names:
+  - Binance USDT-M: set `exchange.name` to `binanceusdm` and `pair_whitelist` to `"BTC/USDT"`. Ensure data path matches exchange folder.
+
+### 1) Download data
+Bybit (recommended for futures path):
 ```bash
-python rl_trader.py download --pair BTC/USDT --timeframe 1h --timerange 20190101-20240101 --exchange binance
+freqtrade download-data \
+  --exchange bybit \
+  --pairs "BTC/USDT:USDT" \
+  --timeframes 1h \
+  --userdir /workspace/rlkit/freqtrade_userdir \
+  --data-format-ohlcv parquet --erase --timerange 20190101- | cat
 ```
 
-### 2) Train PPO on downloaded data
+If you already have Binance parquet and want to reuse it for Bybit backtesting:
 ```bash
-python rl_trader.py train --pair BTC/USDT --timeframe 1h --window 128 --timesteps 200000
-```
-Model saved to `models/rl_ppo.zip`.
-
-### 3) Backtest in Freqtrade using RLStrategy
-```bash
-python rl_trader.py backtest --pair BTC/USDT --timeframe 1h --timerange 20220101-20240101
+mkdir -p /workspace/rlkit/freqtrade_userdir/data/bybit
+ln -sf /workspace/rlkit/freqtrade_userdir/data/binance/BTC_USDT-1h.parquet \
+      /workspace/rlkit/freqtrade_userdir/data/bybit/BTC_USDT_USDT-1h.parquet
 ```
 
-Notes:
-- Strategy: `freqtrade_userdir/strategies/RLStrategy.py`
-- Config example: `freqtrade_userdir/config.example.json`
-- Set `RL_MODEL_PATH` env var to override default model path.
+### 2) Train PPO
+Transformer (standard):
+```bash
+python rl_trader.py train --pair BTC/USDT --timeframe 1h --window 128 --timesteps 300000 --arch transformer
+```
+Transformer (bigger):
+```bash
+python rl_trader.py train --pair BTC/USDT --timeframe 1h --window 128 --timesteps 400000 --arch transformer_big
+```
 
-
-# Download and install TA-Lib C library
-
-apt update && apt install build-essential wget && cd /tmp && wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && tar -xzf ta-lib-0.4.0-src.tar.gz && cd ta-lib/ && ./configure --prefix=/usr && make && make install && ldconfig
-
-
+### 3) Backtest with RLStrategy
+```bash
 export RL_MODEL_PATH=/workspace/rlkit/models/rl_ppo.zip
 export RL_WINDOW=128
-
 freqtrade backtesting \
   --userdir /workspace/rlkit/freqtrade_userdir \
   --config /workspace/rlkit/freqtrade_userdir/config.json \
   --strategy RLStrategy \
   --timeframe 1h \
-  --pairs BTC/USDT \
-  --timerange 20240101- \
+  --pairs "BTC/USDT:USDT" \
+  --timerange 20240101-20250101 \
   --data-format-ohlcv parquet | cat
+```
+
+### Notes
+- Strategy file: `freqtrade_userdir/strategies/RLStrategy.py`
+- RL signals: `rl_lib/signal.py` produce `enter_long/exit_long/enter_short/exit_short` which map directly to Freqtrade’s unified API.
+- Normalization: `VecNormalize` stats saved to `models/vecnormalize.pkl` are used during inference.
+- Troubleshooting:
+  - "Ticker pricing not available": ensure `use_exchange=false` and `price_side="same"`.
+  - "No pair in whitelist": use correct pair symbol (`BTC/USDT:USDT` for Bybit futures), and ensure parquet exists under matching exchange folder.
+  - "No data found": re-run download with `--erase` or symlink data to the correct path.
+
+# Download and install TA-Lib C library
+
+apt update && apt install build-essential wget && cd /tmp && wget http://prdownloads.sourceforge.net/ta-lib/
+ta-lib-0.4.0-src.tar.gz && tar -xzf ta-lib-0.4.0-src.tar.gz && cd ta-lib/ && ./configure --prefix=/usr && 
+make && make install && ldconfig
