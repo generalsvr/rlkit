@@ -21,6 +21,21 @@ from .transformer_extractor import MultiScaleHTFExtractor  # type: ignore
 from .env import FTTradingEnv, TradingConfig
 
 
+def _tf_stride(tf: str) -> int:
+    """Return stride in base hours for timeframe strings like '4H', '1D'. Defaults to 1 on parse issues."""
+    s = str(tf).strip().upper()
+    try:
+        if s.endswith("H"):
+            n = int(s[:-1]) if s[:-1] else 1
+            return max(1, n)
+        if s.endswith("D"):
+            n = int(s[:-1]) if s[:-1] else 1
+            return max(1, n) * 24
+    except Exception:
+        return 1
+    return 1
+
+
 def _find_data_file(userdir: str, pair: str, timeframe: str, prefer_exchange: Optional[str] = None) -> Optional[str]:
     # Support multiple naming variants across exchanges (e.g., Bybit futures)
     base = pair.replace("/", "_")  # BTC_USDT or BTC_USDT:USDT
