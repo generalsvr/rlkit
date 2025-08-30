@@ -123,6 +123,8 @@ def validate(
     userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
     window: int = typer.Option(128),
     model_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "rl_ppo.zip")),
+    max_steps: int = typer.Option(1000),
+    deterministic: bool = typer.Option(True),
 ):
     """Run a quick validation rollout on eval split and print summary (actions, entries, equity)."""
     params = TrainParams(
@@ -132,7 +134,7 @@ def validate(
         window=window,
         model_out_path=model_path,
     )
-    _ = validate_trained_model(params)
+    _ = validate_trained_model(params, max_steps=max_steps, deterministic=deterministic)
 
 
 if __name__ == "__main__":

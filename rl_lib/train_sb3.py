@@ -79,7 +79,7 @@ def _load_ohlcv(path: str) -> pd.DataFrame:
     except Exception:
         pass
     return df
-def _run_validation_rollout(model: PPO, eval_env: VecNormalize | DummyVecEnv) -> Dict[str, Any]:
+def _run_validation_rollout(model: PPO, eval_env: VecNormalize | DummyVecEnv, max_steps: int = 2000, deterministic: bool = True) -> Dict[str, Any]:
     # Assumes single-env DummyVecEnv wrapped (VecNormalize optional)
     obs = eval_env.reset()
     done = False
@@ -91,7 +91,7 @@ def _run_validation_rollout(model: PPO, eval_env: VecNormalize | DummyVecEnv) ->
     equities = []
     steps = 0
     while True:
-        a, _ = model.predict(obs, deterministic=True)
+        a, _ = model.predict(obs, deterministic=deterministic)
         action = int(a[0] if isinstance(a, (list, np.ndarray)) else a)
         action_counts[action] = action_counts.get(action, 0) + 1
         obs, reward, dones, infos = eval_env.step([action])
@@ -119,7 +119,7 @@ def _run_validation_rollout(model: PPO, eval_env: VecNormalize | DummyVecEnv) ->
         else:
             if bool(dones):
                 break
-        if steps > 10_000_000:
+        if steps >= max_steps:
             break
 
     eq_series = np.asarray([e for e in equities if isinstance(e, (int, float)) and not np.isnan(e)], dtype=float)
@@ -141,7 +141,7 @@ def _run_validation_rollout(model: PPO, eval_env: VecNormalize | DummyVecEnv) ->
     }
 
 
-def validate_trained_model(params: TrainParams) -> Dict[str, Any]:
+def validate_trained_model(params: TrainParams, max_steps: int = 2000, deterministic: bool = True) -> Dict[str, Any]:
     # Load data
     data_path = _find_data_file(params.userdir, params.pair, params.timeframe)
     if not data_path:
@@ -179,7 +179,7 @@ def validate_trained_model(params: TrainParams) -> Dict[str, Any]:
             pass
 
     model = PPO.load(params.model_out_path, device="cpu")
-    report = _run_validation_rollout(model, eval_env)
+    report = _run_validation_rollout(model, eval_env, max_steps=max_steps, deterministic=deterministic)
     # Pretty print
     print("VALIDATION SUMMARY:")
     print(report)
@@ -363,7 +363,7 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
         env.save(stats_path)
     # Quick validation rollout on eval split
     try:
-        _ = _run_validation_rollout(model, eval_env)
+        _ = _run_validation_rollout(model, eval_env, max_steps=1000, deterministic=True)
     except Exception:
         pass
     return params.model_out_path
