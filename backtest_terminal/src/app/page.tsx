@@ -1,8 +1,7 @@
 "use client";
 
 import React from "react";
-import { createChart, ColorType, CrosshairMode } from "lightweight-charts";
-import type { IChartApi, ISeriesApi, UTCTimestamp, ChartOptions, DeepPartial } from "lightweight-charts";
+import type { IChartApi, UTCTimestamp } from "lightweight-charts";
 
 type Candle = [number, number, number, number, number, number];
 type Mark = { time: number; label: string; color: string };
@@ -14,7 +13,7 @@ function toUtc(tsMs: number): UTCTimestamp {
 export default function Home() {
   const containerRef = React.useRef<HTMLDivElement | null>(null);
   const chartRef = React.useRef<IChartApi | null>(null);
-  const seriesRef = React.useRef<ISeriesApi<"Candlestick"> | null>(null);
+  const seriesRef = React.useRef<any>(null);
   const [loading, setLoading] = React.useState(false);
   const [logs, setLogs] = React.useState<string[]>([]);
   const [pair, setPair] = React.useState("BTC/USDT:USDT");
@@ -36,19 +35,23 @@ export default function Home() {
     if (!containerRef.current || chartRef.current) return;
     let chart: IChartApi | null = null;
     let ro: ResizeObserver | null = null;
-    const options: DeepPartial<ChartOptions> = {
-      height: 560,
-      layout: { textColor: "#d1d5db", background: { type: ColorType.Solid, color: "#0b1220" } },
-      grid: { horzLines: { color: "#1f2937" }, vertLines: { color: "#1f2937" } },
-      timeScale: { rightOffset: 4, barSpacing: 8, lockVisibleTimeRangeOnResize: true },
-      crosshair: { mode: CrosshairMode.Magnet },
-    };
-    chart = createChart(containerRef.current as HTMLElement, options);
-    const series = (chart as unknown as { addCandlestickSeries: () => ISeriesApi<'Candlestick'> }).addCandlestickSeries();
-    chartRef.current = chart;
-    seriesRef.current = series;
-    ro = new ResizeObserver(() => chart!.applyOptions({ width: containerRef.current?.clientWidth || 800 }));
-    ro.observe(containerRef.current as Element);
+    import("lightweight-charts").then((LWC) => {
+      if (!containerRef.current) return;
+      const { createChart, ColorType, CrosshairMode } = LWC;
+      const options = {
+        height: 560,
+        layout: { textColor: "#d1d5db", background: { type: ColorType.Solid, color: "#0b1220" } },
+        grid: { horzLines: { color: "#1f2937" }, vertLines: { color: "#1f2937" } },
+        timeScale: { rightOffset: 4, barSpacing: 8, lockVisibleTimeRangeOnResize: true },
+        crosshair: { mode: CrosshairMode.Magnet },
+      };
+      chart = createChart(containerRef.current as HTMLElement, options);
+      const series = (chart as any).addCandlestickSeries();
+      chartRef.current = chart;
+      seriesRef.current = series;
+      ro = new ResizeObserver(() => chart!.applyOptions({ width: containerRef.current?.clientWidth || 800 }));
+      ro.observe(containerRef.current as Element);
+    }).catch(console.error);
     return () => {
       if (ro) ro.disconnect();
       chartRef.current = null;
@@ -98,13 +101,10 @@ export default function Home() {
         series.setData(
           candles.map((c: Candle) => ({ time: toUtc(c[0]), open: c[1], high: c[2], low: c[3], close: c[4] }))
         );
-        if (marks.length) {
-          const setMarkers = (series as unknown as { setMarkers: (m: unknown[]) => void }).setMarkers;
-          if (typeof setMarkers === "function") {
-            setMarkers(
-              marks.map((m: Mark) => ({ time: toUtc(m.time), position: "aboveBar", color: m.color, shape: "arrowDown", text: m.label }))
-            );
-          }
+        if (marks.length && series && series.setMarkers) {
+          series.setMarkers(
+            marks.map((m: Mark) => ({ time: toUtc(m.time), position: "aboveBar", color: m.color, shape: "arrowDown", text: m.label }))
+          );
         }
         chartRef.current?.timeScale().fitContent();
       }
