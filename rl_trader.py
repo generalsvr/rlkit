@@ -70,6 +70,10 @@ def train(
     episode_max_steps: int = typer.Option(0, help="Max steps per episode (0 = run to dataset end)"),
     feature_mode: str = typer.Option("full", help="full|basic (basic: close_z, change, d_hl)"),
     basic_lookback: int = typer.Option(64, help="Lookback for basic close_z standardization"),
+    # Eval options
+    eval_freq: int = typer.Option(100000, help="Evaluate every N steps (0 disables)"),
+    n_eval_episodes: int = typer.Option(3, help="Episodes per eval"),
+    eval_max_steps: int = typer.Option(2000, help="Max steps per eval rollout"),
 ):
     """Train PPO on downloaded data using Stable-Baselines3."""
     params = TrainParams(
@@ -96,6 +100,9 @@ def train(
         episode_max_steps=episode_max_steps,
         feature_mode=feature_mode,
         basic_lookback=basic_lookback,
+        eval_freq=eval_freq,
+        n_eval_episodes=n_eval_episodes,
+        eval_max_steps=eval_max_steps,
     )
     out = train_ppo_from_freqtrade_data(params)
     typer.echo(f"Model saved: {out}")
