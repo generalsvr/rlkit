@@ -8,6 +8,22 @@ FRONT_DIR="$ROOT_DIR/backtest_terminal"
 
 echo "[+] Repo root: $ROOT_DIR"
 
+# Kill helper for a port
+kill_port() {
+  local PORT="$1"
+  local PIDS
+  PIDS="$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+  if [ -n "$PIDS" ]; then
+    echo "[i] Freeing port :$PORT (pids: $PIDS)"
+    kill $PIDS 2>/dev/null || true
+    sleep 0.3
+    PIDS="$(lsof -tiTCP:"$PORT" -sTCP:LISTEN 2>/dev/null || true)"
+    if [ -n "$PIDS" ]; then
+      kill -9 $PIDS 2>/dev/null || true
+    fi
+  fi
+}
+
 # Ensure npm/node are available; try OS package manager first, else install NVM locally
 ensure_npm() {
   if command -v npm >/dev/null 2>&1 && command -v node >/dev/null 2>&1; then
@@ -53,8 +69,12 @@ echo "[+] Starting frontend (Next.js) on :8501"
     . "$HOME/.nvm/nvm.sh"
     nvm use --lts >/dev/null 2>&1 || true
   fi
+  # Ensure port is free, and kill prior saved PID if any
+  [ -f .next.pid ] && kill "$(cat .next.pid)" 2>/dev/null || true
+  kill_port 8501
   npm install --silent >/dev/null 2>&1 || true
-  PORT=8501 npm run dev --silent &
+  npm run build --silent >/dev/null 2>&1 || true
+  PORT=8501 npm run start --silent &
   echo $! > "$FRONT_DIR/.next.pid"
 )
 
@@ -70,6 +90,9 @@ echo "[+] Starting backend (FastAPI) on :8080 (this may take a minute on first r
   # Minimal deps for inference server
   pip install -q fastapi uvicorn[standard] pydantic pandas numpy pyarrow stable-baselines3 sb3-contrib gymnasium cloudpickle >/dev/null 2>&1 || true
   export RL_DEVICE="${RL_DEVICE:-cpu}"
+  # Ensure port is free, and kill prior saved PID if any
+  [ -f .uvicorn.pid ] && kill "$(cat .uvicorn.pid)" 2>/dev/null || true
+  kill_port 8080
   uvicorn main:app --host 0.0.0.0 --port 8080 --reload &
   echo $! > "$BACK_DIR/.uvicorn.pid"
   deactivate || true
