@@ -15,7 +15,7 @@ import subprocess
 from pathlib import Path
 import typer
 
-from rl_lib.train_sb3 import TrainParams, train_ppo_from_freqtrade_data
+from rl_lib.train_sb3 import TrainParams, train_ppo_from_freqtrade_data, validate_trained_model
 
 
 app = typer.Typer(add_completion=False)
@@ -114,6 +114,25 @@ def backtest(
     ]
     typer.echo(f"Running: {' '.join(cmd)}")
     subprocess.run(cmd, check=True, env=env)
+
+
+@app.command()
+def validate(
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    window: int = typer.Option(128),
+    model_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "rl_ppo.zip")),
+):
+    """Run a quick validation rollout on eval split and print summary (actions, entries, equity)."""
+    params = TrainParams(
+        userdir=userdir,
+        pair=pair,
+        timeframe=timeframe,
+        window=window,
+        model_out_path=model_path,
+    )
+    _ = validate_trained_model(params)
 
 
 if __name__ == "__main__":

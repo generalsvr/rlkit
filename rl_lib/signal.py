@@ -48,12 +48,14 @@ def compute_rl_signals(df: pd.DataFrame, model_path: str, window: int = 128) -> 
     exit_long = np.zeros(n, dtype=int)
     enter_short = np.zeros(n, dtype=int)
     exit_short = np.zeros(n, dtype=int)
+    deterministic_flag = os.environ.get("RL_DETERMINISTIC", "true").lower() in ("1", "true", "yes")
+
     for t in range(window, n):
         window_slice = feats.iloc[t - window:t].values.astype(np.float32)
         pos_feat = np.full((window, 1), float(position), dtype=np.float32)
         obs = np.concatenate([window_slice, pos_feat], axis=1).reshape(1, -1)
         obs = _apply_norm(obs)
-        a, _ = model.predict(obs, deterministic=True)
+        a, _ = model.predict(obs, deterministic=deterministic_flag)
         act = int(a[0])
         actions[t] = act
         if position == 0:

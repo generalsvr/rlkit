@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import glob
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Dict, Any
 
 import numpy as np
 import pandas as pd
@@ -79,6 +79,112 @@ def _load_ohlcv(path: str) -> pd.DataFrame:
     except Exception:
         pass
     return df
+def _run_validation_rollout(model: PPO, eval_env: VecNormalize | DummyVecEnv) -> Dict[str, Any]:
+    # Assumes single-env DummyVecEnv wrapped (VecNormalize optional)
+    obs = eval_env.reset()
+    done = False
+    if isinstance(done, np.ndarray):
+        done = False
+    action_counts = {0: 0, 1: 0, 2: 0, 3: 0}
+    enter_long = enter_short = exit_long = exit_short = 0
+    positions = []
+    equities = []
+    steps = 0
+    while True:
+        a, _ = model.predict(obs, deterministic=True)
+        action = int(a[0] if isinstance(a, (list, np.ndarray)) else a)
+        action_counts[action] = action_counts.get(action, 0) + 1
+        obs, reward, dones, infos = eval_env.step([action])
+        info = infos[0] if isinstance(infos, (list, tuple)) else infos
+        pos = int(info.get("position", 0))
+        eq = float(info.get("equity", np.nan))
+        positions.append(pos)
+        equities.append(eq)
+        # Entries/exits (0->1, 0->-1, 1->0, -1->0)
+        if len(positions) >= 2:
+            prev = positions[-2]
+            curr = positions[-1]
+            if prev == 0 and curr == 1:
+                enter_long += 1
+            elif prev == 0 and curr == -1:
+                enter_short += 1
+            elif prev == 1 and curr == 0:
+                exit_long += 1
+            elif prev == -1 and curr == 0:
+                exit_short += 1
+        steps += 1
+        if isinstance(dones, (list, np.ndarray)):
+            if bool(dones[0]):
+                break
+        else:
+            if bool(dones):
+                break
+        if steps > 10_000_000:
+            break
+
+    eq_series = np.asarray([e for e in equities if isinstance(e, (int, float)) and not np.isnan(e)], dtype=float)
+    final_equity = float(eq_series[-1]) if eq_series.size > 0 else float("nan")
+    max_equity = float(np.max(eq_series)) if eq_series.size > 0 else float("nan")
+    min_equity = float(np.min(eq_series)) if eq_series.size > 0 else float("nan")
+    time_in_pos = float(np.mean(np.asarray(positions) != 0)) if positions else 0.0
+    return {
+        "steps": steps,
+        "action_counts": action_counts,
+        "enter_long": enter_long,
+        "enter_short": enter_short,
+        "exit_long": exit_long,
+        "exit_short": exit_short,
+        "time_in_position_frac": time_in_pos,
+        "final_equity": final_equity,
+        "max_equity": max_equity,
+        "min_equity": min_equity,
+    }
+
+
+def validate_trained_model(params: TrainParams) -> Dict[str, Any]:
+    # Load data
+    data_path = _find_data_file(params.userdir, params.pair, params.timeframe)
+    if not data_path:
+        raise FileNotFoundError("No data for validation.")
+    raw = _load_ohlcv(data_path)
+    feats = make_features(raw)
+    n = len(feats)
+    cut = int(n * 0.8)
+    eval_df = feats.iloc[cut - max(params.window, 1):].copy()
+
+    tcfg = TradingConfig(
+        window=params.window,
+        fee_bps=params.fee_bps,
+        slippage_bps=params.slippage_bps,
+        reward_scale=params.reward_scale,
+        pnl_on_close=params.pnl_on_close,
+    )
+
+    def make_eval():
+        return FTTradingEnv(eval_df, tcfg)
+
+    eval_env = DummyVecEnv([make_eval])
+    eval_env = VecNormalize(eval_env, training=False, norm_obs=True, norm_reward=False, clip_obs=10.0)
+
+    # Try to load VecNormalize stats if available
+    stats_path = os.path.join(os.path.dirname(params.model_out_path), "vecnormalize.pkl")
+    if os.path.exists(stats_path):
+        try:
+            import cloudpickle  # type: ignore
+            with open(stats_path, "rb") as f:
+                vec = cloudpickle.load(f)
+            if hasattr(vec, "obs_rms") and hasattr(eval_env, "obs_rms"):
+                eval_env.obs_rms = vec.obs_rms
+        except Exception:
+            pass
+
+    model = PPO.load(params.model_out_path, device="cpu")
+    report = _run_validation_rollout(model, eval_env)
+    # Pretty print
+    print("VALIDATION SUMMARY:")
+    print(report)
+    return report
+
 
 
 @dataclass
@@ -121,6 +227,7 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
         slippage_bps=params.slippage_bps,
         reward_scale=params.reward_scale,
         pnl_on_close=params.pnl_on_close,
+        idle_penalty_bps=0.02,
     )
 
     def make_train():
@@ -205,14 +312,14 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
             env=env,
             verbose=1,
             seed=params.seed,
-            n_steps=1024,
-            batch_size=128,
-            learning_rate=1e-4,
+            n_steps=2048,
+            batch_size=256,
+            learning_rate=3e-4,
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            n_epochs=10,
-            ent_coef=0.02,
+            n_epochs=8,
+            ent_coef=0.05,
             policy_kwargs=dict(
                 net_arch=[],
                 features_extractor_class=TransformerExtractor,
@@ -254,6 +361,11 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
     if isinstance(env, VecNormalize):
         stats_path = os.path.join(os.path.dirname(params.model_out_path), "vecnormalize.pkl")
         env.save(stats_path)
+    # Quick validation rollout on eval split
+    try:
+        _ = _run_validation_rollout(model, eval_env)
+    except Exception:
+        pass
     return params.model_out_path
 
 
