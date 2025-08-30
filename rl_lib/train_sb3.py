@@ -61,15 +61,24 @@ def _compute_risk_metrics(equities: np.ndarray) -> Dict[str, float]:
     if equities.size < 2:
         return {"sharpe": float("nan"), "sortino": float("nan"), "max_drawdown": float("nan"), "calmar": float("nan")}
     rets = np.diff(equities) / (equities[:-1] + 1e-12)
+    if rets.size == 0:
+        return {"sharpe": float("nan"), "sortino": float("nan"), "max_drawdown": 0.0, "calmar": float("nan")}
     mean = float(np.mean(rets))
-    std = float(np.std(rets) + 1e-12)
+    std = float(np.std(rets))
+    if not np.isfinite(std) or std == 0.0:
+        std = 1e-12
     downside = rets[rets < 0.0]
-    dd_std = float(np.std(downside) + 1e-12)
+    if downside.size > 0:
+        dd_std = float(np.std(downside))
+        if not np.isfinite(dd_std) or dd_std == 0.0:
+            dd_std = 1e-12
+    else:
+        dd_std = 1e-12
     cummax = np.maximum.accumulate(equities)
     dd = (cummax - equities) / (cummax + 1e-12)
-    max_dd = float(np.max(dd)) if dd.size else float("nan")
-    sharpe = mean / std if std > 0 else float("nan")
-    sortino = mean / dd_std if dd_std > 0 else float("nan")
+    max_dd = float(np.max(dd)) if dd.size else 0.0
+    sharpe = mean / std
+    sortino = mean / dd_std
     calmar = (mean / (max_dd + 1e-12)) if max_dd > 0 else float("nan")
     return {"sharpe": sharpe, "sortino": sortino, "max_drawdown": max_dd, "calmar": calmar}
 

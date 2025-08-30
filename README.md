@@ -4,6 +4,7 @@
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
+pip install -r requirements.extra.txt
 pip install freqtrade
 ```
 
@@ -51,24 +52,45 @@ freqtrade download-data \
   --data-format-ohlcv parquet --erase --timerange 20190101- | cat
 ```
 
-If you already have Binance parquet and want to reuse it for Bybit backtesting:
+### 2) Train PPO (Hybrid Transformer)
+Minimal (MLP):
 ```bash
-mkdir -p /workspace/rlkit/freqtrade_userdir/data/bybit
-ln -sf /workspace/rlkit/freqtrade_userdir/data/binance/BTC_USDT-1h.parquet \
-      /workspace/rlkit/freqtrade_userdir/data/bybit/BTC_USDT_USDT-1h.parquet
+python rl_trader.py train --pair "BTC/USDT:USDT" --timeframe 1h \
+  --window 128 --timesteps 300000 --arch mlp \
+  --fee-bps 6 --slippage-bps 10 --idle-penalty-bps 0.0 \
+  --reward-type vol_scaled --vol-lookback 20 \
+  --turnover-penalty-bps 2.0 --min-hold-bars 3 --cooldown-bars 1 \
+  --random-reset --episode-max-steps 4096 \
+  --feature-mode basic --basic-lookback 128 \
+  --seed 42 --device cuda \
+  --eval-freq 50000 --n-eval-episodes 1 --eval-max-steps 2000
+```
+Hybrid Transformer (recommended):
+```bash
+python rl_trader.py train --pair "BTC/USDT:USDT" --timeframe 1h \
+  --window 128 --timesteps 2000000 --arch transformer_hybrid \
+  --fee-bps 6 --slippage-bps 10 --idle-penalty-bps 0.0 \
+  --reward-type vol_scaled --vol-lookback 20 \
+  --turnover-penalty-bps 2.0 --min-hold-bars 3 --cooldown-bars 1 \
+  --random-reset --episode-max-steps 4096 \
+  --feature-mode basic --basic-lookback 128 \
+  --seed 42 --device cuda \
+  --eval-freq 50000 --n-eval-episodes 1 --eval-max-steps 2000
+```
+Disable eval during long runs:
+```bash
+python rl_trader.py train ... --eval-freq 0
 ```
 
-### 2) Train PPO
-Transformer (standard):
+### 3) Validate
 ```bash
-python rl_trader.py train --pair "BTC/USDT:USDT" --timeframe 1h --window 128 --timesteps 300000 --arch transformer
+python rl_trader.py validate --pair "BTC/USDT:USDT" --timeframe 1h \
+  --window 128 --model-path /workspace/rlkit/models/rl_ppo.zip \
+  --max-steps 5000 --device cuda
 ```
-Transformer (bigger):
-```bash
-python rl_trader.py train --pair "BTC/USDT:USDT" --timeframe 1h --window 128 --timesteps 400000 --arch transformer_big
-```
+- Prints summary including final equity, Sharpe, Sortino, and MaxDD.
 
-### 3) Backtest with RLStrategy
+### 4) Backtest with RLStrategy
 ```bash
 export RL_MODEL_PATH=/workspace/rlkit/models/rl_ppo.zip
 export RL_WINDOW=128
@@ -82,29 +104,33 @@ freqtrade backtesting \
   --data-format-ohlcv parquet | cat
 ```
 
-### Train on GPU:
-
-python rl_trader.py train --pair BTC/USDT:USDT --timeframe 1h --window 128 --timesteps 200000 --arch transformer_big --fee-bps 0.6 --device cuda
-
-### Validate on GPU:
-
-python rl_trader.py validate --pair BTC/USDT:USDT --timeframe 1h --window 128 --model-path /workspace/rlkit/models/rl_ppo.zip --max-steps 500 --device cuda
-
-### Backtest on GPU (Freqtrade subprocess inherits device):
-
-python rl_trader.py backtest --pair BTC/USDT:USDT --timeframe 1h --model-path /workspace/rlkit/models/rl_ppo.zip --timerange 20240101- --device cuda
-
-
 ### Notes
 - Strategy file: `freqtrade_userdir/strategies/RLStrategy.py`
-- RL signals: `rl_lib/signal.py` produce `enter_long/exit_long/enter_short/exit_short` which map directly to Freqtrade’s unified API.
-- Normalization: `VecNormalize` stats saved to `models/vecnormalize.pkl` are used during inference.
-- Troubleshooting:
-  - "Ticker pricing not available": ensure `use_exchange=false` and `price_side="same"`.
-  - "No pair in whitelist": use correct pair symbol (`BTC/USDT:USDT` for Bybit futures), and ensure parquet exists under matching exchange folder.
-  - "No data found": re-run download with `--erase` or symlink data to the correct path.
+- RL signals: `rl_lib/signal.py` produces `enter_long/exit_long/enter_short/exit_short` for Freqtrade.
+- Normalization: `VecNormalize` stats saved to `models/vecnormalize.pkl` are reused during inference.
+- Features:
+  - basic: `close_z`, `change`, `d_hl`
+  - full: `logret`, `hl_range`, `upper_wick`, `lower_wick`, `rsi`, `vol_z`, `atr`, `ret_std_14` (MACD/Bollinger removed)
+- Costs and realism: fees/slippage in bps are charged, flips double-charged; optional min-hold and cooldown.
+- Eval: PnL (final equity) printed every `--eval-freq` steps; cap eval rollout length with `--eval-max-steps`.
 
-# Download and install TA-Lib C library
+### Troubleshooting
+- "No data found": rerun download with `--erase` or ensure parquet path matches exchange folder.
+- "No pair in whitelist": use correct pair symbol (`BTC/USDT:USDT` for Bybit futures).
+- CPU runs: set `--device cpu`.
 
-git clone https://github.com/generalsvr/rlkit && cd rlkit && apt update && apt install build-essential wget && cd /tmp && wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && tar -xzf ta-lib-0.4.0-src.tar.gz && cd ta-lib/ && ./configure --prefix=/usr && 
-make && make install && ldconfig && cd /workspace/rlkit && pip install -r requirements.txt && pip install stable-baselines3[extra] && pip install -r requirements.extra.txt
+### Streamlit Trading Terminal
+
+Run the minimal visual terminal to download data, select ranges, run your RL agent, and visualize LONG/SHORT/EXIT and equity:
+```bash
+source .venv/bin/activate
+streamlit run app.py
+```
+
+Features:
+- Select pair, timeframe, exchange, date range
+- Download OHLCV via Freqtrade
+- Choose model path and window
+- Visualize OHLC (candles), markers (enter_long/enter_short/exit_*), equity curve, and risk metrics
+
+
