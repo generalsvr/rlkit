@@ -35,6 +35,9 @@ def compute_rl_signals(df: pd.DataFrame, model_path: str, window: int = 128) -> 
     def _apply_norm(obs: np.ndarray) -> np.ndarray:
         if obs_mean is None or obs_var is None:
             return obs
+        # Guard against shape mismatch between saved VecNormalize stats and current obs
+        if obs.shape[-1] != int(np.size(obs_mean)):
+            return obs
         return np.clip((obs - obs_mean) / (np.sqrt(obs_var + 1e-8)), -clip_obs, clip_obs)
 
     feats = make_features(df)

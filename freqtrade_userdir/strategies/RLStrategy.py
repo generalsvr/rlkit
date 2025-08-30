@@ -3,16 +3,13 @@ from pandas import DataFrame
 import os
 from pathlib import Path
 import logging
+import sys
 
-# Local import from project
-try:
-    from rl_lib.signal import compute_rl_signals
-except Exception:
-    # When running from freqtrade, PYTHONPATH may not include project root
-    import sys
-    # Ensure user_data root (/freqtrade/user_data) is on path
-    sys.path.append(str(Path(__file__).resolve().parents[1]))
-    from rl_lib.signal import compute_rl_signals
+# Ensure project root is on sys.path so we use the project's rl_lib (matches training)
+_project_root = Path(__file__).resolve().parents[3]
+if str(_project_root) not in sys.path:
+    sys.path.insert(0, str(_project_root))
+from rl_lib.signal import compute_rl_signals
 
 
 class RLStrategy(IStrategy):

@@ -36,6 +36,9 @@ def compute_rl_signals(df: pd.DataFrame, model_path: str, window: int = 128) -> 
         if obs_mean is None or obs_var is None:
             return obs
         import numpy as _np
+        # Guard against shape mismatch (e.g., different window/features). Fall back to unnormalized.
+        if obs.shape[-1] != int(_np.size(obs_mean)):
+            return obs
         return _np.clip((obs - obs_mean) / (_np.sqrt(obs_var + 1e-8)), -clip_obs, clip_obs)
 
     feats = make_features(df)
