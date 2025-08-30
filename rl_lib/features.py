@@ -104,9 +104,11 @@ def make_features(df: pd.DataFrame, feature_columns: List[str] | None = None) ->
 
     if feature_columns is not None:
         missing = [c for c in feature_columns if c not in feats.columns]
-        if missing:
-            raise ValueError(f"Requested features missing: {missing}")
-        feats = feats[feature_columns]
+        # Create any missing columns as zeros to preserve model input layout
+        for c in missing:
+            feats[c] = 0.0
+        # Reorder/select exactly the requested columns
+        feats = feats.reindex(columns=feature_columns)
     return feats
 
 

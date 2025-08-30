@@ -362,6 +362,14 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
 
     model.learn(total_timesteps=int(params.total_timesteps), callback=eval_cb, progress_bar=True)
     model.save(params.model_out_path)
+    # Persist training feature set for consistent inference
+    try:
+        import json as _json
+        feat_path = os.path.join(os.path.dirname(params.model_out_path), "feature_columns.json")
+        with open(feat_path, "w") as f:
+            _json.dump(list(train_df.columns), f)
+    except Exception:
+        pass
     # Save normalization statistics alongside the model
     if isinstance(env, VecNormalize):
         stats_path = os.path.join(os.path.dirname(params.model_out_path), "vecnormalize.pkl")

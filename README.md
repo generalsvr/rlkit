@@ -61,11 +61,11 @@ ln -sf /workspace/rlkit/freqtrade_userdir/data/binance/BTC_USDT-1h.parquet \
 ### 2) Train PPO
 Transformer (standard):
 ```bash
-python rl_trader.py train --pair BTC/USDT --timeframe 1h --window 128 --timesteps 300000 --arch transformer
+python rl_trader.py train --pair "BTC/USDT:USDT" --timeframe 1h --window 128 --timesteps 300000 --arch transformer
 ```
 Transformer (bigger):
 ```bash
-python rl_trader.py train --pair BTC/USDT --timeframe 1h --window 128 --timesteps 400000 --arch transformer_big
+python rl_trader.py train --pair "BTC/USDT:USDT" --timeframe 1h --window 128 --timesteps 400000 --arch transformer_big
 ```
 
 ### 3) Backtest with RLStrategy
@@ -81,6 +81,19 @@ freqtrade backtesting \
   --timerange 20240101-20250101 \
   --data-format-ohlcv parquet | cat
 ```
+
+### Train on GPU:
+
+python rl_trader.py train --pair BTC/USDT:USDT --timeframe 1h --window 128 --timesteps 200000 --arch transformer_big --fee-bps 0.6 --device cuda
+
+### Validate on GPU:
+
+python rl_trader.py validate --pair BTC/USDT:USDT --timeframe 1h --window 128 --model-path /workspace/rlkit/models/rl_ppo.zip --max-steps 500 --device cuda
+
+### Backtest on GPU (Freqtrade subprocess inherits device):
+
+python rl_trader.py backtest --pair BTC/USDT:USDT --timeframe 1h --model-path /workspace/rlkit/models/rl_ppo.zip --timerange 20240101- --device cuda
+
 
 ### Notes
 - Strategy file: `freqtrade_userdir/strategies/RLStrategy.py`

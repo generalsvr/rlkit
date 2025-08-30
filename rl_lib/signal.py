@@ -41,7 +41,17 @@ def compute_rl_signals(df: pd.DataFrame, model_path: str, window: int = 128) -> 
             return obs
         return np.clip((obs - obs_mean) / (np.sqrt(obs_var + 1e-8)), -clip_obs, clip_obs)
 
-    feats = make_features(df)
+    # Enforce training feature layout if available
+    feat_cols_path = os.path.join(os.path.dirname(model_path), "feature_columns.json")
+    feature_columns = None
+    if os.path.exists(feat_cols_path):
+        try:
+            import json as _json
+            with open(feat_cols_path, "r") as f:
+                feature_columns = _json.load(f)
+        except Exception:
+            feature_columns = None
+    feats = make_features(df, feature_columns=feature_columns)
     feats = feats.reset_index(drop=True)
     n = len(feats)
     actions = np.zeros(n, dtype=int)
