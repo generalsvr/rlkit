@@ -11,7 +11,7 @@ from typing import Tuple, Dict, List
 @dataclass
 class TradingConfig:
     window: int = 128
-    fee_bps: float = 1.0
+    fee_bps: float = 0.6
     slippage_bps: float = 2.0
     reward_scale: float = 1.0
     pnl_on_close: bool = False

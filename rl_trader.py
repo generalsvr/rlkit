@@ -52,7 +52,8 @@ def train(
     window: int = typer.Option(128),
     timesteps: int = typer.Option(200_000),
     model_out: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "rl_ppo.zip")),
-    arch: str = typer.Option("mlp", help="mlp|lstm|transformer"),
+    arch: str = typer.Option("mlp", help="mlp|lstm|transformer|transformer_big|transformer_hybrid"),
+    fee_bps: float = typer.Option(0.6, help="Trading fee in basis points (e.g., 0.6 for 0.06%)"),
 ):
     """Train PPO on downloaded data using Stable-Baselines3."""
     params = TrainParams(
@@ -63,6 +64,7 @@ def train(
         total_timesteps=timesteps,
         model_out_path=model_out,
         arch=arch,
+        fee_bps=fee_bps,
     )
     out = train_ppo_from_freqtrade_data(params)
     typer.echo(f"Model saved: {out}")
