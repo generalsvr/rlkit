@@ -52,6 +52,10 @@ class FTTradingEnv(gym.Env):
         if "close" not in self.df.columns:
             raise ValueError("features must include 'close' column for PnL calc")
         self.close = self.df["close"].astype(float).values
+        # Execution parity: require open for next-bar fills
+        if "open" not in self.df.columns:
+            raise ValueError("features must include 'open' column for execution parity mode")
+        self.open = self.df["open"].astype(float).values
         # Precompute simple returns and rolling volatility for vol-scaled rewards
         close_shift = np.roll(self.close, 1)
         close_shift[0] = self.close[0]
@@ -73,6 +77,8 @@ class FTTradingEnv(gym.Env):
             dtype=np.float32,
         )
         self.action_space = spaces.Discrete(4)
+        # Pending target position to execute at next bar's open
+        self._pending_target_pos: int | None = None
 
     def _get_risk_gate(self, idx: int) -> float:
         try:
@@ -106,6 +112,7 @@ class FTTradingEnv(gym.Env):
         self.equity = 1.0
         self.equity_curve = [self.equity]
         self.max_equity_seen = self.equity
+        self._pending_target_pos = None
         obs = self._obs()
         return obs, {}
 
@@ -126,47 +133,27 @@ class FTTradingEnv(gym.Env):
         step_penalty = 0.0
         action_blocked = False
 
-        # apply action
+        # Decide desired target position now; execute at next bar's open
         can_close = (self.episode_steps - self.last_pos_change_step) >= self.cfg.min_hold_bars
         can_open = self.episode_steps >= self.cooldown_until_step
-        gate_at_exec = self._get_risk_gate(self.ptr - 1)
-        if action == 1:  # long
+        target_pos: int | None = None
+        if action == 1:  # request long
             if self.position <= 0 and can_open:
-                if self.position != +1:
-                    cost = self._pay_costs(prev_position, +1, size_factor=gate_at_exec)
-                    step_penalty += cost
-                self.position = +1
-                self.entry_price = prev_price
-                self.last_pos_change_step = self.episode_steps
+                target_pos = +1
             else:
                 action_blocked = True
-        elif action == 2:  # short
+        elif action == 2:  # request short
             if self.position >= 0 and can_open:
-                if self.position != -1:
-                    cost = self._pay_costs(prev_position, -1, size_factor=gate_at_exec)
-                    step_penalty += cost
-                self.position = -1
-                self.entry_price = prev_price
-                self.last_pos_change_step = self.episode_steps
+                target_pos = -1
             else:
                 action_blocked = True
-        elif action == 3:  # close
+        elif action == 3:  # request close
             if self.position != 0 and can_close:
-                cost = self._pay_costs(prev_position, 0, size_factor=gate_at_exec)
-                step_penalty += cost
-                if self.cfg.pnl_on_close and self.entry_price is not None:
-                    r = (prev_price - self.entry_price) / (self.entry_price + 1e-12)
-                    r = r if prev_position == +1 else -r
-                    # Apply current gate to PnL on close as approximation
-                    g = self._get_risk_gate(self.ptr - 1)
-                    self.equity *= (1.0 + g * r)
-                self.position = 0
-                self.entry_price = None
-                self.last_pos_change_step = self.episode_steps
-                if self.cfg.cooldown_bars > 0:
-                    self.cooldown_until_step = self.episode_steps + self.cfg.cooldown_bars
+                target_pos = 0
             else:
                 action_blocked = True
+        if target_pos is not None:
+            self._pending_target_pos = target_pos
 
         # advance
         self.ptr += 1
@@ -177,52 +164,58 @@ class FTTradingEnv(gym.Env):
             self.done = True
 
         reward = 0.0
-        if not self.cfg.pnl_on_close and not self.done:
-            new_price = float(self.close[self.ptr - 1])
-            r = (new_price - prev_price) / (prev_price + 1e-12)
-            pos_sign = 1.0 if self.position == +1 else (-1.0 if self.position == -1 else 0.0)
+        executed_change = False
+        # Execute pending target at this bar's open (if scheduled and not done)
+        if (not self.done) and (self._pending_target_pos is not None) and (self._pending_target_pos != self.position):
+            fill_price = float(self.open[self.ptr - 1])
             g = self._get_risk_gate(self.ptr - 1)
-            raw_ret = (pos_sign * g) * r
-            # Apply reward shaping
-            if self.cfg.reward_type == "vol_scaled":
-                # Use precomputed rolling volatility at prev index
-                sigma = float(self.ret_std[self.ptr - 1])
-                reward = raw_ret / (sigma + 1e-8)
-            elif self.cfg.reward_type == "sharpe_proxy":
-                sigma = float(self.ret_std[self.ptr - 1])
-                reward = raw_ret / (sigma + 1e-8)
-                # Drawdown penalty term
-                dd = max(0.0, (self.max_equity_seen - self.equity) / (self.max_equity_seen + 1e-12))
-                reward -= float(self.cfg.dd_penalty) * dd
-            else:
-                reward = raw_ret
-            # Update equity by raw PnL
-            if self.position == +1:
-                self.equity *= (1.0 + g * r)
-            elif self.position == -1:
-                self.equity *= (1.0 - g * r)
-            else:
-                # Encourage taking positions by applying a tiny idle penalty (in bps)
-                if self.cfg.idle_penalty_bps > 0.0:
-                    idle_cost = self.cfg.idle_penalty_bps * 1e-4
-                    reward -= idle_cost
-                    self.equity *= (1.0 - idle_cost)
+            new_pos = int(self._pending_target_pos)
+            # Realize PnL on exit/flip
+            if self.position != 0 and self.entry_price is not None:
+                r = (fill_price - float(self.entry_price)) / (float(self.entry_price) + 1e-12)
+                r = r if self.position == +1 else -r
+                realized = g * r
+                self.equity *= (1.0 + realized)
+                reward += realized
+            # Pay fees/slippage costs scaled by size
+            cost = self._pay_costs(self.position, new_pos, size_factor=g)
+            reward -= cost
+            # Apply position change
+            self.position = new_pos
+            self.entry_price = (fill_price if new_pos != 0 else None)
+            self.last_pos_change_step = self.episode_steps
+            if new_pos == 0 and self.cfg.cooldown_bars > 0:
+                self.cooldown_until_step = self.episode_steps + self.cfg.cooldown_bars
+            executed_change = True
+            self._pending_target_pos = None
+        else:
+            # Optional idle penalty when flat
+            if self.position == 0 and self.cfg.idle_penalty_bps > 0.0 and not self.done:
+                idle_cost = self.cfg.idle_penalty_bps * 1e-4
+                reward -= idle_cost
+                self.equity *= (1.0 - idle_cost)
         # Turnover penalty (separate from exchange fees) when we attempted and executed a change
-        if not action_blocked and self.cfg.turnover_penalty_bps > 0.0 and self.episode_steps > 0:
-            # Charge only when a position change occurred this step
-            if prev_position != self.position:
-                g = self._get_risk_gate(self.ptr - 1)
-                tcost = (self.cfg.turnover_penalty_bps * 1e-4) * g
-                step_penalty += tcost
-                self.equity *= (1.0 - tcost)
+        if executed_change and self.cfg.turnover_penalty_bps > 0.0 and self.episode_steps > 0:
+            g = self._get_risk_gate(self.ptr - 1)
+            tcost = (self.cfg.turnover_penalty_bps * 1e-4) * g
+            reward -= tcost
+            self.equity *= (1.0 - tcost)
 
         self.equity_curve.append(self.equity)
         self.max_equity_seen = max(self.max_equity_seen, self.equity)
         obs = self._obs() if not self.done else np.zeros_like(self._obs(), dtype=np.float32)
         terminated = self.done
         truncated = False
-        # Subtract exchange/slippage penalties from reward
-        reward = reward - step_penalty
+        # Reward shaping scaling (optional)
+        if reward != 0.0:
+            if self.cfg.reward_type == "vol_scaled":
+                sigma = float(self.ret_std[self.ptr - 1])
+                reward = reward / (sigma + 1e-8)
+            elif self.cfg.reward_type == "sharpe_proxy":
+                sigma = float(self.ret_std[self.ptr - 1])
+                reward = reward / (sigma + 1e-8)
+                dd = max(0.0, (self.max_equity_seen - self.equity) / (self.max_equity_seen + 1e-12))
+                reward -= float(self.cfg.dd_penalty) * dd
         info = {"equity": float(self.equity), "position": int(self.position), "risk_gate": float(self._get_risk_gate(self.ptr - 1))}
         return obs, float(reward * self.cfg.reward_scale), terminated, truncated, info
 
