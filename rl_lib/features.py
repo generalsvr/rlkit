@@ -203,6 +203,7 @@ def make_features(
             for tf in extra_timeframes:
                 try:
                     tf_str = str(tf).upper()
+                    resample_tf = tf_str.lower()
                     agg = {
                         "open": "first",
                         "high": "max",
@@ -210,7 +211,7 @@ def make_features(
                         "close": "last",
                         "volume": "sum",
                     }
-                    res = base.resample(tf_str).agg(agg).dropna(how="all")
+                    res = base.resample(resample_tf).agg(agg).dropna(how="all")
                     # Compute the same feature set on HTF
                     rc = res["close"].values
                     ro = res["open"].values

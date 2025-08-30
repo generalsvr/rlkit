@@ -33,6 +33,10 @@ class RLStrategy(IStrategy):
         self.model_path = os.environ.get("RL_MODEL_PATH", str(Path(__file__).resolve().parents[3] / "models" / "rl_ppo.zip"))
         self.window = int(os.environ.get("RL_WINDOW", "128"))
         self._logger = logging.getLogger(__name__)
+        # Align with env trade gating if provided
+        self.min_hold_bars = int(os.environ.get("RL_MIN_HOLD_BARS", "0"))
+        self.cooldown_bars = int(os.environ.get("RL_COOLDOWN_BARS", "0"))
+        self._cooldown_until = None
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         try:
@@ -44,6 +48,16 @@ class RLStrategy(IStrategy):
             # Propagate risk gate for dynamic position sizing
             if "risk_gate" in enriched.columns:
                 dataframe["risk_gate"] = enriched["risk_gate"].values
+            # Optional: dump signals for audit
+            if os.environ.get("RL_DUMP_SIGNALS", "0") in ("1", "true", "True"):
+                try:
+                    outdir = Path(self.config.get('user_data_dir', '.')) / 'logs'
+                    outdir.mkdir(parents=True, exist_ok=True)
+                    fp = outdir / f"signals_{metadata.get('pair', 'PAIR').replace('/', '_')}_{self.timeframe}.csv"
+                    enriched.to_csv(fp)
+                    self._logger.info(f"RLStrategy: dumped signals -> {fp}")
+                except Exception:
+                    pass
             # Debug summary
             el = int(enriched["enter_long"].sum())
             es = int(enriched["enter_short"].sum())
@@ -73,6 +87,11 @@ class RLStrategy(IStrategy):
 
     # New unified API in newer Freqtrade versions
     def populate_entry_trend(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
+        # Enforce cooldown gating
+        if self.cooldown_bars > 0 and 'date' in dataframe.columns:
+            if self._cooldown_until is not None:
+                mask_cd = dataframe['date'] < self._cooldown_until
+                dataframe.loc[mask_cd, ['enter_long', 'enter_short']] = 0
         dataframe.loc[:, 'enter_long'] = (dataframe.get('enter_long', 0) == 1).astype('int')
         dataframe.loc[:, 'enter_short'] = (dataframe.get('enter_short', 0) == 1).astype('int')
         return dataframe

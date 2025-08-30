@@ -19,6 +19,8 @@ from datetime import datetime
 import csv
 
 from rl_lib.train_sb3 import TrainParams, train_ppo_from_freqtrade_data, validate_trained_model
+from rl_lib.train_sb3 import _find_data_file as _find_data_file_internal, _load_ohlcv as _load_ohlcv_internal  # type: ignore
+from rl_lib.signal import compute_rl_signals
 
 
 app = typer.Typer(add_completion=False)
