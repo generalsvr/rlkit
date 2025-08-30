@@ -2,6 +2,7 @@ from freqtrade.strategy.interface import IStrategy
 from pandas import DataFrame
 import os
 from pathlib import Path
+import logging
 
 # Local import from project
 try:
@@ -32,6 +33,7 @@ class RLStrategy(IStrategy):
         super().__init__(config)
         self.model_path = os.environ.get("RL_MODEL_PATH", str(Path(__file__).resolve().parents[3] / "models" / "rl_ppo.zip"))
         self.window = int(os.environ.get("RL_WINDOW", "128"))
+        self._logger = logging.getLogger(__name__)
 
     def populate_indicators(self, dataframe: DataFrame, metadata: dict) -> DataFrame:
         try:
@@ -40,8 +42,17 @@ class RLStrategy(IStrategy):
             dataframe["exit_long"] = enriched["exit_long"].values
             dataframe["enter_short"] = enriched["enter_short"].values
             dataframe["exit_short"] = enriched["exit_short"].values
-        except Exception:
-            # On failure default to no-op
+            # Debug summary
+            el = int(enriched["enter_long"].sum())
+            es = int(enriched["enter_short"].sum())
+            xl = int(enriched["exit_long"].sum())
+            xs = int(enriched["exit_short"].sum())
+            self._logger.info(
+                f"RLStrategy: signals summary - enter_long={el}, enter_short={es}, exit_long={xl}, exit_short={xs}, model='{self.model_path}', window={self.window}"
+            )
+        except Exception as e:
+            # On failure default to no-op but log the root cause
+            self._logger.exception(f"RLStrategy: compute_rl_signals failed: {e}")
             dataframe["enter_long"] = 0
             dataframe["exit_long"] = 0
             dataframe["enter_short"] = 0
