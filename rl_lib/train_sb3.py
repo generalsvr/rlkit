@@ -240,7 +240,7 @@ class TrainParams:
     total_timesteps: int = 200_000
     seed: int = 42
     model_out_path: str = "models/rl_ppo.zip"
-    fee_bps: float = 0.6
+    fee_bps: float = 6.0
     slippage_bps: float = 2.0
     reward_scale: float = 1.0
     pnl_on_close: bool = False
