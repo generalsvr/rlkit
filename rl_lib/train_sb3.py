@@ -25,12 +25,14 @@ def _find_data_file(userdir: str, pair: str, timeframe: str) -> Optional[str]:
         base.replace(":", "_"),          # BTC_USDT_USDT
         base.split(":")[0],               # BTC_USDT
     }
+    suffixes = ["", "-futures"]
     for ext in ("parquet", "feather"):
         for name in candidates:
-            pattern = os.path.join(userdir, "data", "**", f"{name}-{timeframe}.{ext}")
-            hits = glob.glob(pattern, recursive=True)
-            if hits:
-                return hits[0]
+            for suf in suffixes:
+                pattern = os.path.join(userdir, "data", "**", f"{name}-{timeframe}{suf}.{ext}")
+                hits = glob.glob(pattern, recursive=True)
+                if hits:
+                    return hits[0]
     return None
 
 
