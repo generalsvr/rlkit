@@ -12,6 +12,8 @@ from sb3_contrib import RecurrentPPO
 from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import EvalCallback, BaseCallback, CallbackList
 from stable_baselines3.common.monitor import Monitor
+from datetime import datetime
+import csv
 
 from .features import make_features
 from .transformer_extractor import TransformerExtractor, HybridLSTMTransformerExtractor
@@ -148,12 +150,43 @@ def _run_validation_rollout(model: PPO, eval_env: VecNormalize | DummyVecEnv, ma
 
 
 class PnLEvalCallback(BaseCallback):
-    def __init__(self, eval_env: VecNormalize | DummyVecEnv, eval_freq: int, max_steps: int = 2000, deterministic: bool = True, verbose: int = 1):
+    def __init__(self, eval_env: VecNormalize | DummyVecEnv, eval_freq: int, max_steps: int = 2000, deterministic: bool = True, verbose: int = 1, eval_log_path: Optional[str] = None):
         super().__init__(verbose)
         self.eval_env = eval_env
         self.eval_freq = int(max(1, eval_freq))
         self.max_steps = int(max_steps)
         self.deterministic = bool(deterministic)
+        self.eval_log_path = eval_log_path
+
+    def _append_log(self, num_timesteps: int, report: Dict[str, Any]):
+        if not self.eval_log_path:
+            return
+        path = self.eval_log_path
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        file_exists = os.path.exists(path) and os.path.getsize(path) > 0
+        fields = [
+            "timestamp","timesteps","final_equity","sharpe","max_drawdown","time_in_position_frac",
+            "enter_long","enter_short","exit_long","exit_short"
+        ]
+        row = {
+            "timestamp": datetime.utcnow().isoformat(),
+            "timesteps": int(num_timesteps),
+            "final_equity": float(report.get("final_equity", float("nan"))),
+            "sharpe": float(report.get("sharpe", float("nan"))),
+            "max_drawdown": float(report.get("max_drawdown", float("nan"))),
+            "time_in_position_frac": float(report.get("time_in_position_frac", float("nan"))),
+            "enter_long": int(report.get("enter_long", 0)),
+            "enter_short": int(report.get("enter_short", 0)),
+            "exit_long": int(report.get("exit_long", 0)),
+            "exit_short": int(report.get("exit_short", 0)),
+        }
+        with open(path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(row)
 
     def _on_step(self) -> bool:
         num = int(self.model.num_timesteps)
@@ -163,6 +196,7 @@ class PnLEvalCallback(BaseCallback):
             sharpe = report.get("sharpe", float("nan"))
             self.logger.record("eval/final_equity", final_eq)
             self.logger.record("eval/sharpe", sharpe)
+            self._append_log(num, report)
             if self.verbose:
                 print(f"EVAL_PNL: timesteps={num} final_equity={final_eq:.6f} sharpe={sharpe:.4f}")
         return True
@@ -299,6 +333,13 @@ class TrainParams:
     eval_freq: int = 100_000  # steps; <=0 disables eval
     n_eval_episodes: int = 3
     eval_max_steps: int = 2000
+    eval_log_path: Optional[str] = None
+    # PPO hyperparams
+    ent_coef: float = 0.02
+    learning_rate: float = 3e-4
+    n_steps: int = 2048
+    batch_size: int = 256
+    n_epochs: int = 10
 
 
 
@@ -357,13 +398,14 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
             verbose=1,
             seed=params.seed,
             device=params.device,
-            n_steps=1024,
-            batch_size=256,
-            learning_rate=3e-4,
+            n_steps=max(128, params.n_steps // 2),
+            batch_size=params.batch_size,
+            learning_rate=params.learning_rate,
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            n_epochs=10,
+            n_epochs=params.n_epochs,
+            ent_coef=params.ent_coef,
             policy_kwargs=dict(lstm_hidden_size=128, net_arch=[128]),
         )
     elif arch == "transformer":
@@ -373,14 +415,14 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
             verbose=1,
             seed=params.seed,
             device=params.device,
-            n_steps=2048,
-            batch_size=256,
-            learning_rate=3e-4,
+            n_steps=params.n_steps,
+            batch_size=params.batch_size,
+            learning_rate=params.learning_rate,
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            n_epochs=10,
-            ent_coef=0.02,
+            n_epochs=params.n_epochs,
+            ent_coef=params.ent_coef,
             policy_kwargs=dict(
                 net_arch=[],
                 features_extractor_class=TransformerExtractor,
@@ -394,14 +436,14 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
             verbose=1,
             seed=params.seed,
             device=params.device,
-            n_steps=2048,
-            batch_size=256,
-            learning_rate=3e-4,
+            n_steps=params.n_steps,
+            batch_size=params.batch_size,
+            learning_rate=params.learning_rate,
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            n_epochs=10,
-            ent_coef=0.02,
+            n_epochs=params.n_epochs,
+            ent_coef=params.ent_coef,
             policy_kwargs=dict(
                 net_arch=[],
                 features_extractor_class=HybridLSTMTransformerExtractor,
@@ -424,14 +466,14 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
             verbose=1,
             seed=params.seed,
             device=params.device,
-            n_steps=2048,
-            batch_size=256,
-            learning_rate=3e-4,
+            n_steps=params.n_steps,
+            batch_size=params.batch_size,
+            learning_rate=params.learning_rate,
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            n_epochs=8,
-            ent_coef=0.05,
+            n_epochs=max(1, min(params.n_epochs, 20)),
+            ent_coef=max(0.0, params.ent_coef),
             policy_kwargs=dict(
                 net_arch=[],
                 features_extractor_class=TransformerExtractor,
@@ -445,13 +487,14 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
             verbose=1,
             seed=params.seed,
             device=params.device,
-            n_steps=2048,
-            batch_size=256,
-            learning_rate=3e-4,
+            n_steps=params.n_steps,
+            batch_size=params.batch_size,
+            learning_rate=params.learning_rate,
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
-            n_epochs=10,
+            n_epochs=params.n_epochs,
+            ent_coef=params.ent_coef,
             policy_kwargs=dict(net_arch=[128, 128]),
         )
 
@@ -466,7 +509,7 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
             deterministic=True,
             render=False,
         ))
-        callbacks.append(PnLEvalCallback(eval_env, eval_freq=params.eval_freq, max_steps=params.eval_max_steps, deterministic=True, verbose=1))
+        callbacks.append(PnLEvalCallback(eval_env, eval_freq=params.eval_freq, max_steps=params.eval_max_steps, deterministic=True, verbose=1, eval_log_path=params.eval_log_path))
 
     # Sync eval normalization stats with training env
     if isinstance(env, VecNormalize) and isinstance(eval_env, VecNormalize):

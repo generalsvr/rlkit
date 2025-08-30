@@ -10,7 +10,7 @@ def _ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
         if n not in cols:
             raise ValueError(f"Missing OHLCV column '{n}' in dataframe. Found: {list(df.columns)}")
     out = pd.DataFrame({
-        "open": df[cols["open"].lower() if cols.get("open") is None else cols["open"]].astype(float).values if False else df[cols["open"]].astype(float).values,
+        "open": df[cols["open"]].astype(float).values,
         "high": df[cols["high"]].astype(float).values,
         "low": df[cols["low"]].astype(float).values,
         "close": df[cols["close"]].astype(float).values,
@@ -65,7 +65,7 @@ def make_features(
             "d_hl": d_hl,
         }, index=base.index)
     else:
-        # Full feature set (causal). Removed MACD/Bollinger for consistency.
+        # Full feature set (causal). Keep MACD/EMA; remove Bollinger and funding.
         logret = np.diff(np.log(c + 1e-12), prepend=np.log(c[0] + 1e-12))
         hl_range = (h - l) / (c + 1e-12)
         upper_wick = (h - np.maximum(o, c)) / (c + 1e-12)
@@ -84,6 +84,15 @@ def make_features(
         # Realized volatility of returns (rolling std)
         ret_std_14 = pd.Series(logret).rolling(14, min_periods=1).std().fillna(0.0).to_numpy()
 
+        # EMA ratios and MACD histogram normalized by close
+        ema_fast = pd.Series(c).ewm(span=12, adjust=False).mean().to_numpy()
+        ema_slow = pd.Series(c).ewm(span=26, adjust=False).mean().to_numpy()
+        ema_fast_ratio = (ema_fast - c) / (c + 1e-12)
+        ema_slow_ratio = (ema_slow - c) / (c + 1e-12)
+        macd = ema_fast - ema_slow
+        macd_signal = pd.Series(macd).ewm(span=9, adjust=False).mean().to_numpy()
+        macd_hist_norm = (macd - macd_signal) / (c + 1e-12)
+
         feats = pd.DataFrame({
             "open": base["open"].values,
             "high": base["high"].values,
@@ -98,9 +107,12 @@ def make_features(
             "vol_z": vol_z,
             "atr": atr,
             "ret_std_14": ret_std_14,
+            "ema_fast_ratio": ema_fast_ratio,
+            "ema_slow_ratio": ema_slow_ratio,
+            "macd_hist_norm": macd_hist_norm,
         }, index=base.index)
 
-    # Removed funding_rate usage to keep features consistent across datasets
+    # Funding-rate intentionally removed for consistency across datasets
 
     # Sanitize any residual NaN/Inf from source data
     feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)
