@@ -13,7 +13,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 from stable_baselines3.common.callbacks import EvalCallback
 
 from .features import make_features
-from .transformer_extractor import TransformerExtractor
+from .transformer_extractor import TransformerExtractor, HybridLSTMTransformerExtractor
 from .env import FTTradingEnv, TradingConfig
 
 
@@ -94,7 +94,7 @@ class TrainParams:
     slippage_bps: float = 2.0
     reward_scale: float = 1.0
     pnl_on_close: bool = False
-    arch: str = "mlp"  # mlp | lstm | transformer
+    arch: str = "mlp"  # mlp | lstm | transformer | transformer_big | transformer_hybrid
 
 
 def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
@@ -168,6 +168,35 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
                 net_arch=[],
                 features_extractor_class=TransformerExtractor,
                 features_extractor_kwargs=dict(window=params.window, d_model=96, nhead=4, num_layers=2, ff_dim=192),
+            ),
+        )
+    elif arch == "transformer_hybrid":
+        model = PPO(
+            policy="MlpPolicy",
+            env=env,
+            verbose=1,
+            seed=params.seed,
+            n_steps=2048,
+            batch_size=256,
+            learning_rate=3e-4,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            n_epochs=10,
+            ent_coef=0.02,
+            policy_kwargs=dict(
+                net_arch=[],
+                features_extractor_class=HybridLSTMTransformerExtractor,
+                features_extractor_kwargs=dict(
+                    window=params.window,
+                    d_model=128,
+                    nhead=4,
+                    num_layers=2,
+                    ff_dim=256,
+                    dropout=0.1,
+                    lstm_hidden=128,
+                    bidirectional=True,
+                ),
             ),
         )
     elif arch == "transformer_big":
