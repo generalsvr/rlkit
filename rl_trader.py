@@ -132,6 +132,7 @@ def validate(
     max_steps: int = typer.Option(1000),
     deterministic: bool = typer.Option(True),
     device: str = typer.Option("cuda", help="Device for validation: cuda|cpu"),
+    timerange: str = typer.Option("", help="Optional timerange YYYYMMDD-YYYYMMDD for validation dataset"),
 ):
     """Run a quick validation rollout on eval split and print summary (actions, entries, equity)."""
     params = TrainParams(
@@ -142,7 +143,7 @@ def validate(
         model_out_path=model_path,
     )
     os.environ["RL_DEVICE"] = device
-    _ = validate_trained_model(params, max_steps=max_steps, deterministic=deterministic)
+    _ = validate_trained_model(params, max_steps=max_steps, deterministic=deterministic, timerange=timerange)
 
 
 if __name__ == "__main__":

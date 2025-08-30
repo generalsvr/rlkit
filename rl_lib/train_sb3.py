@@ -141,16 +141,27 @@ def _run_validation_rollout(model: PPO, eval_env: VecNormalize | DummyVecEnv, ma
     }
 
 
-def validate_trained_model(params: TrainParams, max_steps: int = 2000, deterministic: bool = True) -> Dict[str, Any]:
+def validate_trained_model(params: TrainParams, max_steps: int = 2000, deterministic: bool = True, timerange: Optional[str] = None) -> Dict[str, Any]:
     # Load data
     data_path = _find_data_file(params.userdir, params.pair, params.timeframe)
     if not data_path:
         raise FileNotFoundError("No data for validation.")
     raw = _load_ohlcv(data_path)
+    # Optional restrict to timerange
+    if timerange:
+        try:
+            start_str, end_str = timerange.split('-', 1)
+            start = pd.to_datetime(start_str) if start_str else None
+            end = pd.to_datetime(end_str) if end_str else None
+            if isinstance(raw.index, pd.DatetimeIndex):
+                if start is not None:
+                    raw = raw.loc[start:]
+                if end is not None:
+                    raw = raw.loc[:end]
+        except Exception:
+            pass
     feats = make_features(raw)
-    n = len(feats)
-    cut = int(n * 0.8)
-    eval_df = feats.iloc[cut - max(params.window, 1):].copy()
+    eval_df = feats.copy()
 
     tcfg = TradingConfig(
         window=params.window,
@@ -178,7 +189,8 @@ def validate_trained_model(params: TrainParams, max_steps: int = 2000, determini
         except Exception:
             pass
 
-    model = PPO.load(params.model_out_path, device="cpu")
+    import os as _os
+    model = PPO.load(params.model_out_path, device=_os.environ.get("RL_DEVICE", "cuda"))
     report = _run_validation_rollout(model, eval_env, max_steps=max_steps, deterministic=deterministic)
     # Pretty print
     print("VALIDATION SUMMARY:")
@@ -196,7 +208,7 @@ class TrainParams:
     total_timesteps: int = 200_000
     seed: int = 42
     model_out_path: str = "models/rl_ppo.zip"
-    fee_bps: float = 0.6
+    fee_bps: float = 6.0
     slippage_bps: float = 2.0
     reward_scale: float = 1.0
     pnl_on_close: bool = False
