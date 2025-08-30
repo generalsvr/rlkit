@@ -5,10 +5,12 @@ from pathlib import Path
 import logging
 import sys
 
-# Ensure project root is on sys.path so we use the project's rl_lib (matches training)
-_project_root = Path(__file__).resolve().parents[3]
-if str(_project_root) not in sys.path:
-    sys.path.insert(0, str(_project_root))
+# Ensure both userdir and project root are on sys.path so rl_lib resolves
+_userdir_root = Path(__file__).resolve().parents[1]
+_project_root = Path(__file__).resolve().parents[2]
+for _p in (str(_userdir_root), str(_project_root)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 from rl_lib.signal import compute_rl_signals
 
 
