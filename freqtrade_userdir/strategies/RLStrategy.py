@@ -53,8 +53,7 @@ class RLStrategy(IStrategy):
                 try:
                     outdir = Path(self.config.get('user_data_dir', '.')) / 'logs'
                     outdir.mkdir(parents=True, exist_ok=True)
-                    pair_tag = str(metadata.get('pair', 'PAIR')).replace('/', '_').replace(':', '_').replace(' ', '_')
-                    fp = outdir / f"signals_{pair_tag}_{self.timeframe}.csv"
+                    fp = outdir / f"signals_{metadata.get('pair', 'PAIR').replace('/', '_')}_{self.timeframe}.csv"
                     enriched.to_csv(fp)
                     self._logger.info(f"RLStrategy: dumped signals -> {fp}")
                 except Exception:

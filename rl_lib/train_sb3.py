@@ -605,20 +605,12 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
     cb = CallbackList(callbacks) if callbacks else None
     model.learn(total_timesteps=int(params.total_timesteps), callback=cb, progress_bar=True)
     model.save(params.model_out_path)
-    # Persist training feature set for consistent inference (model-specific and generic file)
+    # Persist training feature set for consistent inference
     try:
         import json as _json
-        out_dir = os.path.dirname(params.model_out_path)
-        base = os.path.splitext(os.path.basename(params.model_out_path))[0]
-        cols = list(train_df.columns)
-        # Model-specific file
-        feat_path_model = os.path.join(out_dir, f"{base}.feature_columns.json")
-        with open(feat_path_model, "w") as f:
-            _json.dump(cols, f)
-        # Generic fallback (kept for backward-compatibility)
-        feat_path_generic = os.path.join(out_dir, "feature_columns.json")
-        with open(feat_path_generic, "w") as f:
-            _json.dump(cols, f)
+        feat_path = os.path.join(os.path.dirname(params.model_out_path), "feature_columns.json")
+        with open(feat_path, "w") as f:
+            _json.dump(list(train_df.columns), f)
     except Exception:
         pass
     # Save normalization statistics alongside the model
