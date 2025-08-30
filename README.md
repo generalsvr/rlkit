@@ -6,6 +6,8 @@ python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 pip install -r requirements.extra.txt
 pip install freqtrade
+
+apt update && apt install build-essential wget && cd /tmp && wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && tar -xzf ta-lib-0.4.0-src.tar.gz && cd ta-lib/ && ./configure --prefix=/usr && make && make install && ldconfig && cd /workspace && git clone https://github.com/generalsvr/rlkit && cd rlkit && pip install -r requirements.txt && pip install --ignore-installed blinker==1.8.2 && pip install streamlit>=1.36.0
 ```
 
 ### Futures Mode (USDT-M, offline OHLCV)
@@ -124,7 +126,7 @@ freqtrade backtesting \
 Run the minimal visual terminal to download data, select ranges, run your RL agent, and visualize LONG/SHORT/EXIT and equity:
 ```bash
 source .venv/bin/activate
-streamlit run app.py
+streamlit run app.py   --server.headless true   --server.address 0.0.0.0   --server.port 8501   --server.enableCORS false   --server.enableXsrfProtection false
 ```
 
 Features:

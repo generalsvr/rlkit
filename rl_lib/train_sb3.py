@@ -44,6 +44,10 @@ def _find_data_file(userdir: str, pair: str, timeframe: str, prefer_exchange: Op
         base.replace(":", "_"),          # BTC_USDT_USDT
         base.split(":")[0],               # BTC_USDT
     }
+    # If user typed without futures suffix (e.g., BTC/USDT), still try BTC_USDT_USDT
+    up_pair = pair.upper()
+    if ":" not in pair and (up_pair.endswith("/USDT") or up_pair.endswith("_USDT")):
+        candidates.add(base + "_USDT")     # BTC_USDT_USDT
     suffixes = ["", "-futures"]
     for ext in ("parquet", "feather"):
         for name in candidates:
