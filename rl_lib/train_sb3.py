@@ -18,12 +18,19 @@ from .env import FTTradingEnv, TradingConfig
 
 
 def _find_data_file(userdir: str, pair: str, timeframe: str) -> Optional[str]:
-    safe_pair = pair.replace("/", "_")
+    # Support multiple naming variants across exchanges (e.g., Bybit futures)
+    base = pair.replace("/", "_")  # BTC_USDT or BTC_USDT:USDT
+    candidates = {
+        base,
+        base.replace(":", "_"),          # BTC_USDT_USDT
+        base.split(":")[0],               # BTC_USDT
+    }
     for ext in ("parquet", "feather"):
-        pattern = os.path.join(userdir, "data", "**", f"{safe_pair}-{timeframe}.{ext}")
-        hits = glob.glob(pattern, recursive=True)
-        if hits:
-            return hits[0]
+        for name in candidates:
+            pattern = os.path.join(userdir, "data", "**", f"{name}-{timeframe}.{ext}")
+            hits = glob.glob(pattern, recursive=True)
+            if hits:
+                return hits[0]
     return None
 
 
