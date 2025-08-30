@@ -255,11 +255,25 @@ def validate_trained_model(params: TrainParams, max_steps: int = 2000, determini
                 feature_columns = _json.load(f)
     except Exception:
         feature_columns = None
-    # Auto-detect feature mode from saved columns
+    # Auto-detect feature mode and HTFs from saved columns
     mode_for_eval = params.feature_mode
-    if isinstance(feature_columns, (list, tuple)) and any(col in feature_columns for col in ("close_z", "change", "d_hl")):
-        mode_for_eval = "basic"
-    feats = make_features(raw, feature_columns=feature_columns, mode=mode_for_eval, basic_lookback=params.basic_lookback, extra_timeframes=params.extra_timeframes)
+    extra_timeframes_for_eval = params.extra_timeframes
+    if isinstance(feature_columns, (list, tuple)):
+        if any(col in feature_columns for col in ("close_z", "change", "d_hl")):
+            mode_for_eval = "basic"
+        # Derive HTFs from column prefixes like '4H', '1D'
+        tfs = set()
+        for col in feature_columns:
+            if isinstance(col, str) and "_" in col:
+                prefix = col.split("_", 1)[0]
+                s = prefix.strip().upper()
+                if len(s) >= 2 and (s.endswith("H") or s.endswith("D")):
+                    head = s[:-1]
+                    if head.isdigit():
+                        tfs.add(s)
+        if tfs:
+            extra_timeframes_for_eval = sorted(tfs)
+    feats = make_features(raw, feature_columns=feature_columns, mode=mode_for_eval, basic_lookback=params.basic_lookback, extra_timeframes=extra_timeframes_for_eval)
     eval_df = feats.copy()
 
     # Diagnostics: show actual validation window after slicing

@@ -51,7 +51,27 @@ def compute_rl_signals(df: pd.DataFrame, model_path: str, window: int = 128) -> 
                 feature_columns = _json.load(f)
         except Exception:
             feature_columns = None
-    feats = make_features(df, feature_columns=feature_columns)
+    # Auto-detect feature mode and higher TFs from saved columns
+    mode_for_eval = None
+    extra_timeframes = None
+    if isinstance(feature_columns, (list, tuple)):
+        # Basic mode detector
+        if any(col in feature_columns for col in ("close_z", "change", "d_hl")):
+            mode_for_eval = "basic"
+        # Extract HTF prefixes like '4H', '1D'
+        tfs = set()
+        for col in feature_columns:
+            if isinstance(col, str) and "_" in col:
+                prefix = col.split("_", 1)[0]
+                s = prefix.strip().upper()
+                # crude timeframe pattern: digits + H or D
+                if len(s) >= 2 and (s.endswith("H") or s.endswith("D")):
+                    head = s[:-1]
+                    if head.isdigit():
+                        tfs.add(s)
+        if tfs:
+            extra_timeframes = sorted(tfs)
+    feats = make_features(df, feature_columns=feature_columns, mode=mode_for_eval, extra_timeframes=extra_timeframes)
     feats = feats.reset_index(drop=True)
     n = len(feats)
     actions = np.zeros(n, dtype=int)
