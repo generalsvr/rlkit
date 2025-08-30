@@ -39,6 +39,36 @@ def _load_ohlcv(path: str) -> pd.DataFrame:
     if time_col is not None:
         df[time_col] = pd.to_datetime(df[time_col])
         df = df.sort_values(time_col).set_index(time_col)
+
+    # Optional: merge Bybit funding rate (8h) if available
+    try:
+        base = os.path.basename(path)
+        name_noext = os.path.splitext(base)[0]
+        # e.g., BTC_USDT_USDT-1h -> pair_key = BTC_USDT_USDT
+        pair_key = name_noext.rsplit('-', 1)[0]
+        exchange_dir = os.path.dirname(path)
+        funding_path = os.path.join(os.path.dirname(exchange_dir), os.path.basename(exchange_dir), "futures", f"{pair_key}-8h-funding_rate.parquet")
+        # Fallback: typical layout /data/bybit/futures/<file>
+        if not os.path.exists(funding_path):
+            funding_path = os.path.join(os.path.dirname(exchange_dir), "futures", f"{pair_key}-8h-funding_rate.parquet")
+        if os.path.exists(funding_path):
+            fr = pd.read_parquet(funding_path)
+            c2 = {c.lower(): c for c in fr.columns}
+            tcol = c2.get("date") or c2.get("time") or c2.get("datetime")
+            if tcol is not None:
+                fr[tcol] = pd.to_datetime(fr[tcol])
+                fr = fr.sort_values(tcol).set_index(tcol)
+            # Expect a column named funding_rate; if not, take first numeric
+            if "funding_rate" not in fr.columns:
+                num_cols = [c for c in fr.columns if pd.api.types.is_numeric_dtype(fr[c])]
+                if num_cols:
+                    fr = fr.rename(columns={num_cols[0]: "funding_rate"})
+            # Resample to 1h, ffill
+            fr1h = fr[["funding_rate"]].resample("1H").ffill()
+            df = df.join(fr1h, how="left")
+            df["funding_rate"] = df["funding_rate"].fillna(0.0).astype(float)
+    except Exception:
+        pass
     return df
 
 
