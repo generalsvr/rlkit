@@ -9,7 +9,7 @@ FRONT_DIR="$ROOT_DIR/backtest_terminal"
 echo "[+] Repo root: $ROOT_DIR"
 
 # Start backend (FastAPI on 8501)
-echo "[+] Starting backend (FastAPI) on :8501"
+echo "[+] Starting backend (FastAPI) on :8080"
 (
   cd "$BACK_DIR"
   # Create venv if missing
@@ -24,17 +24,18 @@ echo "[+] Starting backend (FastAPI) on :8501"
   # Prefer CPU by default to avoid CUDA issues on Mac unless RL_DEVICE is set
   export RL_DEVICE="${RL_DEVICE:-cpu}"
   # Run server
-  uvicorn backtest_server.main:app --host 0.0.0.0 --port 8501 --reload &
+  uvicorn backtest_server.main:app --host 0.0.0.0 --port 8080 --reload &
   echo $! > "$BACK_DIR/.uvicorn.pid"
   deactivate || true
 ) 
 
 # Start frontend (Next.js on 3000)
-echo "[+] Starting frontend (Next.js) on :3000"
+echo "[+] Starting frontend (Next.js) on :8501"
 (
   cd "$FRONT_DIR"
   npm install --silent >/dev/null 2>&1 || true
-  npm run dev --silent &
+  # Next: dev server default is 3000; bind to 8501
+  PORT=8501 npm run dev --silent &
   echo $! > "$FRONT_DIR/.next.pid"
 )
 
@@ -52,12 +53,12 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "[+] Backend:  http://127.0.0.1:8501/health"
-echo "[+] Frontend: http://127.0.0.1:3000"
+echo "[+] Backend:  http://127.0.0.1:8080/health"
+echo "[+] Frontend: http://127.0.0.1:8501"
 
 # macOS: open browser tab (optional)
 if command -v open >/dev/null 2>&1; then
-  (sleep 1 && open "http://127.0.0.1:3000") >/dev/null 2>&1 || true
+  (sleep 1 && open "http://127.0.0.1:8501") >/dev/null 2>&1 || true
 fi
 
 echo "[i] Press Ctrl+C to stop both servers."

@@ -20,6 +20,7 @@ export default function Home() {
   const [timeframe, setTimeframe] = React.useState("1h");
   const [timerange, setTimerange] = React.useState<string>("");
   const [modelPath, setModelPath] = React.useState<string>("./models/newrl_ppo.zip");
+  const apiBase = (process.env.NEXT_PUBLIC_API_BASE as string) || "http://127.0.0.1:8080";
 
   async function loadChartsModule() {
     const mod: any = await import("lightweight-charts");
@@ -58,7 +59,7 @@ export default function Home() {
   }, []);
 
   const fetchCandles = async () => {
-    const r = await fetch("http://127.0.0.1:8501/candles", {
+    const r = await fetch(`${apiBase}/candles`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ pair, timeframe, timerange: timerange || null }),
@@ -79,7 +80,7 @@ export default function Home() {
     setLoading(true);
     setLogs([]);
     try {
-      const r = await fetch("http://127.0.0.1:8501/run", {
+      const r = await fetch(`${apiBase}/run`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({

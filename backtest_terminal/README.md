@@ -2,7 +2,7 @@ Backtest Agent Terminal (Next.js + FastAPI)
 
 Getting Started
 
-1) Backend (FastAPI on 8501)
+1) Backend (FastAPI on 8080)
 
 ```bash
 cd ../backtest_server
@@ -15,12 +15,12 @@ Endpoints:
 - POST /candles { pair, timeframe, timerange? }
 - POST /run { pair, timeframe, model_path, timerange?, window, reward_type, ... }
 
-2) Frontend (Next.js on 3000)
+2) Frontend (Next.js on 8501)
 
 ```bash
 cd ../backtest_terminal
 npm install
-npm run dev
+npm run dev  # serves on 8501
 ```
 
 Use the UI to:
