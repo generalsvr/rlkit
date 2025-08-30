@@ -89,12 +89,9 @@ echo "[+] Starting frontend (Next.js) on :8501"
     echo "[!] npm install failed" >&2
     exit 1
   fi
-  # Build production assets (do not suppress errors)
-  if ! npm run build --silent; then
-    echo "[!] npm run build failed" >&2
-    exit 1
-  fi
-  PORT=8501 npm run start --silent &
+  # Run dev server (no blocking build)
+  export NEXT_TELEMETRY_DISABLED=1
+  HOST=0.0.0.0 PORT=8501 npm run dev --silent &
   echo $! > "$FRONT_DIR/.next.pid"
 )
 
