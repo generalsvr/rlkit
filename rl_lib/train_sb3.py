@@ -159,10 +159,18 @@ def validate_trained_model(params: TrainParams, max_steps: int = 2000, determini
             start = pd.to_datetime(start_str) if start_str else None
             end = pd.to_datetime(end_str) if end_str else None
             if isinstance(raw.index, pd.DatetimeIndex):
+                idx = raw.index
+                # Normalize to naive for comparison if tz-aware
+                try:
+                    idx_cmp = idx.tz_convert(None) if idx.tz is not None else idx
+                except Exception:
+                    idx_cmp = idx.tz_localize(None) if getattr(idx, 'tz', None) is not None else idx
+                mask = pd.Series(True, index=idx)
                 if start is not None:
-                    raw = raw.loc[start:]
+                    mask &= idx_cmp >= pd.to_datetime(start)
                 if end is not None:
-                    raw = raw.loc[:end]
+                    mask &= idx_cmp <= pd.to_datetime(end)
+                raw = raw.loc[mask]
         except Exception:
             pass
     # Enforce training feature layout if available to match inference/backtest
@@ -177,6 +185,14 @@ def validate_trained_model(params: TrainParams, max_steps: int = 2000, determini
         feature_columns = None
     feats = make_features(raw, feature_columns=feature_columns)
     eval_df = feats.copy()
+
+    # Diagnostics: show actual validation window after slicing
+    if isinstance(eval_df.index, pd.DatetimeIndex) and not eval_df.empty:
+        _start_dt = str(eval_df.index[0])
+        _end_dt = str(eval_df.index[-1])
+        print(f"VALIDATION DATA: rows={len(eval_df)}, start={_start_dt}, end={_end_dt}")
+    else:
+        print(f"VALIDATION DATA: rows={len(eval_df)} (index type={type(eval_df.index).__name__})")
 
     tcfg = TradingConfig(
         window=params.window,
