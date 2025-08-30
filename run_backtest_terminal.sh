@@ -44,7 +44,7 @@ ensure_npm() {
     apt-get update -y >/dev/null 2>&1 || true
     curl -fsSL https://deb.nodesource.com/setup_20.x | bash - >/dev/null 2>&1 || true
     apt-get install -y nodejs >/dev/null 2>&1 || apt-get install -y nodejs npm >/dev/null 2>&1 || true
-  elif command -v yum >/dev/null 2>&1 && [ "${EUID:-$(id -u)}" -eq 0 ]; then
+  elif command -v yum >/dev/null 2>&1 && [ "${EUID:-$(id -u)}" -eq 0 ]; thenfix
     echo "[i] Installing Node.js via NodeSource (RHEL/CentOS)..."
     curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - >/dev/null 2>&1 || true
     yum install -y nodejs >/dev/null 2>&1 || true

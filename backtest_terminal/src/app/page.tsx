@@ -2,7 +2,7 @@
 
 import React from "react";
 import { createChart, ColorType, CrosshairMode } from "lightweight-charts";
-import type { IChartApi, ISeriesApi, UTCTimestamp, ChartOptions } from "lightweight-charts";
+import type { IChartApi, ISeriesApi, UTCTimestamp, ChartOptions, DeepPartial } from "lightweight-charts";
 
 type Candle = [number, number, number, number, number, number];
 type Mark = { time: number; label: string; color: string };
@@ -36,7 +36,7 @@ export default function Home() {
     if (!containerRef.current || chartRef.current) return;
     let chart: IChartApi | null = null;
     let ro: ResizeObserver | null = null;
-    const options: Partial<ChartOptions> = {
+    const options: DeepPartial<ChartOptions> = {
       height: 560,
       layout: { textColor: "#d1d5db", background: { type: ColorType.Solid, color: "#0b1220" } },
       grid: { horzLines: { color: "#1f2937" }, vertLines: { color: "#1f2937" } },
