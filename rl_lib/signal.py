@@ -76,8 +76,21 @@ def compute_rl_signals(df: pd.DataFrame, model_path: str, window: int = 128) -> 
     n = len(feats)
     actions = np.zeros(n, dtype=int)
 
-    # Rolling inference, causal, with position fed back into observation
-    position = 0
+    # Rolling inference with next-open execution parity and gating
+    position = 0  # effective position after last executed change
+    pending_target: int | None = None
+    last_change_idx = -10**9
+    cooldown_until_idx = -1
+    # Gates via env vars (optional)
+    try:
+        min_hold_bars = int(os.environ.get("RL_MIN_HOLD_BARS", "0"))
+    except Exception:
+        min_hold_bars = 0
+    try:
+        cooldown_bars = int(os.environ.get("RL_COOLDOWN_BARS", "0"))
+    except Exception:
+        cooldown_bars = 0
+
     enter_long = np.zeros(n, dtype=int)
     exit_long = np.zeros(n, dtype=int)
     enter_short = np.zeros(n, dtype=int)
@@ -85,6 +98,33 @@ def compute_rl_signals(df: pd.DataFrame, model_path: str, window: int = 128) -> 
     deterministic_flag = os.environ.get("RL_DETERMINISTIC", "true").lower() in ("1", "true", "yes")
 
     for t in range(window, n):
+        # Execute any pending target at this bar's open (signals set on this bar)
+        if pending_target is not None:
+            # Apply min-hold/cooldown gating already enforced at scheduling time
+            if pending_target == 0 and position != 0:
+                if position == 1:
+                    exit_long[t] = 1
+                elif position == -1:
+                    exit_short[t] = 1
+                position = 0
+                last_change_idx = t
+                if cooldown_bars > 0:
+                    cooldown_until_idx = t + cooldown_bars
+            elif pending_target == 1 and position <= 0:
+                if position == -1:
+                    exit_short[t] = 1
+                enter_long[t] = 1
+                position = 1
+                last_change_idx = t
+            elif pending_target == -1 and position >= 0:
+                if position == 1:
+                    exit_long[t] = 1
+                enter_short[t] = 1
+                position = -1
+                last_change_idx = t
+            pending_target = None
+
+        # Build observation with current effective position
         window_slice = feats.iloc[t - window:t].values.astype(np.float32)
         pos_feat = np.full((window, 1), float(position), dtype=np.float32)
         obs = np.concatenate([window_slice, pos_feat], axis=1).reshape(1, -1)
@@ -92,31 +132,25 @@ def compute_rl_signals(df: pd.DataFrame, model_path: str, window: int = 128) -> 
         a, _ = model.predict(obs, deterministic=deterministic_flag)
         act = int(a[0])
         actions[t] = act
-        if position == 0:
-            if act == 1:  # take_long
-                enter_long[t] = 1
-                position = 1
-            elif act == 2:  # take_short
-                enter_short[t] = 1
-                position = -1
-        elif position == 1:
-            if act == 3:
-                exit_long[t] = 1
-                position = 0
-            elif act == 2:
-                # Flip: long -> short
-                exit_long[t] = 1
-                enter_short[t] = 1
-                position = -1
-        elif position == -1:
-            if act == 3:
-                exit_short[t] = 1
-                position = 0
-            elif act == 1:
-                # Flip: short -> long
-                exit_short[t] = 1
-                enter_long[t] = 1
-                position = 1
+
+        # Decide desired target to be executed at t+1, subject to gating
+        if t + 1 >= n:
+            break
+        can_close = (t - last_change_idx) >= max(0, min_hold_bars)
+        can_open = t >= cooldown_until_idx
+        desired: int | None = None
+        if act == 1:  # request long
+            if position <= 0 and can_open:
+                desired = +1
+        elif act == 2:  # request short
+            if position >= 0 and can_open:
+                desired = -1
+        elif act == 3:  # request close
+            if position != 0 and can_close:
+                desired = 0
+        # Schedule for next bar
+        if desired is not None and pending_target is None:
+            pending_target = desired
 
     out = feats.copy()
     out["rl_action"] = actions
