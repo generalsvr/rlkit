@@ -99,9 +99,12 @@ export default function Home() {
           candles.map((c: Candle) => ({ time: toUtc(c[0]), open: c[1], high: c[2], low: c[3], close: c[4] }))
         );
         if (marks.length) {
-          series.setMarkers(
-            marks.map((m: Mark) => ({ time: toUtc(m.time), position: "aboveBar", color: m.color, shape: "arrowDown", text: m.label }))
-          );
+          const setMarkers = (series as unknown as { setMarkers: (m: unknown[]) => void }).setMarkers;
+          if (typeof setMarkers === "function") {
+            setMarkers(
+              marks.map((m: Mark) => ({ time: toUtc(m.time), position: "aboveBar", color: m.color, shape: "arrowDown", text: m.label }))
+            );
+          }
         }
         chartRef.current?.timeScale().fitContent();
       }
