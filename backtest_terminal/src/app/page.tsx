@@ -44,7 +44,7 @@ export default function Home() {
       crosshair: { mode: CrosshairMode.Magnet },
     };
     chart = createChart(containerRef.current as HTMLElement, options);
-    const series = chart.addCandlestickSeries();
+    const series = chart.addSeries({ type: 'Candlestick' });
     chartRef.current = chart;
     seriesRef.current = series;
     ro = new ResizeObserver(() => chart!.applyOptions({ width: containerRef.current?.clientWidth || 800 }));
