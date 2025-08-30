@@ -77,9 +77,9 @@ python rl_trader.py train --pair "BTC/USDT:USDT" --timeframe 1h \
   --seed 42 --device cuda \
   --eval-freq 50000 --n-eval-episodes 1 --eval-max-steps 2000
 ```
-Disable eval during long runs:
+MultiTF:
 ```bash
-python rl_trader.py train ... --eval-freq 0
+python rl_trader.py train --pair BTC/USDT:USDT --timeframe 1h --window 128 --timesteps 500000 --arch transformer_hybrid --reward-type vol_scaled --eval-freq 50000 --eval-max-steps 5000 --device cuda --extra-timeframes "4H,1D" --model-out ./models/newrl_ppo.zip 
 ```
 
 ### 3) Validate

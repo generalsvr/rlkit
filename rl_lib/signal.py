@@ -42,7 +42,11 @@ def compute_rl_signals(df: pd.DataFrame, model_path: str, window: int = 128) -> 
         return np.clip((obs - obs_mean) / (np.sqrt(obs_var + 1e-8)), -clip_obs, clip_obs)
 
     # Enforce training feature layout if available
-    feat_cols_path = os.path.join(os.path.dirname(model_path), "feature_columns.json")
+    # Prefer model-specific feature columns file; fallback to generic
+    base = os.path.splitext(os.path.basename(model_path))[0]
+    feat_cols_path_model = os.path.join(os.path.dirname(model_path), f"{base}.feature_columns.json")
+    feat_cols_path_generic = os.path.join(os.path.dirname(model_path), "feature_columns.json")
+    feat_cols_path = feat_cols_path_model if os.path.exists(feat_cols_path_model) else feat_cols_path_generic
     feature_columns = None
     if os.path.exists(feat_cols_path):
         try:
