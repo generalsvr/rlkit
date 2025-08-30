@@ -1,7 +1,7 @@
 "use client";
 
 import React from "react";
-import { createChart } from "lightweight-charts";
+import { createChart, ColorType, CrosshairMode } from "lightweight-charts";
 import type { IChartApi, ISeriesApi, UTCTimestamp, ChartOptions } from "lightweight-charts";
 
 type Candle = [number, number, number, number, number, number];
@@ -38,10 +38,10 @@ export default function Home() {
     let ro: ResizeObserver | null = null;
     const options: Partial<ChartOptions> = {
       height: 560,
-      layout: { textColor: "#d1d5db", background: { type: "solid", color: "#0b1220" } },
+      layout: { textColor: "#d1d5db", background: { type: ColorType.Solid, color: "#0b1220" } },
       grid: { horzLines: { color: "#1f2937" }, vertLines: { color: "#1f2937" } },
       timeScale: { rightOffset: 4, barSpacing: 8, lockVisibleTimeRangeOnResize: true },
-      crosshair: { mode: 1 },
+      crosshair: { mode: CrosshairMode.Magnet },
     };
     chart = createChart(containerRef.current as HTMLElement, options);
     const series = chart.addCandlestickSeries();
