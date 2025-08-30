@@ -35,6 +35,7 @@ def make_features(
     feature_columns: Optional[List[str]] | None = None,
     mode: Optional[str] = None,
     basic_lookback: int = 64,
+    extra_timeframes: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     base = _ensure_ohlcv(df)
 
@@ -112,7 +113,83 @@ def make_features(
             "macd_hist_norm": macd_hist_norm,
         }, index=base.index)
 
-    # Funding-rate intentionally removed for consistency across datasets
+    # Add higher timeframe features (resampled and forward-filled) if requested
+    if extra_timeframes:
+        if isinstance(base.index, pd.DatetimeIndex):
+            for tf in extra_timeframes:
+                try:
+                    tf_str = str(tf).upper()
+                    agg = {
+                        "open": "first",
+                        "high": "max",
+                        "low": "min",
+                        "close": "last",
+                        "volume": "sum",
+                    }
+                    res = base.resample(tf_str).agg(agg).dropna(how="all")
+                    # Compute the same feature set on HTF
+                    rc = res["close"].values
+                    ro = res["open"].values
+                    rh = res["high"].values
+                    rl = res["low"].values
+                    rv = res["volume"].values
+
+                    if mode_l == "basic":
+                        change_tf = np.diff(np.log(rc + 1e-12), prepend=np.log(rc[0] + 1e-12))
+                        d_hl_tf = (rh - rl) / (rc + 1e-12)
+                        s_tf = pd.Series(rc, index=res.index)
+                        roll_mean_tf = s_tf.rolling(basic_lookback, min_periods=1).mean()
+                        roll_std_tf = s_tf.rolling(basic_lookback, min_periods=1).std().fillna(0.0)
+                        roll_std_tf = roll_std_tf.replace(0.0, 1e-8)
+                        close_z_tf = ((s_tf - roll_mean_tf) / roll_std_tf)
+                        feats_tf = pd.DataFrame({
+                            f"{tf}_close_z": close_z_tf,
+                            f"{tf}_change": change_tf,
+                            f"{tf}_d_hl": d_hl_tf,
+                        }, index=res.index)
+                    else:
+                        logret_tf = np.diff(np.log(rc + 1e-12), prepend=np.log(rc[0] + 1e-12))
+                        hl_range_tf = (rh - rl) / (rc + 1e-12)
+                        upper_wick_tf = (rh - np.maximum(ro, rc)) / (rc + 1e-12)
+                        lower_wick_tf = (np.minimum(ro, rc) - rl) / (rc + 1e-12)
+                        rsi_tf = compute_rsi(rc, period=14) / 100.0
+                        vol_z_tf = (rv - rv.mean()) / (rv.std() + 1e-8)
+                        tr1_tf = rh - rl
+                        tr2_tf = np.abs(rh - np.roll(rc, 1))
+                        tr3_tf = np.abs(rl - np.roll(rc, 1))
+                        tr_tf = np.maximum.reduce([tr1_tf, tr2_tf, tr3_tf])
+                        tr_tf[0] = rh[0] - rl[0]
+                        atr_tf = pd.Series(tr_tf, index=res.index).ewm(alpha=1 / 14, adjust=False).mean().to_numpy() / (rc + 1e-12)
+                        ret_std_14_tf = pd.Series(logret_tf, index=res.index).rolling(14, min_periods=1).std().fillna(0.0).to_numpy()
+                        ema_fast_tf = pd.Series(rc, index=res.index).ewm(span=12, adjust=False).mean().to_numpy()
+                        ema_slow_tf = pd.Series(rc, index=res.index).ewm(span=26, adjust=False).mean().to_numpy()
+                        ema_fast_ratio_tf = (ema_fast_tf - rc) / (rc + 1e-12)
+                        ema_slow_ratio_tf = (ema_slow_tf - rc) / (rc + 1e-12)
+                        macd_tf = ema_fast_tf - ema_slow_tf
+                        macd_signal_tf = pd.Series(macd_tf, index=res.index).ewm(span=9, adjust=False).mean().to_numpy()
+                        macd_hist_norm_tf = (macd_tf - macd_signal_tf) / (rc + 1e-12)
+                        feats_tf = pd.DataFrame({
+                            f"{tf}_logret": logret_tf,
+                            f"{tf}_hl_range": hl_range_tf,
+                            f"{tf}_upper_wick": upper_wick_tf,
+                            f"{tf}_lower_wick": lower_wick_tf,
+                            f"{tf}_rsi": rsi_tf,
+                            f"{tf}_vol_z": vol_z_tf,
+                            f"{tf}_atr": atr_tf,
+                            f"{tf}_ret_std_14": ret_std_14_tf,
+                            f"{tf}_ema_fast_ratio": ema_fast_ratio_tf,
+                            f"{tf}_ema_slow_ratio": ema_slow_ratio_tf,
+                            f"{tf}_macd_hist_norm": macd_hist_norm_tf,
+                        }, index=res.index)
+                    # Align to base index causally
+                    feats_tf_aligned = feats_tf.reindex(base.index).ffill().fillna(0.0)
+                    feats = feats.join(feats_tf_aligned, how="left")
+                except Exception:
+                    # If resampling fails, skip this timeframe silently
+                    continue
+        else:
+            # Non-datetime index: ignore extra timeframes to avoid misalignment
+            pass
 
     # Sanitize any residual NaN/Inf from source data
     feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)

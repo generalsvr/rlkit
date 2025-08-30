@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import glob
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 import numpy as np
 import pandas as pd
@@ -17,6 +17,7 @@ import csv
 
 from .features import make_features
 from .transformer_extractor import TransformerExtractor, HybridLSTMTransformerExtractor
+from .transformer_extractor import MultiScaleHTFExtractor  # type: ignore
 from .env import FTTradingEnv, TradingConfig
 
 
@@ -243,7 +244,7 @@ def validate_trained_model(params: TrainParams, max_steps: int = 2000, determini
     mode_for_eval = params.feature_mode
     if isinstance(feature_columns, (list, tuple)) and any(col in feature_columns for col in ("close_z", "change", "d_hl")):
         mode_for_eval = "basic"
-    feats = make_features(raw, feature_columns=feature_columns, mode=mode_for_eval, basic_lookback=params.basic_lookback)
+    feats = make_features(raw, feature_columns=feature_columns, mode=mode_for_eval, basic_lookback=params.basic_lookback, extra_timeframes=params.extra_timeframes)
     eval_df = feats.copy()
 
     # Diagnostics: show actual validation window after slicing
@@ -314,7 +315,7 @@ class TrainParams:
     reward_scale: float = 1.0
     pnl_on_close: bool = False
     idle_penalty_bps: float = 0.02
-    arch: str = "mlp"  # mlp | lstm | transformer | transformer_big | transformer_hybrid
+    arch: str = "mlp"  # mlp | lstm | transformer | transformer_big | transformer_hybrid | multiscale
     device: str = "cuda"
     prefer_exchange: Optional[str] = None
     # Env shaping and risk controls
@@ -329,6 +330,7 @@ class TrainParams:
     # Feature pipeline
     feature_mode: str = "full"  # full | basic
     basic_lookback: int = 64
+    extra_timeframes: Optional[List[str]] = None
     # Evaluation
     eval_freq: int = 100_000  # steps; <=0 disables eval
     n_eval_episodes: int = 3
@@ -353,7 +355,7 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
             f"Run data download first."
         )
     raw = _load_ohlcv(data_path)
-    feats = make_features(raw, mode=params.feature_mode, basic_lookback=params.basic_lookback)
+    feats = make_features(raw, mode=params.feature_mode, basic_lookback=params.basic_lookback, extra_timeframes=params.extra_timeframes)
 
     # Simple split: 80/20 by time
     n = len(feats)
@@ -389,6 +391,32 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
     env = VecNormalize(env, norm_obs=True, norm_reward=False, clip_obs=10.0)
     eval_env = DummyVecEnv([make_eval])
     eval_env = VecNormalize(eval_env, training=False, norm_obs=True, norm_reward=False, clip_obs=10.0)
+
+    # Compute feature groups for multiscale extractor
+    base_cols = list(train_df.columns)
+    group_to_indices: Dict[str, List[int]] = {"base": []}
+    if params.extra_timeframes:
+        for tf in params.extra_timeframes:
+            group_to_indices[tf] = []
+    for i, col in enumerate(base_cols):
+        matched = False
+        if params.extra_timeframes:
+            for tf in params.extra_timeframes:
+                prefix = f"{str(tf).upper()}_"
+                if col.startswith(prefix):
+                    group_to_indices[tf].append(i)
+                    matched = True
+                    break
+        if not matched:
+            group_to_indices["base"].append(i)
+    # Add position feature (last column) to base group
+    pos_index = len(base_cols)
+    group_to_indices["base"].append(pos_index)
+
+    strides: Dict[str, int] = {"base": 1}
+    if params.extra_timeframes:
+        for tf in params.extra_timeframes:
+            strides[tf] = _tf_stride(tf)
 
     arch = params.arch.lower()
     if arch == "lstm":
@@ -478,6 +506,36 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
                 net_arch=[],
                 features_extractor_class=TransformerExtractor,
                 features_extractor_kwargs=dict(window=params.window, d_model=192, nhead=8, num_layers=4, ff_dim=768),
+            ),
+        )
+    elif arch == "multiscale":
+        model = PPO(
+            policy="MlpPolicy",
+            env=env,
+            verbose=1,
+            seed=params.seed,
+            device=params.device,
+            n_steps=params.n_steps,
+            batch_size=params.batch_size,
+            learning_rate=params.learning_rate,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            n_epochs=params.n_epochs,
+            ent_coef=params.ent_coef,
+            policy_kwargs=dict(
+                net_arch=[],
+                features_extractor_class=MultiScaleHTFExtractor,
+                features_extractor_kwargs=dict(
+                    window=params.window,
+                    groups=group_to_indices,
+                    strides=strides,
+                    d_model=128,
+                    ff_dim=256,
+                    nhead=4,
+                    num_layers=1,
+                    dropout=0.1,
+                ),
             ),
         )
     else:

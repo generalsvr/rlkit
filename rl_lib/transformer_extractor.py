@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Tuple, Dict, List
 import math
 import torch
 from torch import nn
@@ -113,6 +113,7 @@ class HybridLSTMTransformerExtractor(BaseFeaturesExtractor):
         last = torch.nan_to_num(last, nan=0.0, posinf=1e6, neginf=-1e6)
         return last
 
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 10000):
         super().__init__()
@@ -126,5 +127,77 @@ class PositionalEncoding(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         T = x.size(1)
         return x + self.pe[:, :T, :]
+
+
+class MultiScaleHTFExtractor(BaseFeaturesExtractor):
+    """
+    Per-HTF encoders with stride downsampling and gated fusion.
+
+    Args:
+        window: base window length (in base bars)
+        groups: mapping group_name -> list of feature indices (columns within per-step feature vector)
+        strides: mapping group_name -> downsample stride in base bars (e.g., base=1, 4H=4, 1D=24)
+        d_model: hidden size for each group encoder
+        ff_dim, nhead, num_layers, dropout: Transformer encoder hyperparams per group
+
+    Output: fused vector of size d_model
+    """
+
+    def __init__(self, observation_space: spaces.Box, window: int, groups: Dict[str, List[int]], strides: Dict[str, int],
+                 d_model: int = 128, ff_dim: int = 256, nhead: int = 4, num_layers: int = 1, dropout: float = 0.1):
+        obs_dim = int(observation_space.shape[0])
+        assert obs_dim % window == 0, "Observation dim must be divisible by window."
+        self.window = window
+        self.feature_dim = obs_dim // window
+        super().__init__(observation_space, features_dim=d_model)
+
+        self.groups = groups
+        self.strides = strides
+        self.group_names = list(groups.keys())
+
+        # Per-group slicers and encoders
+        self.in_linears = nn.ModuleDict()
+        self.norms_in = nn.ModuleDict()
+        self.encoders = nn.ModuleDict()
+        self.norms_out = nn.ModuleDict()
+        self.pos = PositionalEncoding(d_model)
+        for g, idxs in groups.items():
+            in_dim = max(1, len(idxs))
+            self.in_linears[g] = nn.Linear(in_dim, d_model)
+            self.norms_in[g] = nn.LayerNorm(d_model)
+            layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=ff_dim, dropout=dropout, batch_first=True, activation="gelu")
+            self.encoders[g] = nn.TransformerEncoder(layer, num_layers=num_layers)
+            self.norms_out[g] = nn.LayerNorm(d_model)
+
+        # Learnable gates per group
+        self.gates = nn.Parameter(torch.ones(len(self.group_names)))
+        self.fuse_norm = nn.LayerNorm(d_model)
+
+    def forward(self, observations: torch.Tensor) -> torch.Tensor:
+        b, d = observations.shape
+        x = observations.view(b, self.window, self.feature_dim)
+        x = torch.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
+
+        fused = None
+        gates = torch.softmax(self.gates, dim=0)
+        for i, g in enumerate(self.group_names):
+            idxs = self.groups[g]
+            stride = max(1, int(self.strides.get(g, 1)))
+            xs = x[:, :, idxs] if len(idxs) > 1 else x[:, :, idxs[0:1]]
+            if stride > 1:
+                xs = xs[:, ::stride, :]
+            h = self.in_linears[g](xs)
+            h = self.norms_in[g](h)
+            h = self.pos(h)
+            T = h.size(1)
+            mask = torch.triu(torch.ones(T, T, device=h.device), diagonal=1).bool()
+            z = self.encoders[g](h, mask=mask)
+            last = z[:, -1, :]
+            last = self.norms_out[g](last)
+            last = gates[i] * last
+            fused = last if fused is None else fused + last
+        fused = self.fuse_norm(fused)
+        fused = torch.nan_to_num(fused, nan=0.0, posinf=1e6, neginf=-1e6)
+        return fused
 
 
