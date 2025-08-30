@@ -20,13 +20,22 @@ export default function Home() {
   const [timeframe, setTimeframe] = React.useState("1h");
   const [timerange, setTimerange] = React.useState<string>("");
   const [modelPath, setModelPath] = React.useState<string>("./models/newrl_ppo.zip");
-  const apiBase = (process.env.NEXT_PUBLIC_API_BASE as string) || "http://127.0.0.1:8080";
+  const defaultApi = (process.env.NEXT_PUBLIC_API_BASE as string)
+    || (typeof window !== "undefined" ? `${window.location.protocol}//${window.location.hostname}:8080` : "http://127.0.0.1:8080");
+  const [apiBase, setApiBase] = React.useState<string>(defaultApi);
+
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    const p = new URLSearchParams(window.location.search);
+    const api = p.get("api");
+    if (api) setApiBase(api);
+  }, []);
 
   async function loadChartsModule() {
-    const mod: any = await import("lightweight-charts");
-    const create = mod.createChart || (mod.default && mod.default.createChart);
-    if (!create) throw new Error("createChart not found in lightweight-charts module");
-    return create as (container: HTMLElement, options?: any) => IChartApi;
+    const mod = await import("lightweight-charts");
+    const { createChart } = mod as unknown as { createChart: (container: HTMLElement, options?: any) => IChartApi };
+    if (!createChart) throw new Error("createChart not found in lightweight-charts module");
+    return createChart;
   }
 
   React.useEffect(() => {
@@ -42,7 +51,12 @@ export default function Home() {
           timeScale: { rightOffset: 4, barSpacing: 8, lockVisibleTimeRangeOnResize: true },
           crosshair: { mode: 1 },
         });
-        const series = (chart as any).addCandlestickSeries();
+        const addSeries: any = (chart as any).addCandlestickSeries;
+        if (typeof addSeries !== "function") {
+          console.error("CandlestickSeries method not found on chart", chart);
+          throw new Error("Candlestick series API not available");
+        }
+        const series = addSeries.call(chart);
         chartRef.current = chart;
         seriesRef.current = series;
         ro = new ResizeObserver(() => chart!.applyOptions({ width: containerRef.current?.clientWidth || 800 }));
@@ -68,7 +82,7 @@ export default function Home() {
     const j = await r.json();
     const candles: Candle[] = j.candles || [];
     const series = seriesRef.current;
-    if (series) {
+    if (series && candles.length) {
       series.setData(
         candles.map((c: Candle) => ({ time: toUtc(c[0]), open: c[1], high: c[2], low: c[3], close: c[4] }))
       );
@@ -120,6 +134,10 @@ export default function Home() {
     <main className="min-h-screen bg-[#0b1220] text-gray-200 p-6">
       <h1 className="text-xl font-semibold mb-4">Backtest Agent Terminal</h1>
       <div className="flex flex-wrap gap-3 items-end mb-4">
+        <div className="flex flex-col">
+          <label className="text-xs mb-1">API Base (override)</label>
+          <input className="bg-gray-900 border border-gray-700 rounded px-2 py-1 w-[360px]" value={apiBase} onChange={(e) => setApiBase(e.target.value)} placeholder="https://your-proxy-domain:8080" />
+        </div>
         <div className="flex flex-col">
           <label className="text-xs mb-1">Pair</label>
           <input className="bg-gray-900 border border-gray-700 rounded px-2 py-1" value={pair} onChange={(e) => setPair(e.target.value)} />

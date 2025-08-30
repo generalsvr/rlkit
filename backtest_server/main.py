@@ -102,8 +102,10 @@ def candles(q: CandlesQuery) -> JSONResponse:
     for i in range(len(df)):
         ts = int(pd.Timestamp(idx[i]).value // 10**6) if isinstance(idx, pd.DatetimeIndex) else int(i)
         row = df.iloc[i]
-        out.append([ts, float(row["open"]), float(row["high"]), float(row["low"]), float(row["close"]), float(row.get("volume", 0.0))])
-    return JSONResponse({"candles": out})
+        out.append([ts, float(row.get("open", np.nan)), float(row.get("high", np.nan)), float(row.get("low", np.nan)), float(row.get("close", np.nan)), float(row.get("volume", 0.0))])
+    # Filter out rows missing OHLC to avoid client errors
+    filtered = [c for c in out if all(np.isfinite(v) for v in c[1:5])]
+    return JSONResponse({"candles": filtered})
 
 
 def _slice_timerange(df: pd.DataFrame, timerange: Optional[str]) -> pd.DataFrame:
