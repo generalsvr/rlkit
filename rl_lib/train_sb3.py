@@ -53,37 +53,26 @@ def _load_ohlcv(path: str) -> pd.DataFrame:
     if time_col is not None:
         df[time_col] = pd.to_datetime(df[time_col])
         df = df.sort_values(time_col).set_index(time_col)
-
-    # Optional: merge Bybit funding rate (8h) if available
-    try:
-        base = os.path.basename(path)
-        name_noext = os.path.splitext(base)[0]
-        # e.g., BTC_USDT_USDT-1h -> pair_key = BTC_USDT_USDT
-        pair_key = name_noext.rsplit('-', 1)[0]
-        exchange_dir = os.path.dirname(path)
-        funding_path = os.path.join(os.path.dirname(exchange_dir), os.path.basename(exchange_dir), "futures", f"{pair_key}-8h-funding_rate.parquet")
-        # Fallback: typical layout /data/bybit/futures/<file>
-        if not os.path.exists(funding_path):
-            funding_path = os.path.join(os.path.dirname(exchange_dir), "futures", f"{pair_key}-8h-funding_rate.parquet")
-        if os.path.exists(funding_path):
-            fr = pd.read_parquet(funding_path)
-            c2 = {c.lower(): c for c in fr.columns}
-            tcol = c2.get("date") or c2.get("time") or c2.get("datetime")
-            if tcol is not None:
-                fr[tcol] = pd.to_datetime(fr[tcol])
-                fr = fr.sort_values(tcol).set_index(tcol)
-            # Expect a column named funding_rate; if not, take first numeric
-            if "funding_rate" not in fr.columns:
-                num_cols = [c for c in fr.columns if pd.api.types.is_numeric_dtype(fr[c])]
-                if num_cols:
-                    fr = fr.rename(columns={num_cols[0]: "funding_rate"})
-            # Resample to 1h, ffill
-            fr1h = fr[["funding_rate"]].resample("1H").ffill()
-            df = df.join(fr1h, how="left")
-            df["funding_rate"] = df["funding_rate"].fillna(0.0).astype(float)
-    except Exception:
-        pass
     return df
+
+
+def _compute_risk_metrics(equities: np.ndarray) -> Dict[str, float]:
+    if equities.size < 2:
+        return {"sharpe": float("nan"), "sortino": float("nan"), "max_drawdown": float("nan"), "calmar": float("nan")}
+    rets = np.diff(equities) / (equities[:-1] + 1e-12)
+    mean = float(np.mean(rets))
+    std = float(np.std(rets) + 1e-12)
+    downside = rets[rets < 0.0]
+    dd_std = float(np.std(downside) + 1e-12)
+    cummax = np.maximum.accumulate(equities)
+    dd = (cummax - equities) / (cummax + 1e-12)
+    max_dd = float(np.max(dd)) if dd.size else float("nan")
+    sharpe = mean / std if std > 0 else float("nan")
+    sortino = mean / dd_std if dd_std > 0 else float("nan")
+    calmar = (mean / (max_dd + 1e-12)) if max_dd > 0 else float("nan")
+    return {"sharpe": sharpe, "sortino": sortino, "max_drawdown": max_dd, "calmar": calmar}
+
+
 def _run_validation_rollout(model: PPO, eval_env: VecNormalize | DummyVecEnv, max_steps: int = 2000, deterministic: bool = True) -> Dict[str, Any]:
     # Assumes single-env DummyVecEnv wrapped (VecNormalize optional)
     obs = eval_env.reset()
@@ -132,6 +121,7 @@ def _run_validation_rollout(model: PPO, eval_env: VecNormalize | DummyVecEnv, ma
     max_equity = float(np.max(eq_series)) if eq_series.size > 0 else float("nan")
     min_equity = float(np.min(eq_series)) if eq_series.size > 0 else float("nan")
     time_in_pos = float(np.mean(np.asarray(positions) != 0)) if positions else 0.0
+    risk = _compute_risk_metrics(eq_series) if eq_series.size > 1 else {"sharpe": float("nan"), "sortino": float("nan"), "max_drawdown": float("nan"), "calmar": float("nan")}
     return {
         "steps": steps,
         "action_counts": action_counts,
@@ -143,7 +133,9 @@ def _run_validation_rollout(model: PPO, eval_env: VecNormalize | DummyVecEnv, ma
         "final_equity": final_equity,
         "max_equity": max_equity,
         "min_equity": min_equity,
+        **risk,
     }
+
 
 
 def validate_trained_model(params: TrainParams, max_steps: int = 2000, deterministic: bool = True, timerange: Optional[str] = None) -> Dict[str, Any]:
@@ -183,7 +175,11 @@ def validate_trained_model(params: TrainParams, max_steps: int = 2000, determini
                 feature_columns = _json.load(f)
     except Exception:
         feature_columns = None
-    feats = make_features(raw, feature_columns=feature_columns)
+    # Auto-detect feature mode from saved columns
+    mode_for_eval = params.feature_mode
+    if isinstance(feature_columns, (list, tuple)) and any(col in feature_columns for col in ("close_z", "change", "d_hl")):
+        mode_for_eval = "basic"
+    feats = make_features(raw, feature_columns=feature_columns, mode=mode_for_eval, basic_lookback=params.basic_lookback)
     eval_df = feats.copy()
 
     # Diagnostics: show actual validation window after slicing
@@ -201,6 +197,14 @@ def validate_trained_model(params: TrainParams, max_steps: int = 2000, determini
         reward_scale=params.reward_scale,
         pnl_on_close=params.pnl_on_close,
         idle_penalty_bps=params.idle_penalty_bps,
+        reward_type=params.reward_type,
+        vol_lookback=params.vol_lookback,
+        turnover_penalty_bps=params.turnover_penalty_bps,
+        dd_penalty=params.dd_penalty,
+        min_hold_bars=params.min_hold_bars,
+        cooldown_bars=params.cooldown_bars,
+        random_reset=params.random_reset,
+        episode_max_steps=params.episode_max_steps,
     )
 
     def make_eval():
@@ -248,6 +252,19 @@ class TrainParams:
     arch: str = "mlp"  # mlp | lstm | transformer | transformer_big | transformer_hybrid
     device: str = "cuda"
     prefer_exchange: Optional[str] = None
+    # Env shaping and risk controls
+    reward_type: str = "raw"  # raw | vol_scaled | sharpe_proxy
+    vol_lookback: int = 20
+    turnover_penalty_bps: float = 0.0
+    dd_penalty: float = 0.0
+    min_hold_bars: int = 0
+    cooldown_bars: int = 0
+    random_reset: bool = False
+    episode_max_steps: int = 0
+    # Feature pipeline
+    feature_mode: str = "full"  # full | basic
+    basic_lookback: int = 64
+
 
 
 def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
@@ -260,7 +277,7 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
             f"Run data download first."
         )
     raw = _load_ohlcv(data_path)
-    feats = make_features(raw)
+    feats = make_features(raw, mode=params.feature_mode, basic_lookback=params.basic_lookback)
 
     # Simple split: 80/20 by time
     n = len(feats)
@@ -275,6 +292,14 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
         reward_scale=params.reward_scale,
         pnl_on_close=params.pnl_on_close,
         idle_penalty_bps=params.idle_penalty_bps,
+        reward_type=params.reward_type,
+        vol_lookback=params.vol_lookback,
+        turnover_penalty_bps=params.turnover_penalty_bps,
+        dd_penalty=params.dd_penalty,
+        min_hold_bars=params.min_hold_bars,
+        cooldown_bars=params.cooldown_bars,
+        random_reset=params.random_reset,
+        episode_max_steps=params.episode_max_steps,
     )
 
     def make_train():
@@ -332,6 +357,7 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
             env=env,
             verbose=1,
             seed=params.seed,
+            device=params.device,
             n_steps=2048,
             batch_size=256,
             learning_rate=3e-4,

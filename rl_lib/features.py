@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from typing import List
+from typing import List, Optional
 
 
 def _ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
@@ -10,7 +10,7 @@ def _ensure_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
         if n not in cols:
             raise ValueError(f"Missing OHLCV column '{n}' in dataframe. Found: {list(df.columns)}")
     out = pd.DataFrame({
-        "open": df[cols["open"]].astype(float).values,
+        "open": df[cols["open"].lower() if cols.get("open") is None else cols["open"]].astype(float).values if False else df[cols["open"]].astype(float).values,
         "high": df[cols["high"]].astype(float).values,
         "low": df[cols["low"]].astype(float).values,
         "close": df[cols["close"]].astype(float).values,
@@ -30,7 +30,12 @@ def compute_rsi(close: np.ndarray, period: int = 14, eps: float = 1e-8) -> np.nd
     return rsi
 
 
-def make_features(df: pd.DataFrame, feature_columns: List[str] | None = None) -> pd.DataFrame:
+def make_features(
+    df: pd.DataFrame,
+    feature_columns: Optional[List[str]] | None = None,
+    mode: Optional[str] = None,
+    basic_lookback: int = 64,
+) -> pd.DataFrame:
     base = _ensure_ohlcv(df)
 
     c = base["close"].values
@@ -39,65 +44,63 @@ def make_features(df: pd.DataFrame, feature_columns: List[str] | None = None) ->
     l = base["low"].values
     v = base["volume"].values
 
-    logret = np.diff(np.log(c + 1e-12), prepend=np.log(c[0] + 1e-12))
-    hl_range = (h - l) / (c + 1e-12)
-    upper_wick = (h - np.maximum(o, c)) / (c + 1e-12)
-    lower_wick = (np.minimum(o, c) - l) / (c + 1e-12)
-    rsi = compute_rsi(c, period=14) / 100.0
-    vol_z = (v - v.mean()) / (v.std() + 1e-8)
+    mode_l = (mode or "full").lower()
+    if mode_l == "basic":
+        # Minimal, causal, standardized features: close_z, change, d_hl
+        change = np.diff(np.log(c + 1e-12), prepend=np.log(c[0] + 1e-12))
+        d_hl = (h - l) / (c + 1e-12)
+        s = pd.Series(c)
+        roll_mean = s.rolling(basic_lookback, min_periods=1).mean()
+        roll_std = s.rolling(basic_lookback, min_periods=1).std().fillna(0.0)
+        roll_std = roll_std.replace(0.0, 1e-8)
+        close_z = ((s - roll_mean) / roll_std).to_numpy()
+        feats = pd.DataFrame({
+            "open": base["open"].values,
+            "high": base["high"].values,
+            "low": base["low"].values,
+            "close": base["close"].values,
+            "volume": base["volume"].values,
+            "close_z": close_z,
+            "change": change,
+            "d_hl": d_hl,
+        }, index=base.index)
+    else:
+        # Full feature set (causal). Removed MACD/Bollinger for consistency.
+        logret = np.diff(np.log(c + 1e-12), prepend=np.log(c[0] + 1e-12))
+        hl_range = (h - l) / (c + 1e-12)
+        upper_wick = (h - np.maximum(o, c)) / (c + 1e-12)
+        lower_wick = (np.minimum(o, c) - l) / (c + 1e-12)
+        rsi = compute_rsi(c, period=14) / 100.0
+        vol_z = (v - v.mean()) / (v.std() + 1e-8)
 
-    # ATR normalized by close
-    tr1 = h - l
-    tr2 = np.abs(h - np.roll(c, 1))
-    tr3 = np.abs(l - np.roll(c, 1))
-    tr = np.maximum.reduce([tr1, tr2, tr3])
-    tr[0] = h[0] - l[0]
-    atr = pd.Series(tr).ewm(alpha=1 / 14, adjust=False).mean().to_numpy() / (c + 1e-12)
+        # ATR normalized by close
+        tr1 = h - l
+        tr2 = np.abs(h - np.roll(c, 1))
+        tr3 = np.abs(l - np.roll(c, 1))
+        tr = np.maximum.reduce([tr1, tr2, tr3])
+        tr[0] = h[0] - l[0]
+        atr = pd.Series(tr).ewm(alpha=1 / 14, adjust=False).mean().to_numpy() / (c + 1e-12)
 
-    # Realized volatility of returns (rolling std)
-    ret_std_14 = pd.Series(logret).rolling(14, min_periods=1).std().fillna(0.0).to_numpy()
+        # Realized volatility of returns (rolling std)
+        ret_std_14 = pd.Series(logret).rolling(14, min_periods=1).std().fillna(0.0).to_numpy()
 
-    # Moving averages and MACD features normalized by close
-    ema_fast = pd.Series(c).ewm(span=12, adjust=False).mean().to_numpy()
-    ema_slow = pd.Series(c).ewm(span=26, adjust=False).mean().to_numpy()
-    ema_fast_ratio = (ema_fast - c) / (c + 1e-12)
-    ema_slow_ratio = (ema_slow - c) / (c + 1e-12)
-    macd = ema_fast - ema_slow
-    macd_signal = pd.Series(macd).ewm(span=9, adjust=False).mean().to_numpy()
-    macd_hist_norm = (macd - macd_signal) / (c + 1e-12)
+        feats = pd.DataFrame({
+            "open": base["open"].values,
+            "high": base["high"].values,
+            "low": base["low"].values,
+            "close": base["close"].values,
+            "volume": base["volume"].values,
+            "logret": logret,
+            "hl_range": hl_range,
+            "upper_wick": upper_wick,
+            "lower_wick": lower_wick,
+            "rsi": rsi,
+            "vol_z": vol_z,
+            "atr": atr,
+            "ret_std_14": ret_std_14,
+        }, index=base.index)
 
-    # Bollinger Bands width (20, 2) normalized by middle band
-    mid = pd.Series(c).rolling(20, min_periods=1).mean()
-    std = pd.Series(c).rolling(20, min_periods=1).std().fillna(0.0)
-    upper = mid + 2 * std
-    lower = mid - 2 * std
-    bb_width = ((upper - lower) / (mid.abs() + 1e-12)).to_numpy()
-
-    feats = pd.DataFrame({
-        "open": base["open"].values,
-        "high": base["high"].values,
-        "low": base["low"].values,
-        "close": base["close"].values,
-        "volume": base["volume"].values,
-        "logret": logret,
-        "hl_range": hl_range,
-        "upper_wick": upper_wick,
-        "lower_wick": lower_wick,
-        "rsi": rsi,
-        "vol_z": vol_z,
-        "atr": atr,
-        "ret_std_14": ret_std_14,
-        "ema_fast_ratio": ema_fast_ratio,
-        "ema_slow_ratio": ema_slow_ratio,
-        "macd_hist_norm": macd_hist_norm,
-        "bb_width": bb_width,
-    }, index=base.index)
-
-    # If funding_rate present (from loader), add it and smoothed version
-    if "funding_rate" in df.columns:
-        fr = df["funding_rate"].astype(float).reindex(feats.index).fillna(0.0)
-        feats["funding_rate"] = fr.values
-        feats["funding_rate_ma"] = fr.rolling(24, min_periods=1).mean().fillna(0.0).values
+    # Removed funding_rate usage to keep features consistent across datasets
 
     # Sanitize any residual NaN/Inf from source data
     feats = feats.replace([np.inf, -np.inf], np.nan).fillna(0.0)

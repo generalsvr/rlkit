@@ -16,6 +16,16 @@ class TradingConfig:
     reward_scale: float = 1.0
     pnl_on_close: bool = False
     idle_penalty_bps: float = 0.0
+    # Reward shaping and risk controls
+    reward_type: str = "raw"  # raw | vol_scaled | sharpe_proxy
+    vol_lookback: int = 20
+    turnover_penalty_bps: float = 0.0
+    dd_penalty: float = 0.0
+    min_hold_bars: int = 0
+    cooldown_bars: int = 0
+    # Training ergonomics
+    random_reset: bool = False
+    episode_max_steps: int = 0  # 0 means run to end of dataset
 
 
 class FTTradingEnv(gym.Env):
@@ -33,11 +43,24 @@ class FTTradingEnv(gym.Env):
         self.entry_price = None
         self.equity = 1.0
         self.equity_curve: List[float] = []
+        self.episode_steps = 0
+        self.last_pos_change_step = -10**9
+        self.cooldown_until_step = -1
+        self.max_equity_seen = 1.0
 
         # Price series for PnL
         if "close" not in self.df.columns:
             raise ValueError("features must include 'close' column for PnL calc")
         self.close = self.df["close"].astype(float).values
+        # Precompute simple returns and rolling volatility for vol-scaled rewards
+        close_shift = np.roll(self.close, 1)
+        close_shift[0] = self.close[0]
+        self.simple_ret = (self.close - close_shift) / (close_shift + 1e-12)
+        try:
+            ret_std = pd.Series(self.simple_ret).rolling(self.cfg.vol_lookback, min_periods=1).std().fillna(0.0).to_numpy()
+        except Exception:
+            ret_std = np.zeros_like(self.simple_ret)
+        self.ret_std = np.maximum(ret_std, 1e-8)
 
         # Observation is a flattened window of features + position channel
         self.feature_cols = list(self.df.columns)
@@ -53,12 +76,25 @@ class FTTradingEnv(gym.Env):
 
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
-        self.ptr = self.cfg.window
+        # Randomized start to improve sample efficiency if enabled
+        self.episode_steps = 0
+        self.last_pos_change_step = -10**9
+        self.cooldown_until_step = -1
+        n = len(self.close)
+        if self.cfg.random_reset and self.cfg.episode_max_steps > 0 and n > (self.cfg.window + self.cfg.episode_max_steps + 1):
+            low = self.cfg.window
+            high = n - self.cfg.episode_max_steps
+            # Avoid degenerate ranges
+            start = int(np.random.randint(low, max(low + 1, high)))
+            self.ptr = start
+        else:
+            self.ptr = self.cfg.window
         self.done = False
         self.position = 0
         self.entry_price = None
         self.equity = 1.0
         self.equity_curve = [self.equity]
+        self.max_equity_seen = self.equity
         obs = self._obs()
         return obs, {}
 
@@ -76,42 +112,79 @@ class FTTradingEnv(gym.Env):
 
         prev_price = float(self.close[self.ptr - 1])
         prev_position = self.position
+        step_penalty = 0.0
+        action_blocked = False
 
         # apply action
+        can_close = (self.episode_steps - self.last_pos_change_step) >= self.cfg.min_hold_bars
+        can_open = self.episode_steps >= self.cooldown_until_step
         if action == 1:  # long
-            if self.position <= 0:
-                self._pay_costs(prev_position, +1)
+            if self.position <= 0 and can_open:
+                if self.position != +1:
+                    cost = self._pay_costs(prev_position, +1)
+                    step_penalty += cost
                 self.position = +1
                 self.entry_price = prev_price
+                self.last_pos_change_step = self.episode_steps
+            else:
+                action_blocked = True
         elif action == 2:  # short
-            if self.position >= 0:
-                self._pay_costs(prev_position, -1)
+            if self.position >= 0 and can_open:
+                if self.position != -1:
+                    cost = self._pay_costs(prev_position, -1)
+                    step_penalty += cost
                 self.position = -1
                 self.entry_price = prev_price
+                self.last_pos_change_step = self.episode_steps
+            else:
+                action_blocked = True
         elif action == 3:  # close
-            if self.position != 0:
-                self._pay_costs(prev_position, 0)
+            if self.position != 0 and can_close:
+                cost = self._pay_costs(prev_position, 0)
+                step_penalty += cost
                 if self.cfg.pnl_on_close and self.entry_price is not None:
-                    r = (prev_price - self.entry_price) / self.entry_price
+                    r = (prev_price - self.entry_price) / (self.entry_price + 1e-12)
                     r = r if prev_position == +1 else -r
                     self.equity *= (1.0 + r)
                 self.position = 0
                 self.entry_price = None
+                self.last_pos_change_step = self.episode_steps
+                if self.cfg.cooldown_bars > 0:
+                    self.cooldown_until_step = self.episode_steps + self.cfg.cooldown_bars
+            else:
+                action_blocked = True
 
         # advance
         self.ptr += 1
+        self.episode_steps += 1
         if self.ptr >= len(self.close):
+            self.done = True
+        if (not self.done) and self.cfg.episode_max_steps > 0 and self.episode_steps >= self.cfg.episode_max_steps:
             self.done = True
 
         reward = 0.0
         if not self.cfg.pnl_on_close and not self.done:
             new_price = float(self.close[self.ptr - 1])
             r = (new_price - prev_price) / (prev_price + 1e-12)
+            pos_sign = 1.0 if self.position == +1 else (-1.0 if self.position == -1 else 0.0)
+            raw_ret = pos_sign * r
+            # Apply reward shaping
+            if self.cfg.reward_type == "vol_scaled":
+                # Use precomputed rolling volatility at prev index
+                sigma = float(self.ret_std[self.ptr - 1])
+                reward = raw_ret / (sigma + 1e-8)
+            elif self.cfg.reward_type == "sharpe_proxy":
+                sigma = float(self.ret_std[self.ptr - 1])
+                reward = raw_ret / (sigma + 1e-8)
+                # Drawdown penalty term
+                dd = max(0.0, (self.max_equity_seen - self.equity) / (self.max_equity_seen + 1e-12))
+                reward -= float(self.cfg.dd_penalty) * dd
+            else:
+                reward = raw_ret
+            # Update equity by raw PnL
             if self.position == +1:
-                reward = r
                 self.equity *= (1.0 + r)
             elif self.position == -1:
-                reward = -r
                 self.equity *= (1.0 - r)
             else:
                 # Encourage taking positions by applying a tiny idle penalty (in bps)
@@ -119,19 +192,33 @@ class FTTradingEnv(gym.Env):
                     idle_cost = self.cfg.idle_penalty_bps * 1e-4
                     reward -= idle_cost
                     self.equity *= (1.0 - idle_cost)
+        # Turnover penalty (separate from exchange fees) when we attempted and executed a change
+        if not action_blocked and self.cfg.turnover_penalty_bps > 0.0 and self.episode_steps > 0:
+            # Charge only when a position change occurred this step
+            if prev_position != self.position:
+                tcost = self.cfg.turnover_penalty_bps * 1e-4
+                step_penalty += tcost
+                self.equity *= (1.0 - tcost)
 
         self.equity_curve.append(self.equity)
+        self.max_equity_seen = max(self.max_equity_seen, self.equity)
         obs = self._obs() if not self.done else np.zeros_like(self._obs(), dtype=np.float32)
         terminated = self.done
         truncated = False
+        # Subtract exchange/slippage penalties from reward
+        reward = reward - step_penalty
         info = {"equity": float(self.equity), "position": int(self.position)}
         return obs, float(reward * self.cfg.reward_scale), terminated, truncated, info
 
-    def _pay_costs(self, from_pos: int, to_pos: int):
+    def _pay_costs(self, from_pos: int, to_pos: int) -> float:
         if from_pos == to_pos:
-            return
+            return 0.0
         bps = self.cfg.fee_bps + self.cfg.slippage_bps
+        # Flip (long<->short) incurs exit+entry costs
+        if from_pos * to_pos == -1:
+            bps *= 2.0
         cost = bps * 1e-4
         self.equity *= (1.0 - cost)
+        return float(cost)
 
 

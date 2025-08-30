@@ -58,6 +58,18 @@ def train(
     idle_penalty_bps: float = typer.Option(0.02, help="Idle penalty in bps when flat (applied in env)"),
     exchange: str = typer.Option("bybit", help="Prefer this exchange's dataset when multiple exist"),
     device: str = typer.Option("cuda", help="Device for training: cuda|cpu"),
+    # New options
+    seed: int = typer.Option(42, help="Random seed"),
+    reward_type: str = typer.Option("raw", help="raw|vol_scaled|sharpe_proxy"),
+    vol_lookback: int = typer.Option(20, help="Volatility lookback for reward shaping"),
+    turnover_penalty_bps: float = typer.Option(0.0, help="Extra turnover penalty in bps per change"),
+    dd_penalty: float = typer.Option(0.0, help="Coefficient for drawdown penalty in sharpe_proxy"),
+    min_hold_bars: int = typer.Option(0, help="Minimum bars to hold before closing/flip"),
+    cooldown_bars: int = typer.Option(0, help="Cooldown bars after closing before re-entry"),
+    random_reset: bool = typer.Option(False, help="Randomize episode start index"),
+    episode_max_steps: int = typer.Option(0, help="Max steps per episode (0 = run to dataset end)"),
+    feature_mode: str = typer.Option("full", help="full|basic (basic: close_z, change, d_hl)"),
+    basic_lookback: int = typer.Option(64, help="Lookback for basic close_z standardization"),
 ):
     """Train PPO on downloaded data using Stable-Baselines3."""
     params = TrainParams(
@@ -73,6 +85,17 @@ def train(
         idle_penalty_bps=idle_penalty_bps,
         prefer_exchange=exchange,
         device=device,
+        seed=seed,
+        reward_type=reward_type,
+        vol_lookback=vol_lookback,
+        turnover_penalty_bps=turnover_penalty_bps,
+        dd_penalty=dd_penalty,
+        min_hold_bars=min_hold_bars,
+        cooldown_bars=cooldown_bars,
+        random_reset=random_reset,
+        episode_max_steps=episode_max_steps,
+        feature_mode=feature_mode,
+        basic_lookback=basic_lookback,
     )
     out = train_ppo_from_freqtrade_data(params)
     typer.echo(f"Model saved: {out}")
@@ -146,6 +169,17 @@ def validate(
     slippage_bps: float = typer.Option(2.0, help="Slippage in basis points"),
     idle_penalty_bps: float = typer.Option(0.0, help="Idle penalty in bps when flat (applied in env)"),
     timerange: str = typer.Option("", help="Optional timerange YYYYMMDD-YYYYMMDD for validation dataset"),
+    # New options
+    reward_type: str = typer.Option("raw", help="raw|vol_scaled|sharpe_proxy"),
+    vol_lookback: int = typer.Option(20, help="Volatility lookback for reward shaping"),
+    turnover_penalty_bps: float = typer.Option(0.0, help="Extra turnover penalty in bps per change"),
+    dd_penalty: float = typer.Option(0.0, help="Coefficient for drawdown penalty in sharpe_proxy"),
+    min_hold_bars: int = typer.Option(0, help="Minimum bars to hold before closing/flip"),
+    cooldown_bars: int = typer.Option(0, help="Cooldown bars after closing before re-entry"),
+    random_reset: bool = typer.Option(False, help="Randomize episode start index"),
+    episode_max_steps: int = typer.Option(0, help="Max steps per episode (0 = run to dataset end)"),
+    feature_mode: str = typer.Option("full", help="full|basic (basic: close_z, change, d_hl)"),
+    basic_lookback: int = typer.Option(64, help="Lookback for basic close_z standardization"),
 ):
     """Run a quick validation rollout on eval split and print summary (actions, entries, equity)."""
     params = TrainParams(
@@ -158,6 +192,16 @@ def validate(
         slippage_bps=slippage_bps,
         idle_penalty_bps=idle_penalty_bps,
         prefer_exchange=exchange,
+        reward_type=reward_type,
+        vol_lookback=vol_lookback,
+        turnover_penalty_bps=turnover_penalty_bps,
+        dd_penalty=dd_penalty,
+        min_hold_bars=min_hold_bars,
+        cooldown_bars=cooldown_bars,
+        random_reset=random_reset,
+        episode_max_steps=episode_max_steps,
+        feature_mode=feature_mode,
+        basic_lookback=basic_lookback,
     )
     os.environ["RL_DEVICE"] = device
     _ = validate_trained_model(params, max_steps=max_steps, deterministic=deterministic, timerange=timerange)
