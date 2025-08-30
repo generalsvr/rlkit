@@ -20,12 +20,15 @@ export default function Home() {
   const [timeframe, setTimeframe] = React.useState("1h");
   const [timerange, setTimerange] = React.useState<string>("");
   const [modelPath, setModelPath] = React.useState<string>("./models/newrl_ppo.zip");
-  const defaultApi = (process.env.NEXT_PUBLIC_API_BASE as string)
-    || (typeof window !== "undefined" ? `${window.location.protocol}//${window.location.hostname}:8080` : "http://127.0.0.1:8080");
-  const [apiBase, setApiBase] = React.useState<string>(defaultApi);
+  const [apiBase, setApiBase] = React.useState<string>("http://127.0.0.1:8080");
 
   React.useEffect(() => {
     if (typeof window === "undefined") return;
+    // Set default API from window location
+    const defaultApi = (process.env.NEXT_PUBLIC_API_BASE as string)
+      || `${window.location.protocol}//${window.location.hostname}:8080`;
+    setApiBase(defaultApi);
+    // Override from URL param if present
     const p = new URLSearchParams(window.location.search);
     const api = p.get("api");
     if (api) setApiBase(api);
@@ -42,11 +45,16 @@ export default function Home() {
         height: 560,
         layout: { textColor: "#d1d5db", background: { type: ColorType.Solid, color: "#0b1220" } },
         grid: { horzLines: { color: "#1f2937" }, vertLines: { color: "#1f2937" } },
-        timeScale: { rightOffset: 4, barSpacing: 8, lockVisibleTimeRangeOnResize: true },
+        timeScale: { rightOffset: 4, barSpacing: 8 },
         crosshair: { mode: CrosshairMode.Magnet },
       };
       chart = createChart(containerRef.current as HTMLElement, options);
-      const series = (chart as any).addCandlestickSeries();
+      // Use explicit method that exists in all versions
+      const series = (chart as any).addSeries?.({ type: 'Candlestick' }) || (chart as any).addCandlestickSeries?.();
+      if (!series) {
+        console.error("Failed to add candlestick series");
+        return;
+      }
       chartRef.current = chart;
       seriesRef.current = series;
       ro = new ResizeObserver(() => chart!.applyOptions({ width: containerRef.current?.clientWidth || 800 }));

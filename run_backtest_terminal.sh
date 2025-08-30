@@ -108,20 +108,33 @@ echo "[+] Starting backend (FastAPI) on :8080 (this may take a minute on first r
 (
   cd "$BACK_DIR"
   if [ ! -d .venv ]; then
+    echo "[i] Creating Python venv..."
     python3 -m venv .venv
   fi
+  echo "[i] Activating venv and installing deps..."
   # shellcheck disable=SC1091
   source .venv/bin/activate
   python -m pip install --upgrade pip >/dev/null 2>&1 || true
-  # Minimal deps for inference server
-  pip install -q fastapi uvicorn[standard] pydantic pandas numpy pyarrow stable-baselines3 sb3-contrib gymnasium cloudpickle >/dev/null 2>&1 || true
+  # Install deps with visible output
+  pip install -q fastapi uvicorn[standard] pydantic pandas numpy pyarrow stable-baselines3 sb3-contrib gymnasium cloudpickle || {
+    echo "[!] pip install failed" >&2
+    exit 1
+  }
   export RL_DEVICE="${RL_DEVICE:-cpu}"
   # Ensure port is free, and kill prior saved PID if any
   [ -f .uvicorn.pid ] && kill "$(cat .uvicorn.pid)" 2>/dev/null || true
   pkill -f "uvicorn .*:8080" 2>/dev/null || true
   kill_port 8080 || exit 1
+  echo "[i] Starting uvicorn server..."
+  # Test import first
+  python -c "import backtest_server.main" 2>/dev/null || python -c "import main" || {
+    echo "[!] Cannot import main.py - check Python path" >&2
+    ls -la
+    exit 1
+  }
   uvicorn main:app --host 0.0.0.0 --port 8080 &
   echo $! > "$BACK_DIR/.uvicorn.pid"
+  echo "[i] Backend PID: $!"
   deactivate || true
 )
 
