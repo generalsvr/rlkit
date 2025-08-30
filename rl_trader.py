@@ -366,6 +366,54 @@ def validate(
     _ = validate_trained_model(params, max_steps=max_steps, deterministic=deterministic, timerange=timerange)
 
 
+@app.command()
+def dump_signals(
+    pair: str = typer.Option("BTC/USDT:USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    model_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "rl_ppo.zip")),
+    timerange: str = typer.Option(""),
+    exchange: str = typer.Option("bybit"),
+    window: int = typer.Option(128),
+):
+    """Generate signals CSV for a given pair/timeframe using the RL model (no Freqtrade).
+    Output path: userdir/logs/signals_{PAIR}_{timeframe}.csv
+    """
+    # Load data
+    path = _find_data_file_internal(userdir, pair, timeframe, prefer_exchange=exchange)
+    if not path:
+        raise FileNotFoundError("No data found. Run download first.")
+    df = _load_ohlcv_internal(path)
+    # Optional restrict
+    if timerange:
+        try:
+            start_str, end_str = timerange.split('-', 1)
+            start = pd.to_datetime(start_str) if start_str else None
+            end = pd.to_datetime(end_str) if end_str else None
+            if isinstance(df.index, pd.DatetimeIndex):
+                idx = df.index
+                try:
+                    idx_cmp = idx.tz_convert(None) if idx.tz is not None else idx
+                except Exception:
+                    idx_cmp = idx.tz_localize(None) if getattr(idx, 'tz', None) is not None else idx
+                mask = pd.Series(True, index=idx)
+                if start is not None:
+                    mask &= idx_cmp >= pd.to_datetime(start)
+                if end is not None:
+                    mask &= idx_cmp <= pd.to_datetime(end)
+                df = df.loc[mask]
+        except Exception:
+            pass
+    # Compute
+    os.environ["RL_DEVICE"] = os.environ.get("RL_DEVICE", "cuda")
+    enriched = compute_rl_signals(df, model_path, window=window)
+    outdir = Path(userdir) / 'logs'
+    outdir.mkdir(parents=True, exist_ok=True)
+    pair_tag = pair.replace('/', '_').replace(':', '_').replace(' ', '_')
+    fp = outdir / f"signals_{pair_tag}_{timeframe}.csv"
+    enriched.to_csv(fp, index=False)
+    typer.echo(f"Signals written: {fp}")
+
 if __name__ == "__main__":
     app()
 
