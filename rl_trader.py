@@ -54,6 +54,9 @@ def train(
     model_out: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "rl_ppo.zip")),
     arch: str = typer.Option("mlp", help="mlp|lstm|transformer|transformer_big|transformer_hybrid"),
     fee_bps: float = typer.Option(0.6, help="Trading fee in basis points (e.g., 0.6 for 0.06%)"),
+    slippage_bps: float = typer.Option(2.0, help="Slippage in basis points"),
+    idle_penalty_bps: float = typer.Option(0.02, help="Idle penalty in bps when flat (applied in env)"),
+    exchange: str = typer.Option("bybit", help="Prefer this exchange's dataset when multiple exist"),
     device: str = typer.Option("cuda", help="Device for training: cuda|cpu"),
 ):
     """Train PPO on downloaded data using Stable-Baselines3."""
@@ -66,6 +69,9 @@ def train(
         model_out_path=model_out,
         arch=arch,
         fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        idle_penalty_bps=idle_penalty_bps,
+        prefer_exchange=exchange,
         device=device,
     )
     out = train_ppo_from_freqtrade_data(params)
@@ -80,11 +86,14 @@ def backtest(
     model_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "rl_ppo.zip")),
     timerange: str = typer.Option("20220101-20240101"),
     device: str = typer.Option("cuda", help="Device for backtest: cuda|cpu"),
+    exchange: str = typer.Option("bybit", help="Exchange name for dataset and backtest config"),
+    window: int = typer.Option(128, help="Window size (must match training)"),
 ):
     """Backtest trained RL model inside Freqtrade."""
     env = os.environ.copy()
     env["RL_DEVICE"] = device
     env["RL_MODEL_PATH"] = model_path
+    env["RL_WINDOW"] = str(window)
     # Ensure minimal config exists
     config_path = Path(userdir) / "config.json"
     if not config_path.exists():
@@ -93,7 +102,7 @@ def backtest(
             "user_data_dir": str(userdir),
             "strategy": "RLStrategy",
             "exchange": {
-                "name": "binance",
+                "name": exchange,
                 "key": "",
                 "secret": "",
                 "pair_whitelist": [pair]
@@ -132,6 +141,10 @@ def validate(
     max_steps: int = typer.Option(1000),
     deterministic: bool = typer.Option(True),
     device: str = typer.Option("cuda", help="Device for validation: cuda|cpu"),
+    exchange: str = typer.Option("bybit", help="Prefer this exchange's dataset when multiple exist"),
+    fee_bps: float = typer.Option(0.6, help="Trading fee in basis points (e.g., 0.6 for 0.06%)"),
+    slippage_bps: float = typer.Option(2.0, help="Slippage in basis points"),
+    idle_penalty_bps: float = typer.Option(0.0, help="Idle penalty in bps when flat (applied in env)"),
     timerange: str = typer.Option("", help="Optional timerange YYYYMMDD-YYYYMMDD for validation dataset"),
 ):
     """Run a quick validation rollout on eval split and print summary (actions, entries, equity)."""
@@ -141,6 +154,10 @@ def validate(
         timeframe=timeframe,
         window=window,
         model_out_path=model_path,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        idle_penalty_bps=idle_penalty_bps,
+        prefer_exchange=exchange,
     )
     os.environ["RL_DEVICE"] = device
     _ = validate_trained_model(params, max_steps=max_steps, deterministic=deterministic, timerange=timerange)

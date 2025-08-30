@@ -15,6 +15,7 @@ class TradingConfig:
     slippage_bps: float = 2.0
     reward_scale: float = 1.0
     pnl_on_close: bool = False
+    idle_penalty_bps: float = 0.0
 
 
 class FTTradingEnv(gym.Env):
@@ -103,13 +104,19 @@ class FTTradingEnv(gym.Env):
         reward = 0.0
         if not self.cfg.pnl_on_close and not self.done:
             new_price = float(self.close[self.ptr - 1])
-            r = (new_price - prev_price) / prev_price
+            r = (new_price - prev_price) / (prev_price + 1e-12)
             if self.position == +1:
                 reward = r
                 self.equity *= (1.0 + r)
             elif self.position == -1:
                 reward = -r
                 self.equity *= (1.0 - r)
+            else:
+                # Encourage taking positions by applying a tiny idle penalty (in bps)
+                if self.cfg.idle_penalty_bps > 0.0:
+                    idle_cost = self.cfg.idle_penalty_bps * 1e-4
+                    reward -= idle_cost
+                    self.equity *= (1.0 - idle_cost)
 
         self.equity_curve.append(self.equity)
         obs = self._obs() if not self.done else np.zeros_like(self._obs(), dtype=np.float32)

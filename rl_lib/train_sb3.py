@@ -17,7 +17,7 @@ from .transformer_extractor import TransformerExtractor, HybridLSTMTransformerEx
 from .env import FTTradingEnv, TradingConfig
 
 
-def _find_data_file(userdir: str, pair: str, timeframe: str) -> Optional[str]:
+def _find_data_file(userdir: str, pair: str, timeframe: str, prefer_exchange: Optional[str] = None) -> Optional[str]:
     # Support multiple naming variants across exchanges (e.g., Bybit futures)
     base = pair.replace("/", "_")  # BTC_USDT or BTC_USDT:USDT
     candidates = {
@@ -32,6 +32,11 @@ def _find_data_file(userdir: str, pair: str, timeframe: str) -> Optional[str]:
                 pattern = os.path.join(userdir, "data", "**", f"{name}-{timeframe}{suf}.{ext}")
                 hits = glob.glob(pattern, recursive=True)
                 if hits:
+                    if prefer_exchange:
+                        # Prefer files that contain the exchange segment in their path
+                        preferred = [h for h in hits if f"/{prefer_exchange}/" in h]
+                        if preferred:
+                            return preferred[0]
                     return hits[0]
     return None
 
@@ -143,7 +148,7 @@ def _run_validation_rollout(model: PPO, eval_env: VecNormalize | DummyVecEnv, ma
 
 def validate_trained_model(params: TrainParams, max_steps: int = 2000, deterministic: bool = True, timerange: Optional[str] = None) -> Dict[str, Any]:
     # Load data
-    data_path = _find_data_file(params.userdir, params.pair, params.timeframe)
+    data_path = _find_data_file(params.userdir, params.pair, params.timeframe, prefer_exchange=params.prefer_exchange)
     if not data_path:
         raise FileNotFoundError("No data for validation.")
     raw = _load_ohlcv(data_path)
@@ -160,7 +165,17 @@ def validate_trained_model(params: TrainParams, max_steps: int = 2000, determini
                     raw = raw.loc[:end]
         except Exception:
             pass
-    feats = make_features(raw)
+    # Enforce training feature layout if available to match inference/backtest
+    feature_columns = None
+    try:
+        import json as _json
+        feat_cols_path = os.path.join(os.path.dirname(params.model_out_path), "feature_columns.json")
+        if os.path.exists(feat_cols_path):
+            with open(feat_cols_path, "r") as f:
+                feature_columns = _json.load(f)
+    except Exception:
+        feature_columns = None
+    feats = make_features(raw, feature_columns=feature_columns)
     eval_df = feats.copy()
 
     tcfg = TradingConfig(
@@ -169,6 +184,7 @@ def validate_trained_model(params: TrainParams, max_steps: int = 2000, determini
         slippage_bps=params.slippage_bps,
         reward_scale=params.reward_scale,
         pnl_on_close=params.pnl_on_close,
+        idle_penalty_bps=params.idle_penalty_bps,
     )
 
     def make_eval():
@@ -208,18 +224,20 @@ class TrainParams:
     total_timesteps: int = 200_000
     seed: int = 42
     model_out_path: str = "models/rl_ppo.zip"
-    fee_bps: float = 6.0
+    fee_bps: float = 0.6
     slippage_bps: float = 2.0
     reward_scale: float = 1.0
     pnl_on_close: bool = False
+    idle_penalty_bps: float = 0.02
     arch: str = "mlp"  # mlp | lstm | transformer | transformer_big | transformer_hybrid
     device: str = "cuda"
+    prefer_exchange: Optional[str] = None
 
 
 def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
     os.makedirs(os.path.dirname(params.model_out_path), exist_ok=True)
 
-    data_path = _find_data_file(params.userdir, params.pair, params.timeframe)
+    data_path = _find_data_file(params.userdir, params.pair, params.timeframe, prefer_exchange=params.prefer_exchange)
     if not data_path:
         raise FileNotFoundError(
             f"No parquet found for {params.pair} {params.timeframe} under {params.userdir}/data. "
@@ -240,7 +258,7 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
         slippage_bps=params.slippage_bps,
         reward_scale=params.reward_scale,
         pnl_on_close=params.pnl_on_close,
-        idle_penalty_bps=0.02,
+        idle_penalty_bps=params.idle_penalty_bps,
     )
 
     def make_train():

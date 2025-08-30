@@ -80,13 +80,23 @@ def compute_rl_signals(df: pd.DataFrame, model_path: str, window: int = 128) -> 
                 enter_short[t] = 1
                 position = -1
         elif position == 1:
-            if act == 3:  # close_position
+            if act == 3:
                 exit_long[t] = 1
                 position = 0
+            elif act == 2:
+                # Flip: long -> short
+                exit_long[t] = 1
+                enter_short[t] = 1
+                position = -1
         elif position == -1:
-            if act == 3:  # close_position
+            if act == 3:
                 exit_short[t] = 1
                 position = 0
+            elif act == 1:
+                # Flip: short -> long
+                exit_short[t] = 1
+                enter_long[t] = 1
+                position = 1
 
     out = feats.copy()
     out["rl_action"] = actions
