@@ -54,6 +54,7 @@ def train(
     model_out: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "rl_ppo.zip")),
     arch: str = typer.Option("mlp", help="mlp|lstm|transformer|transformer_big|transformer_hybrid"),
     fee_bps: float = typer.Option(0.6, help="Trading fee in basis points (e.g., 0.6 for 0.06%)"),
+    device: str = typer.Option("cuda", help="Device for training: cuda|cpu"),
 ):
     """Train PPO on downloaded data using Stable-Baselines3."""
     params = TrainParams(
@@ -65,6 +66,7 @@ def train(
         model_out_path=model_out,
         arch=arch,
         fee_bps=fee_bps,
+        device=device,
     )
     out = train_ppo_from_freqtrade_data(params)
     typer.echo(f"Model saved: {out}")
@@ -77,9 +79,11 @@ def backtest(
     userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
     model_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "rl_ppo.zip")),
     timerange: str = typer.Option("20220101-20240101"),
+    device: str = typer.Option("cuda", help="Device for backtest: cuda|cpu"),
 ):
     """Backtest trained RL model inside Freqtrade."""
     env = os.environ.copy()
+    env["RL_DEVICE"] = device
     env["RL_MODEL_PATH"] = model_path
     # Ensure minimal config exists
     config_path = Path(userdir) / "config.json"
@@ -127,6 +131,7 @@ def validate(
     model_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "rl_ppo.zip")),
     max_steps: int = typer.Option(1000),
     deterministic: bool = typer.Option(True),
+    device: str = typer.Option("cuda", help="Device for validation: cuda|cpu"),
 ):
     """Run a quick validation rollout on eval split and print summary (actions, entries, equity)."""
     params = TrainParams(
@@ -136,6 +141,7 @@ def validate(
         window=window,
         model_out_path=model_path,
     )
+    os.environ["RL_DEVICE"] = device
     _ = validate_trained_model(params, max_steps=max_steps, deterministic=deterministic)
 
 

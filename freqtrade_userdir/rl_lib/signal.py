@@ -12,7 +12,8 @@ def compute_rl_signals(df: pd.DataFrame, model_path: str, window: int = 128) -> 
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model not found at {model_path}")
 
-    model = PPO.load(model_path, device="cpu")
+    device = os.environ.get("RL_DEVICE", "cuda")
+    model = PPO.load(model_path, device=device)
 
     # Optional: load VecNormalize stats for observation normalization
     obs_mean = None

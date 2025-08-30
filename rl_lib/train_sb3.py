@@ -201,6 +201,7 @@ class TrainParams:
     reward_scale: float = 1.0
     pnl_on_close: bool = False
     arch: str = "mlp"  # mlp | lstm | transformer | transformer_big | transformer_hybrid
+    device: str = "cuda"
 
 
 def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
@@ -248,6 +249,7 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
             env=env,
             verbose=1,
             seed=params.seed,
+            device=params.device,
             n_steps=1024,
             batch_size=256,
             learning_rate=3e-4,
@@ -263,6 +265,7 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
             env=env,
             verbose=1,
             seed=params.seed,
+            device=params.device,
             n_steps=2048,
             batch_size=256,
             learning_rate=3e-4,
@@ -312,6 +315,7 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
             env=env,
             verbose=1,
             seed=params.seed,
+            device=params.device,
             n_steps=2048,
             batch_size=256,
             learning_rate=3e-4,
@@ -332,6 +336,7 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
             env=env,
             verbose=1,
             seed=params.seed,
+            device=params.device,
             n_steps=2048,
             batch_size=256,
             learning_rate=3e-4,
