@@ -1,7 +1,8 @@
 "use client";
 
 import React from "react";
-import type { IChartApi, UTCTimestamp } from "lightweight-charts";
+import { createChart } from "lightweight-charts";
+import type { IChartApi, ISeriesApi, UTCTimestamp, ChartOptions } from "lightweight-charts";
 
 type Candle = [number, number, number, number, number, number];
 type Mark = { time: number; label: string; color: string };
@@ -13,9 +14,9 @@ function toUtc(tsMs: number): UTCTimestamp {
 export default function Home() {
   const containerRef = React.useRef<HTMLDivElement | null>(null);
   const chartRef = React.useRef<IChartApi | null>(null);
-  const seriesRef = React.useRef<any>(null);
+  const seriesRef = React.useRef<ISeriesApi<"Candlestick"> | null>(null);
   const [loading, setLoading] = React.useState(false);
-  const [logs, setLogs] = React.useState<any[]>([]);
+  const [logs, setLogs] = React.useState<string[]>([]);
   const [pair, setPair] = React.useState("BTC/USDT:USDT");
   const [timeframe, setTimeframe] = React.useState("1h");
   const [timerange, setTimerange] = React.useState<string>("");
@@ -31,43 +32,25 @@ export default function Home() {
     if (api) setApiBase(api);
   }, []);
 
-  async function loadChartsModule() {
-    const mod = await import("lightweight-charts");
-    const { createChart } = mod as unknown as { createChart: (container: HTMLElement, options?: any) => IChartApi };
-    if (!createChart) throw new Error("createChart not found in lightweight-charts module");
-    return createChart;
-  }
-
   React.useEffect(() => {
     if (!containerRef.current || chartRef.current) return;
     let chart: IChartApi | null = null;
     let ro: ResizeObserver | null = null;
-    loadChartsModule()
-      .then((create) => {
-        chart = create(containerRef.current as HTMLElement, {
-          height: 560,
-          layout: { textColor: "#d1d5db", background: { type: "solid", color: "#0b1220" } },
-          grid: { horzLines: { color: "#1f2937" }, vertLines: { color: "#1f2937" } },
-          timeScale: { rightOffset: 4, barSpacing: 8, lockVisibleTimeRangeOnResize: true },
-          crosshair: { mode: 1 },
-        });
-        const addSeries: any = (chart as any).addCandlestickSeries;
-        if (typeof addSeries !== "function") {
-          console.error("CandlestickSeries method not found on chart", chart);
-          throw new Error("Candlestick series API not available");
-        }
-        const series = addSeries.call(chart);
-        chartRef.current = chart;
-        seriesRef.current = series;
-        ro = new ResizeObserver(() => chart!.applyOptions({ width: containerRef.current?.clientWidth || 800 }));
-        ro.observe(containerRef.current as Element);
-      })
-      .catch((e) => {
-        console.error(e);
-      });
+    const options: Partial<ChartOptions> = {
+      height: 560,
+      layout: { textColor: "#d1d5db", background: { type: "solid", color: "#0b1220" } },
+      grid: { horzLines: { color: "#1f2937" }, vertLines: { color: "#1f2937" } },
+      timeScale: { rightOffset: 4, barSpacing: 8, lockVisibleTimeRangeOnResize: true },
+      crosshair: { mode: 1 },
+    };
+    chart = createChart(containerRef.current as HTMLElement, options);
+    const series = chart.addCandlestickSeries();
+    chartRef.current = chart;
+    seriesRef.current = series;
+    ro = new ResizeObserver(() => chart!.applyOptions({ width: containerRef.current?.clientWidth || 800 }));
+    ro.observe(containerRef.current as Element);
     return () => {
       if (ro) ro.disconnect();
-      if (chart) (chart as any).remove?.();
       chartRef.current = null;
     };
   }, []);
@@ -122,9 +105,10 @@ export default function Home() {
         }
         chartRef.current?.timeScale().fitContent();
       }
-      setLogs(j.logs || []);
-    } catch (e: any) {
-      setLogs([{ level: "error", message: e?.message || String(e) }]);
+      setLogs((j.logs || []).map((x: unknown) => (typeof x === "string" ? x : JSON.stringify(x))));
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      setLogs([msg]);
     } finally {
       setLoading(false);
     }
@@ -164,9 +148,7 @@ export default function Home() {
         <h2 className="text-lg font-semibold mb-2">Logs</h2>
         <div className="bg-gray-900 border border-gray-700 rounded p-3 max-h-72 overflow-auto text-xs">
           {logs.map((l, i) => (
-            <div key={i} className="whitespace-pre">
-              {typeof l === "string" ? l : JSON.stringify(l)}
-            </div>
+            <div key={i} className="whitespace-pre">{l}</div>
           ))}
         </div>
       </div>
