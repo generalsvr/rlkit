@@ -30,6 +30,57 @@ def compute_rsi(close: np.ndarray, period: int = 14, eps: float = 1e-8) -> np.nd
     return rsi
 
 
+def compute_hurst_proxy_from_returns(
+    logret: np.ndarray,
+    var_lookback: int = 256,
+    scales: Optional[List[int]] | None = None,
+) -> np.ndarray:
+    """Causal, efficient Hurst exponent proxy via multiscale EWM std slope.
+
+    Approximates H by regressing log(std of aggregated returns over scale m) on log(m).
+    Uses EWM std for robustness and causality. Clipped to [0, 1].
+    """
+    if scales is None:
+        scales = [1, 4, 16]
+    s = pd.Series(logret)
+    log_std_list: List[np.ndarray] = []
+    for m in scales:
+        # Aggregate returns over scale m (causal rolling sum)
+        agg = s.rolling(m, min_periods=1).sum()
+        std_m = agg.ewm(span=max(2, int(var_lookback)), adjust=False).std(bias=False)
+        log_std_list.append(np.log(std_m.to_numpy() + 1e-12))
+    log_ms = np.log(np.asarray(scales, dtype=float))
+    xc = log_ms - log_ms.mean()
+    denom = float(np.sum(xc * xc) + 1e-12)
+    L = np.vstack(log_std_list).T  # (T, S)
+    slope = (L @ xc) / denom
+    hurst = np.clip(slope, 0.0, 1.0)
+    return hurst
+
+
+def compute_tail_alpha_proxy(
+    logret: np.ndarray,
+    window: int = 256,
+    q1: float = 0.98,
+    q2: float = 0.995,
+) -> np.ndarray:
+    """Causal tail index proxy via high-quantile ratio method.
+
+    For a power-law tail, Q(1-p) ~ C p^{-1/alpha}. Using two tail quantiles q1<q2:
+        alpha ≈ log((1-q2)/(1-q1)) / log(Q(q2)/Q(q1))
+    We apply this to absolute log returns over a rolling window.
+    """
+    abs_r = np.abs(logret)
+    s = pd.Series(abs_r)
+    q1_series = s.rolling(max(10, int(window)), min_periods=10).quantile(q1)
+    q2_series = s.rolling(max(10, int(window)), min_periods=10).quantile(q2)
+    ratio = (q2_series.to_numpy() + 1e-12) / (q1_series.to_numpy() + 1e-12)
+    c = np.log((1.0 - q2) / (1.0 - q1) + 1e-12)
+    alpha = c / np.log(ratio + 1e-12)
+    alpha = np.clip(alpha, 0.5, 10.0)
+    return alpha
+
+
 def make_features(
     df: pd.DataFrame,
     feature_columns: Optional[List[str]] | None = None,
@@ -55,6 +106,19 @@ def make_features(
         roll_std = s.rolling(basic_lookback, min_periods=1).std().fillna(0.0)
         roll_std = roll_std.replace(0.0, 1e-8)
         close_z = ((s - roll_mean) / roll_std).to_numpy()
+        # Add minimal volatility estimate for gating
+        ret_std_14 = pd.Series(change).rolling(14, min_periods=1).std().fillna(0.0).to_numpy()
+        # Hurst and tail alpha proxies from returns
+        hurst = compute_hurst_proxy_from_returns(change, var_lookback=max(64, basic_lookback * 2))
+        hurst = np.nan_to_num(hurst, nan=0.5, posinf=1.0, neginf=0.0)
+        tail_alpha = compute_tail_alpha_proxy(change, window=max(128, basic_lookback * 2))
+        tail_alpha = np.nan_to_num(tail_alpha, nan=2.0, posinf=10.0, neginf=0.5)
+        # Risk gate: shrink when vol high or tail_alpha small
+        vol_median = pd.Series(ret_std_14).rolling(200, min_periods=1).median().to_numpy()
+        vol_ratio = ret_std_14 / (vol_median + 1e-12)
+        vol_gate = 1.0 / (1.0 + np.maximum(0.0, vol_ratio))
+        alpha_gate = np.clip((tail_alpha - 1.5) / (3.5 - 1.5), 0.0, 1.0)
+        risk_gate = np.clip(alpha_gate * vol_gate, 0.1, 1.0)
         feats = pd.DataFrame({
             "open": base["open"].values,
             "high": base["high"].values,
@@ -64,6 +128,10 @@ def make_features(
             "close_z": close_z,
             "change": change,
             "d_hl": d_hl,
+            "ret_std_14": ret_std_14,
+            "hurst": hurst,
+            "tail_alpha": tail_alpha,
+            "risk_gate": risk_gate,
         }, index=base.index)
     else:
         # Full feature set (causal). Keep MACD/EMA; remove Bollinger and funding.
@@ -84,6 +152,19 @@ def make_features(
 
         # Realized volatility of returns (rolling std)
         ret_std_14 = pd.Series(logret).rolling(14, min_periods=1).std().fillna(0.0).to_numpy()
+
+        # Hurst and tail alpha proxies
+        hurst = compute_hurst_proxy_from_returns(logret, var_lookback=256)
+        hurst = np.nan_to_num(hurst, nan=0.5, posinf=1.0, neginf=0.0)
+        tail_alpha = compute_tail_alpha_proxy(logret, window=256)
+        tail_alpha = np.nan_to_num(tail_alpha, nan=2.0, posinf=10.0, neginf=0.5)
+
+        # Risk gate: reduce effective exposure when tails are heavy or vol elevated
+        vol_median = pd.Series(ret_std_14).rolling(200, min_periods=1).median().to_numpy()
+        vol_ratio = ret_std_14 / (vol_median + 1e-12)
+        vol_gate = 1.0 / (1.0 + np.maximum(0.0, vol_ratio))
+        alpha_gate = np.clip((tail_alpha - 1.5) / (3.5 - 1.5), 0.0, 1.0)
+        risk_gate = np.clip(alpha_gate * vol_gate, 0.1, 1.0)
 
         # EMA ratios and MACD histogram normalized by close
         ema_fast = pd.Series(c).ewm(span=12, adjust=False).mean().to_numpy()
@@ -108,6 +189,9 @@ def make_features(
             "vol_z": vol_z,
             "atr": atr,
             "ret_std_14": ret_std_14,
+            "hurst": hurst,
+            "tail_alpha": tail_alpha,
+            "risk_gate": risk_gate,
             "ema_fast_ratio": ema_fast_ratio,
             "ema_slow_ratio": ema_slow_ratio,
             "macd_hist_norm": macd_hist_norm,

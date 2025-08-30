@@ -26,7 +26,7 @@ class RLStrategy(IStrategy):
 
     # Disable TA; RL decides
     process_only_new_candles = True
-    startup_candle_count = 128
+    startup_candle_count = 256
 
     def __init__(self, config: dict) -> None:
         super().__init__(config)
@@ -41,6 +41,9 @@ class RLStrategy(IStrategy):
             dataframe["exit_long"] = enriched["exit_long"].values
             dataframe["enter_short"] = enriched["enter_short"].values
             dataframe["exit_short"] = enriched["exit_short"].values
+            # Propagate risk gate for dynamic position sizing
+            if "risk_gate" in enriched.columns:
+                dataframe["risk_gate"] = enriched["risk_gate"].values
             # Debug summary
             el = int(enriched["enter_long"].sum())
             es = int(enriched["enter_short"].sum())
@@ -78,5 +81,28 @@ class RLStrategy(IStrategy):
         dataframe.loc[:, 'exit_long'] = (dataframe.get('exit_long', 0) == 1).astype('int')
         dataframe.loc[:, 'exit_short'] = (dataframe.get('exit_short', 0) == 1).astype('int')
         return dataframe
+
+    # Dynamic stake sizing: scale proposed stake by current risk_gate (0..1)
+    def custom_stake_amount(self, pair: str, current_time, current_rate: float, proposed_stake: float, **kwargs) -> float:
+        try:
+            # Access analyzed dataframe to fetch risk_gate aligned at current_time
+            df, _ = self.dp.get_analyzed_dataframe(pair, self.timeframe)
+            g = 1.0
+            if df is not None and len(df) > 0:
+                if current_time in df.index and 'risk_gate' in df.columns:
+                    val = df.at[current_time, 'risk_gate']
+                else:
+                    val = df['risk_gate'].iloc[-1] if 'risk_gate' in df.columns else 1.0
+                try:
+                    import math
+                    g = float(val)
+                    if not math.isfinite(g):
+                        g = 1.0
+                except Exception:
+                    g = 1.0
+            g = float(max(0.1, min(1.0, g)))
+            return float(max(0.0, proposed_stake * g))
+        except Exception:
+            return float(proposed_stake)
 
 

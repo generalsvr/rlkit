@@ -74,6 +74,17 @@ class FTTradingEnv(gym.Env):
         )
         self.action_space = spaces.Discrete(4)
 
+    def _get_risk_gate(self, idx: int) -> float:
+        try:
+            if "risk_gate" in self.df.columns and 0 <= idx < len(self.df):
+                g = float(self.df.at[idx, "risk_gate"])  # type: ignore[index]
+                if not np.isfinite(g):
+                    return 1.0
+                return float(np.clip(g, 0.0, 1.0))
+        except Exception:
+            pass
+        return 1.0
+
     def reset(self, *, seed: int | None = None, options: dict | None = None):
         super().reset(seed=seed)
         # Randomized start to improve sample efficiency if enabled
@@ -118,10 +129,11 @@ class FTTradingEnv(gym.Env):
         # apply action
         can_close = (self.episode_steps - self.last_pos_change_step) >= self.cfg.min_hold_bars
         can_open = self.episode_steps >= self.cooldown_until_step
+        gate_at_exec = self._get_risk_gate(self.ptr - 1)
         if action == 1:  # long
             if self.position <= 0 and can_open:
                 if self.position != +1:
-                    cost = self._pay_costs(prev_position, +1)
+                    cost = self._pay_costs(prev_position, +1, size_factor=gate_at_exec)
                     step_penalty += cost
                 self.position = +1
                 self.entry_price = prev_price
@@ -131,7 +143,7 @@ class FTTradingEnv(gym.Env):
         elif action == 2:  # short
             if self.position >= 0 and can_open:
                 if self.position != -1:
-                    cost = self._pay_costs(prev_position, -1)
+                    cost = self._pay_costs(prev_position, -1, size_factor=gate_at_exec)
                     step_penalty += cost
                 self.position = -1
                 self.entry_price = prev_price
@@ -140,12 +152,14 @@ class FTTradingEnv(gym.Env):
                 action_blocked = True
         elif action == 3:  # close
             if self.position != 0 and can_close:
-                cost = self._pay_costs(prev_position, 0)
+                cost = self._pay_costs(prev_position, 0, size_factor=gate_at_exec)
                 step_penalty += cost
                 if self.cfg.pnl_on_close and self.entry_price is not None:
                     r = (prev_price - self.entry_price) / (self.entry_price + 1e-12)
                     r = r if prev_position == +1 else -r
-                    self.equity *= (1.0 + r)
+                    # Apply current gate to PnL on close as approximation
+                    g = self._get_risk_gate(self.ptr - 1)
+                    self.equity *= (1.0 + g * r)
                 self.position = 0
                 self.entry_price = None
                 self.last_pos_change_step = self.episode_steps
@@ -167,7 +181,8 @@ class FTTradingEnv(gym.Env):
             new_price = float(self.close[self.ptr - 1])
             r = (new_price - prev_price) / (prev_price + 1e-12)
             pos_sign = 1.0 if self.position == +1 else (-1.0 if self.position == -1 else 0.0)
-            raw_ret = pos_sign * r
+            g = self._get_risk_gate(self.ptr - 1)
+            raw_ret = (pos_sign * g) * r
             # Apply reward shaping
             if self.cfg.reward_type == "vol_scaled":
                 # Use precomputed rolling volatility at prev index
@@ -183,9 +198,9 @@ class FTTradingEnv(gym.Env):
                 reward = raw_ret
             # Update equity by raw PnL
             if self.position == +1:
-                self.equity *= (1.0 + r)
+                self.equity *= (1.0 + g * r)
             elif self.position == -1:
-                self.equity *= (1.0 - r)
+                self.equity *= (1.0 - g * r)
             else:
                 # Encourage taking positions by applying a tiny idle penalty (in bps)
                 if self.cfg.idle_penalty_bps > 0.0:
@@ -196,7 +211,8 @@ class FTTradingEnv(gym.Env):
         if not action_blocked and self.cfg.turnover_penalty_bps > 0.0 and self.episode_steps > 0:
             # Charge only when a position change occurred this step
             if prev_position != self.position:
-                tcost = self.cfg.turnover_penalty_bps * 1e-4
+                g = self._get_risk_gate(self.ptr - 1)
+                tcost = (self.cfg.turnover_penalty_bps * 1e-4) * g
                 step_penalty += tcost
                 self.equity *= (1.0 - tcost)
 
@@ -207,17 +223,19 @@ class FTTradingEnv(gym.Env):
         truncated = False
         # Subtract exchange/slippage penalties from reward
         reward = reward - step_penalty
-        info = {"equity": float(self.equity), "position": int(self.position)}
+        info = {"equity": float(self.equity), "position": int(self.position), "risk_gate": float(self._get_risk_gate(self.ptr - 1))}
         return obs, float(reward * self.cfg.reward_scale), terminated, truncated, info
 
-    def _pay_costs(self, from_pos: int, to_pos: int) -> float:
+    def _pay_costs(self, from_pos: int, to_pos: int, size_factor: float = 1.0) -> float:
         if from_pos == to_pos:
             return 0.0
         bps = self.cfg.fee_bps + self.cfg.slippage_bps
         # Flip (long<->short) incurs exit+entry costs
         if from_pos * to_pos == -1:
             bps *= 2.0
-        cost = bps * 1e-4
+        # Scale fees/slippage by current effective size
+        size = float(np.clip(size_factor, 0.0, 1.0))
+        cost = (bps * 1e-4) * size
         self.equity *= (1.0 - cost)
         return float(cost)
 

@@ -77,7 +77,7 @@ def train(
     episode_max_steps: int = typer.Option(0, help="Max steps per episode (0 = run to dataset end)"),
     feature_mode: str = typer.Option("full", help="full|basic (basic: close_z, change, d_hl)"),
     basic_lookback: int = typer.Option(64, help="Lookback for basic close_z standardization"),
-    extra_timeframes: str = typer.Option("4H", help="Comma-separated higher TFs to include, e.g., '4H,1D'"),
+    extra_timeframes: str = typer.Option("", help="Optional comma-separated HTFs to include, e.g., '4H,1D'"),
     # Eval options
     eval_freq: int = typer.Option(100000, help="Evaluate every N steps (0 disables)"),
     n_eval_episodes: int = typer.Option(3, help="Episodes per eval"),
@@ -202,7 +202,7 @@ def sweep(
     fee_list: str = typer.Option("2,6"),
     slip_list: str = typer.Option("5,10"),
     seeds: str = typer.Option("42,1337"),
-    extra_timeframes: str = typer.Option("4H", help="Comma-separated HTFs to include for all trials"),
+    extra_timeframes: str = typer.Option("", help="Optional comma-separated HTFs to include for all trials"),
     # Fixed env knobs
     turnover_penalty_bps: float = typer.Option(1.0),
     min_hold_bars: int = typer.Option(2),
@@ -334,7 +334,7 @@ def validate(
     episode_max_steps: int = typer.Option(0, help="Max steps per episode (0 = run to dataset end)"),
     feature_mode: str = typer.Option("full", help="full|basic (basic: close_z, change, d_hl)"),
     basic_lookback: int = typer.Option(64, help="Lookback for basic close_z standardization"),
-    extra_timeframes: str = typer.Option("4H", help="Comma-separated HTFs to include, e.g., '4H,1D'"),
+    extra_timeframes: str = typer.Option("", help="Optional comma-separated HTFs to include, e.g., '4H,1D'"),
 ):
     """Run a quick validation rollout on eval split and print summary (actions, entries, equity)."""
     etf_list = _parse_list(extra_timeframes, str) if extra_timeframes else []
