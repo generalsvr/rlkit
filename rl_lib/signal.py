@@ -72,6 +72,25 @@ def compute_rl_signals(df: pd.DataFrame, model_path: str, window: int = 128) -> 
         if tfs:
             extra_timeframes = sorted(tfs)
     feats = make_features(df, feature_columns=feature_columns, mode=mode_for_eval, extra_timeframes=extra_timeframes)
+    # Align feature dimension to model's expected observation size if needed
+    try:
+        expected_flat = int(getattr(getattr(model, "observation_space", None) or getattr(model.policy, "observation_space", None), "shape", [0])[0])
+    except Exception:
+        expected_flat = 0
+    if expected_flat and window > 0:
+        # model expects: (window * (num_features + 1)) where +1 is position channel
+        target_feat_dim = max(1, (expected_flat // int(window)) - 1)
+        current_feat_dim = int(feats.shape[1])
+        if current_feat_dim != target_feat_dim:
+            if current_feat_dim > target_feat_dim:
+                # Trim extra columns from the right (HTFs were appended after base)
+                feats = feats.iloc[:, :target_feat_dim].copy()
+            else:
+                # Pad with zeros for missing columns to match expected size
+                for i in range(current_feat_dim, target_feat_dim):
+                    feats[f"pad_{i}"] = 0.0
+                # Ensure exact ordering
+                feats = feats.iloc[:, :target_feat_dim].copy()
     feats = feats.reset_index(drop=True)
     n = len(feats)
     actions = np.zeros(n, dtype=int)
