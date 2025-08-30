@@ -70,7 +70,7 @@ echo "[+] Starting backend (FastAPI) on :8080 (this may take a minute on first r
   # Minimal deps for inference server
   pip install -q fastapi uvicorn[standard] pydantic pandas numpy pyarrow stable-baselines3 sb3-contrib gymnasium cloudpickle >/dev/null 2>&1 || true
   export RL_DEVICE="${RL_DEVICE:-cpu}"
-  uvicorn backtest_server.main:app --host 0.0.0.0 --port 8080 --reload &
+  uvicorn main:app --host 0.0.0.0 --port 8080 --reload &
   echo $! > "$BACK_DIR/.uvicorn.pid"
   deactivate || true
 )
