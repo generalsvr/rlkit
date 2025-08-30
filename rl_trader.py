@@ -24,6 +24,10 @@ from rl_lib.train_sb3 import TrainParams, train_ppo_from_freqtrade_data, validat
 app = typer.Typer(add_completion=False)
 
 
+def _parse_list(s: str, cast):
+    return [cast(x.strip()) for x in s.split(",") if x.strip() != ""]
+
+
 @app.command()
 def download(
     pair: str = typer.Option("BTC/USDT"),
@@ -55,7 +59,7 @@ def train(
     window: int = typer.Option(128),
     timesteps: int = typer.Option(200_000),
     model_out: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "rl_ppo.zip")),
-    arch: str = typer.Option("mlp", help="mlp|lstm|transformer|transformer_big|transformer_hybrid"),
+    arch: str = typer.Option("mlp", help="mlp|lstm|transformer|transformer_big|transformer_hybrid|multiscale"),
     fee_bps: float = typer.Option(6.0, help="Trading fee in basis points (e.g., 6.0 = 0.06%)"),
     slippage_bps: float = typer.Option(2.0, help="Slippage in basis points"),
     idle_penalty_bps: float = typer.Option(0.02, help="Idle penalty in bps when flat (applied in env)"),
@@ -73,6 +77,7 @@ def train(
     episode_max_steps: int = typer.Option(0, help="Max steps per episode (0 = run to dataset end)"),
     feature_mode: str = typer.Option("full", help="full|basic (basic: close_z, change, d_hl)"),
     basic_lookback: int = typer.Option(64, help="Lookback for basic close_z standardization"),
+    extra_timeframes: str = typer.Option("4H", help="Comma-separated higher TFs to include, e.g., '4H,1D'"),
     # Eval options
     eval_freq: int = typer.Option(100000, help="Evaluate every N steps (0 disables)"),
     n_eval_episodes: int = typer.Option(3, help="Episodes per eval"),
@@ -86,6 +91,7 @@ def train(
     n_epochs: int = typer.Option(10, help="Epochs per update"),
 ):
     """Train PPO on downloaded data using Stable-Baselines3."""
+    etf_list = _parse_list(extra_timeframes, str) if extra_timeframes else []
     params = TrainParams(
         userdir=userdir,
         pair=pair,
@@ -110,6 +116,7 @@ def train(
         episode_max_steps=episode_max_steps,
         feature_mode=feature_mode,
         basic_lookback=basic_lookback,
+        extra_timeframes=etf_list or None,
         eval_freq=eval_freq,
         n_eval_episodes=n_eval_episodes,
         eval_max_steps=eval_max_steps,
@@ -177,10 +184,6 @@ def backtest(
     subprocess.run(cmd, check=True, env=env)
 
 
-def _parse_list(s: str, cast):
-    return [cast(x.strip()) for x in s.split(",") if x.strip() != ""]
-
-
 @app.command()
 def sweep(
     pair: str = typer.Option("BTC/USDT:USDT"),
@@ -199,6 +202,7 @@ def sweep(
     fee_list: str = typer.Option("2,6"),
     slip_list: str = typer.Option("5,10"),
     seeds: str = typer.Option("42,1337"),
+    extra_timeframes: str = typer.Option("4H", help="Comma-separated HTFs to include for all trials"),
     # Fixed env knobs
     turnover_penalty_bps: float = typer.Option(1.0),
     min_hold_bars: int = typer.Option(2),
@@ -230,6 +234,7 @@ def sweep(
     fee_vals = _parse_list(fee_list, float)
     slip_vals = _parse_list(slip_list, float)
     seed_vals = _parse_list(seeds, int)
+    etf_list = _parse_list(extra_timeframes, str) if extra_timeframes else []
 
     combos = list(product(rt_list, ec_list, lr_list, ns_list, bs_list, fee_vals, slip_vals, seed_vals))
     if len(combos) > max_trials:
@@ -262,6 +267,7 @@ def sweep(
             episode_max_steps=4096,
             feature_mode=feature_mode,
             basic_lookback=basic_lookback,
+            extra_timeframes=etf_list or None,
             eval_freq=0,
             n_eval_episodes=1,
             eval_max_steps=eval_max_steps,
@@ -276,7 +282,6 @@ def sweep(
         typer.echo(f"[{idx}/{len(combos)}] Training {tag}")
         try:
             _ = train_ppo_from_freqtrade_data(params)
-            # Quick eval using same data split settings
             report = validate_trained_model(params, max_steps=eval_max_steps, deterministic=True)
             row = {
                 "model_path": model_path,
@@ -329,8 +334,10 @@ def validate(
     episode_max_steps: int = typer.Option(0, help="Max steps per episode (0 = run to dataset end)"),
     feature_mode: str = typer.Option("full", help="full|basic (basic: close_z, change, d_hl)"),
     basic_lookback: int = typer.Option(64, help="Lookback for basic close_z standardization"),
+    extra_timeframes: str = typer.Option("4H", help="Comma-separated HTFs to include, e.g., '4H,1D'"),
 ):
     """Run a quick validation rollout on eval split and print summary (actions, entries, equity)."""
+    etf_list = _parse_list(extra_timeframes, str) if extra_timeframes else []
     params = TrainParams(
         userdir=userdir,
         pair=pair,
@@ -351,6 +358,7 @@ def validate(
         episode_max_steps=episode_max_steps,
         feature_mode=feature_mode,
         basic_lookback=basic_lookback,
+        extra_timeframes=etf_list or None,
     )
     os.environ["RL_DEVICE"] = device
     _ = validate_trained_model(params, max_steps=max_steps, deterministic=deterministic, timerange=timerange)
