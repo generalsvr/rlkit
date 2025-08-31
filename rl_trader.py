@@ -192,6 +192,10 @@ def train_multi(
     feature_mode: str = typer.Option("basic"),
     basic_lookback: int = typer.Option(128),
     extra_timeframes: str = typer.Option("4H,1D", "--extra-timeframes", "--extra_timeframes"),
+    # Eval knobs
+    eval_freq: int = typer.Option(50000, help="Evaluate every N steps (0 disables)"),
+    n_eval_episodes: int = typer.Option(1, help="Episodes per eval"),
+    eval_max_steps: int = typer.Option(2000, help="Max steps per eval rollout"),
     # Auto-download knobs
     autofetch: bool = typer.Option(True, help="Auto-download missing datasets (1h,4h,1d,1w)"),
     timerange: str = typer.Option("20190101-", help="Timerange for auto-download"),
@@ -235,9 +239,9 @@ def train_multi(
         feature_mode=feature_mode,
         basic_lookback=basic_lookback,
         extra_timeframes=etf_list or None,
-        eval_freq=50000,
-        n_eval_episodes=1,
-        eval_max_steps=2000,
+        eval_freq=eval_freq,
+        n_eval_episodes=n_eval_episodes,
+        eval_max_steps=eval_max_steps,
         eval_log_path=str(Path(model_out).with_suffix("") ) + "_eval.csv",
         ent_coef=0.02,
         learning_rate=3e-4,
