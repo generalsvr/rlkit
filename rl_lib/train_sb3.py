@@ -182,6 +182,8 @@ class PnLEvalCallback(BaseCallback):
         self.max_steps = int(max_steps)
         self.deterministic = bool(deterministic)
         self.eval_log_path = eval_log_path
+        # Track last eval trigger to handle vectorized step jumps (n_envs * n_steps)
+        self._last_eval_steps = 0
 
     def _append_log(self, num_timesteps: int, report: Dict[str, Any]):
         if not self.eval_log_path:
@@ -215,13 +217,15 @@ class PnLEvalCallback(BaseCallback):
 
     def _on_step(self) -> bool:
         num = int(self.model.num_timesteps)
-        if num % self.eval_freq == 0:
+        # Trigger when at least eval_freq steps have elapsed since last eval
+        if (num - self._last_eval_steps) >= self.eval_freq:
             report = _run_validation_rollout(self.model, self.eval_env, max_steps=self.max_steps, deterministic=self.deterministic)
             final_eq = report.get("final_equity", float("nan"))
             sharpe = report.get("sharpe", float("nan"))
             self.logger.record("eval/final_equity", final_eq)
             self.logger.record("eval/sharpe", sharpe)
             self._append_log(num, report)
+            self._last_eval_steps = num
             if self.verbose:
                 print(f"EVAL_PNL: timesteps={num} final_equity={final_eq:.6f} sharpe={sharpe:.4f}")
         return True
