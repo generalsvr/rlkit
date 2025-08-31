@@ -113,6 +113,11 @@ def train(
     n_eval_episodes: int = typer.Option(3, help="Episodes per eval"),
     eval_max_steps: int = typer.Option(2000, help="Max steps per eval rollout"),
     eval_log_path: str = typer.Option("", help="CSV path to append eval results"),
+    # Early stopping (optional)
+    early_stop_metric: str = typer.Option("", help="Metric to monitor for early stop: sharpe|final_equity|max_drawdown"),
+    early_stop_patience: int = typer.Option(0, help="Evals to wait without improvement before stopping"),
+    early_stop_min_delta: float = typer.Option(0.0, help="Minimum improvement to reset patience"),
+    early_stop_degrade_ratio: float = typer.Option(0.0, help="Stop if metric drops below best*(1-ratio)"),
     # PPO overrides
     ent_coef: float = typer.Option(0.02, help="Entropy coefficient"),
     learning_rate: float = typer.Option(3e-4, help="Learning rate"),
@@ -165,6 +170,10 @@ def train(
         batch_size=batch_size,
         n_epochs=n_epochs,
         timerange=(train_timerange or None),
+        early_stop_metric=(early_stop_metric or None),
+        early_stop_patience=early_stop_patience,
+        early_stop_min_delta=early_stop_min_delta,
+        early_stop_degrade_ratio=early_stop_degrade_ratio,
     )
     out = train_ppo_from_freqtrade_data(params)
     typer.echo(f"Model saved: {out}")
@@ -199,6 +208,11 @@ def train_multi(
     eval_freq: int = typer.Option(50000, help="Evaluate every N steps (0 disables)"),
     n_eval_episodes: int = typer.Option(1, help="Episodes per eval"),
     eval_max_steps: int = typer.Option(2000, help="Max steps per eval rollout"),
+    # Early stopping (optional)
+    early_stop_metric: str = typer.Option("", help="Metric to monitor for early stop: sharpe|final_equity|max_drawdown"),
+    early_stop_patience: int = typer.Option(0, help="Evals to wait without improvement before stopping"),
+    early_stop_min_delta: float = typer.Option(0.0, help="Minimum improvement to reset patience"),
+    early_stop_degrade_ratio: float = typer.Option(0.0, help="Stop if metric drops below best*(1-ratio)"),
     # Auto-download knobs
     autofetch: bool = typer.Option(True, help="Auto-download missing datasets (1h,4h,1d,1w)"),
     timerange: str = typer.Option("20190101-", help="Timerange for auto-download"),
@@ -256,6 +270,10 @@ def train_multi(
         n_epochs=10,
         timerange=(train_timerange or None),
         align_mode=str(align_mode).lower(),
+        early_stop_metric=(early_stop_metric or None),
+        early_stop_patience=early_stop_patience,
+        early_stop_min_delta=early_stop_min_delta,
+        early_stop_degrade_ratio=early_stop_degrade_ratio,
     )
     out = train_ppo_multi_from_freqtrade_data(params, pair_list)
     typer.echo(f"Model saved: {out}")

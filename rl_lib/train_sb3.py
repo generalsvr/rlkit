@@ -200,7 +200,8 @@ def _run_validation_rollout(model: PPO, eval_env: VecNormalize | DummyVecEnv, ma
 
 
 class PnLEvalCallback(BaseCallback):
-    def __init__(self, eval_env: VecNormalize | DummyVecEnv, eval_freq: int, max_steps: int = 2000, deterministic: bool = True, verbose: int = 1, eval_log_path: Optional[str] = None):
+    def __init__(self, eval_env: VecNormalize | DummyVecEnv, eval_freq: int, max_steps: int = 2000, deterministic: bool = True, verbose: int = 1, eval_log_path: Optional[str] = None,
+                 early_stop_metric: Optional[str] = None, early_stop_patience: int = 0, early_stop_min_delta: float = 0.0, early_stop_degrade_ratio: float = 0.0):
         super().__init__(verbose)
         self.eval_env = eval_env
         self.eval_freq = int(max(1, eval_freq))
@@ -209,6 +210,13 @@ class PnLEvalCallback(BaseCallback):
         self.eval_log_path = eval_log_path
         # Track last eval trigger to handle vectorized step jumps (n_envs * n_steps)
         self._last_eval_steps = 0
+        # Early stopping config
+        self.early_stop_metric = (early_stop_metric or "").strip().lower() or None
+        self.early_stop_patience = int(max(0, early_stop_patience))
+        self.early_stop_min_delta = float(max(0.0, early_stop_min_delta))
+        self.early_stop_degrade_ratio = float(max(0.0, min(1.0, early_stop_degrade_ratio)))
+        self._best_metric = float('-inf')
+        self._since_improve = 0
 
     def _append_log(self, num_timesteps: int, report: Dict[str, Any]):
         if not self.eval_log_path:
@@ -253,6 +261,27 @@ class PnLEvalCallback(BaseCallback):
             self._last_eval_steps = num
             if self.verbose:
                 print(f"EVAL_PNL: timesteps={num} final_equity={final_eq:.6f} sharpe={sharpe:.4f}")
+            # Early stopping logic (maximize metric)
+            if self.early_stop_metric is not None:
+                curr = float(report.get(self.early_stop_metric, float('nan')))
+                improved = False
+                if np.isfinite(curr):
+                    if curr >= (self._best_metric + self.early_stop_min_delta):
+                        self._best_metric = curr
+                        self._since_improve = 0
+                        improved = True
+                    else:
+                        self._since_improve += 1
+                # Degradation check relative to best (only if best positive)
+                degraded = False
+                if self.early_stop_degrade_ratio > 0.0 and np.isfinite(self._best_metric) and self._best_metric > 0.0 and np.isfinite(curr):
+                    threshold = self._best_metric * (1.0 - self.early_stop_degrade_ratio)
+                    if curr < threshold:
+                        degraded = True
+                if (self.early_stop_patience > 0 and self._since_improve >= self.early_stop_patience) or degraded:
+                    reason = "patience_exhausted" if (self.early_stop_patience > 0 and self._since_improve >= self.early_stop_patience) else "degraded"
+                    print(f"EARLY_STOP: metric={self.early_stop_metric} best={self._best_metric:.6f} curr={curr:.6f} steps={num} reason={reason}")
+                    return False
         return True
 
 
@@ -530,6 +559,11 @@ class TrainParams:
     # Dataset slicing/alignment
     timerange: Optional[str] = None  # e.g. "20190101-20240101"
     align_mode: str = "union"  # union | intersection (multi-train only)
+    # Early stopping
+    early_stop_metric: Optional[str] = None  # e.g., 'sharpe', 'final_equity', 'max_drawdown'
+    early_stop_patience: int = 0
+    early_stop_min_delta: float = 0.0
+    early_stop_degrade_ratio: float = 0.0
     # PPO hyperparams
     ent_coef: float = 0.02
     learning_rate: float = 3e-4
@@ -763,7 +797,18 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
             deterministic=True,
             render=False,
         ))
-        callbacks.append(PnLEvalCallback(eval_env, eval_freq=params.eval_freq, max_steps=params.eval_max_steps, deterministic=True, verbose=1, eval_log_path=params.eval_log_path))
+        callbacks.append(PnLEvalCallback(
+            eval_env,
+            eval_freq=params.eval_freq,
+            max_steps=params.eval_max_steps,
+            deterministic=True,
+            verbose=1,
+            eval_log_path=params.eval_log_path,
+            early_stop_metric=params.early_stop_metric,
+            early_stop_patience=params.early_stop_patience,
+            early_stop_min_delta=params.early_stop_min_delta,
+            early_stop_degrade_ratio=params.early_stop_degrade_ratio,
+        ))
 
     # Sync eval normalization stats with training env
     if isinstance(env, VecNormalize) and isinstance(eval_env, VecNormalize):
@@ -1081,7 +1126,18 @@ def train_ppo_multi_from_freqtrade_data(params: TrainParams, pairs: List[str]) -
             deterministic=True,
             render=False,
         ))
-        callbacks.append(PnLEvalCallback(eval_env, eval_freq=params.eval_freq, max_steps=params.eval_max_steps, deterministic=True, verbose=1, eval_log_path=params.eval_log_path))
+        callbacks.append(PnLEvalCallback(
+            eval_env,
+            eval_freq=params.eval_freq,
+            max_steps=params.eval_max_steps,
+            deterministic=True,
+            verbose=1,
+            eval_log_path=params.eval_log_path,
+            early_stop_metric=params.early_stop_metric,
+            early_stop_patience=params.early_stop_patience,
+            early_stop_min_delta=params.early_stop_min_delta,
+            early_stop_degrade_ratio=params.early_stop_degrade_ratio,
+        ))
 
     # Sync eval normalization stats with training env
     if isinstance(train_env, VecNormalize) and isinstance(eval_env, VecNormalize):
