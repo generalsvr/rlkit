@@ -7,7 +7,7 @@ pip install -r requirements.txt
 pip install -r requirements.extra.txt
 pip install freqtrade
 
-apt update && apt install build-essential wget && cd /tmp && wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && tar -xzf ta-lib-0.4.0-src.tar.gz && cd ta-lib/ && ./configure --prefix=/usr && make && make install && ldconfig && cd /workspace && git clone https://github.com/generalsvr/rlkit && cd rlkit && pip install -r requirements.txt && pip install --ignore-installed blinker==1.8.2 && pip install streamlit>=1.36.0
+apt update && apt install build-essential wget && cd /tmp && wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && tar -xzf ta-lib-0.4.0-src.tar.gz && cd ta-lib/ && ./configure --prefix=/usr && make && make install && ldconfig && cd /workspace && git clone https://github.com/generalsvr/rlkit && cd rlkit && pip install stable-baselines3[extra] && pip install -r requirements.txt
 ```
 
 ### Futures Mode (USDT-M, offline OHLCV)
@@ -108,7 +108,7 @@ Notes:
 ```bash
 python rl_trader.py validate --pair "BTC/USDT:USDT" --timeframe 1h \
   --window 128 --model-path /workspace/rlkit/models/rl_ppo.zip \
-  --max-steps 5000 --device cuda
+  --max-steps 5000 --device cuda --timerange 20250101-
 ```
 - Prints summary including final equity, Sharpe, Sortino, and MaxDD.
 
@@ -141,18 +141,4 @@ freqtrade backtesting \
 - "No pair in whitelist": use correct pair symbol (`BTC/USDT:USDT` for Bybit futures).
 - CPU runs: set `--device cpu`.
 
-### Streamlit Trading Terminal
-
-Run the minimal visual terminal to download data, select ranges, run your RL agent, and visualize LONG/SHORT/EXIT and equity:
-```bash
-source .venv/bin/activate
-streamlit run app.py   --server.headless true   --server.address 0.0.0.0   --server.port 8501   --server.enableCORS false   --server.enableXsrfProtection false
-```
-
-Features:
-- Select pair, timeframe, exchange, date range
-- Download OHLCV via Freqtrade
-- Choose model path and window
-- Visualize OHLC (candles), markers (enter_long/enter_short/exit_*), equity curve, and risk metrics
-
-
+ 

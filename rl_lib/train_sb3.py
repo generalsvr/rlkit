@@ -356,45 +356,79 @@ def validate_trained_model(params: TrainParams, max_steps: int = 2000, determini
             # Use close price for plotting
             y = df["close"].astype(float).values if "close" in df.columns else df.iloc[:, 0].astype(float).values
 
-            fig, ax = plt.subplots(figsize=(14, 7))
+            fig, ax = plt.subplots(figsize=(15, 7))
             ax.plot(x, y, color="#2c3e50", linewidth=1.0, label="Close")
 
-            # Collect events
-            events = []
-            if "enter_long" in df.columns:
-                for idx in list(np.flatnonzero(df["enter_long"].values == 1)):
-                    events.append((idx, "LONG"))
-            if "enter_short" in df.columns:
-                for idx in list(np.flatnonzero(df["enter_short"].values == 1)):
-                    events.append((idx, "SHORT"))
-            # SELL is any exit (long or short)
-            if "exit_long" in df.columns:
-                for idx in list(np.flatnonzero(df["exit_long"].values == 1)):
-                    events.append((idx, "SELL"))
-            if "exit_short" in df.columns:
-                for idx in list(np.flatnonzero(df["exit_short"].values == 1)):
-                    events.append((idx, "SELL"))
+            # Indices for events
+            lo_idx = list(np.flatnonzero(df.get("enter_long", pd.Series(0, index=df.index)).values == 1))
+            lc_idx = list(np.flatnonzero(df.get("exit_long", pd.Series(0, index=df.index)).values == 1))
+            so_idx = list(np.flatnonzero(df.get("enter_short", pd.Series(0, index=df.index)).values == 1))
+            sc_idx = list(np.flatnonzero(df.get("exit_short", pd.Series(0, index=df.index)).values == 1))
 
-            # Stable chronological order
-            events.sort(key=lambda t: t[0])
+            # Pair opens/closes per side to number trades and shade spans
+            def pair_trades(open_indices: List[int], close_indices: List[int]) -> List[tuple[int, int | None, int]]:
+                open_indices_sorted = sorted(open_indices)
+                close_indices_sorted = sorted(close_indices)
+                pairs: List[tuple[int, int | None, int]] = []
+                active: List[tuple[int, int]] = []  # (open_idx, trade_no)
+                trade_no = 0
+                # Traverse timeline; process all events in order
+                timeline = sorted([(i, 1) for i in open_indices_sorted] + [(i, -1) for i in close_indices_sorted])
+                for idx, typ in timeline:
+                    if typ == 1:  # open
+                        trade_no += 1
+                        active.append((idx, trade_no))
+                        pairs.append((idx, None, trade_no))
+                    else:  # close
+                        # match earliest active
+                        if active:
+                            open_idx, no = active.pop(0)
+                            # update pairs for this trade_no
+                            for k in range(len(pairs)):
+                                if pairs[k][2] == no and pairs[k][1] is None:
+                                    pairs[k] = (pairs[k][0], idx, no)
+                                    break
+                        else:
+                            # orphan close, skip pairing
+                            pass
+                return pairs
 
-            # Separate counters
-            counters: Dict[str, int] = {"LONG": 0, "SHORT": 0, "SELL": 0}
-            # Colors and markers
-            color_map = {"LONG": "#2ecc71", "SHORT": "#e74c3c", "SELL": "#f1c40f"}
-            marker_map = {"LONG": "^", "SHORT": "v", "SELL": "x"}
+            long_pairs = pair_trades(lo_idx, lc_idx)
+            short_pairs = pair_trades(so_idx, sc_idx)
 
-            # Plot markers and annotations
-            for idx, kind in events:
-                if idx < 0 or idx >= len(y):
-                    continue
-                counters[kind] += 1
-                label = f"{kind}{counters[kind]}"
-                xi = x[idx]
-                yi = y[idx]
-                ax.scatter([xi], [yi], marker=marker_map[kind], color=color_map[kind], s=40, zorder=3)
-                ax.annotate(label, (xi, yi), textcoords="offset points", xytext=(0, 8), ha="center",
-                            fontsize=8, color=color_map[kind], fontweight="bold")
+            # Shading for positions
+            def _shade_spans(pairs: List[tuple[int, int | None, int]], color: str):
+                for open_i, close_i, _no in pairs:
+                    x0 = x[open_i]
+                    x1 = x[close_i] if (close_i is not None and close_i < len(x)) else x[-1]
+                    ax.axvspan(x0, x1, color=color, alpha=0.06, linewidth=0)
+
+            _shade_spans(long_pairs, "#2ecc71")
+            _shade_spans(short_pairs, "#e74c3c")
+
+            # Plot markers and LO/LC/SO/SC labels with alternating offsets
+            def _annotate_pairs(pairs: List[tuple[int, int | None, int]], open_kind: str, close_kind: str, open_color: str, close_color: str, open_marker: str, close_marker: str):
+                for open_i, close_i, no in pairs:
+                    # Alternate offsets by trade number to reduce overlap
+                    open_off = 14 if (no % 2 == 1) else 20
+                    close_off = -14 if (no % 2 == 1) else -20
+                    # Open
+                    if 0 <= open_i < len(y):
+                        xi = x[open_i]
+                        yi = y[open_i]
+                        ax.scatter([xi], [yi], marker=open_marker, color=open_color, s=42, zorder=3)
+                        ax.annotate(f"{open_kind}{no}", (xi, yi), textcoords="offset points", xytext=(0, open_off), ha="center",
+                                    fontsize=8, color=open_color, fontweight="bold")
+                    # Close
+                    if close_i is not None and 0 <= close_i < len(y):
+                        xi = x[close_i]
+                        yi = y[close_i]
+                        ax.scatter([xi], [yi], marker=close_marker, color=close_color, s=36, zorder=3)
+                        ax.annotate(f"{close_kind}{no}", (xi, yi), textcoords="offset points", xytext=(0, close_off), ha="center",
+                                    fontsize=8, color=close_color, fontweight="bold")
+
+            _annotate_pairs(long_pairs, "LO", "LC", open_color="#2ecc71", close_color="#27ae60", open_marker="^", close_marker="o")
+            _annotate_pairs(short_pairs, "SO", "SC", open_color="#e74c3c", close_color="#c0392b", open_marker="v", close_marker="o")
 
             ax.set_title(title)
             ax.set_xlabel("Time")
@@ -405,7 +439,7 @@ def validate_trained_model(params: TrainParams, max_steps: int = 2000, determini
                 formatter = mdates.ConciseDateFormatter(locator)
                 ax.xaxis.set_major_locator(locator)
                 ax.xaxis.set_major_formatter(formatter)
-            ax.legend(loc="upper left")
+            ax.legend(["Close"], loc="upper left")
             fig.tight_layout()
             fig.savefig(save_path, dpi=150)
             plt.close(fig)
