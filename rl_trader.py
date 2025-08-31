@@ -34,6 +34,24 @@ def _parse_list(s: str, cast):
     return [cast(x.strip()) for x in s.split(",") if x.strip() != ""]
 
 
+def _safe_float(x: Any) -> float:
+    try:
+        if x is None:
+            return float("nan")
+        return float(x)
+    except Exception:
+        return float("nan")
+
+
+def _safe_int(x: Any) -> int:
+    try:
+        if x is None:
+            return 0
+        return int(x)
+    except Exception:
+        return 0
+
+
 @app.command()
 def download(
     pair: str = typer.Option("BTC/USDT"),
@@ -506,6 +524,7 @@ def sweep(
     windows_list: str = typer.Option("", help="Comma-separated window sizes; if empty, uses --window"),
     min_hold_bars_list: str = typer.Option("", help="Comma-separated min-hold bars values"),
     cooldown_bars_list: str = typer.Option("", help="Comma-separated cooldown bars values"),
+    feature_modes: str = typer.Option("", help="Comma-separated feature modes to sweep: basic,full"),
     # Eval and early stop
     eval_max_steps: int = typer.Option(5000),
     eval_freq: int = typer.Option(50000, help="Evaluate every N steps; enable >0 for early stopping"),
@@ -527,7 +546,7 @@ def sweep(
     results_csv = sweep_dir / "results.csv"
     with open(results_csv, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[
-            "model_path","window","min_hold_bars","cooldown_bars","reward_type","ent_coef","learning_rate","n_steps","batch_size","fee_bps","slippage_bps","seed",
+            "model_path","feature_mode","window","min_hold_bars","cooldown_bars","reward_type","ent_coef","learning_rate","n_steps","batch_size","fee_bps","slippage_bps","seed",
             "final_equity","sharpe","max_drawdown","time_in_position_frac",
             "bt_total_profit_pct","bt_total_profit_abs","bt_total_trades","bt_win_rate","bt_profit_factor",
             "bt_zip","bt_meta","bt_run_id"
@@ -546,15 +565,16 @@ def sweep(
     win_vals = _parse_list(windows_list, int) if windows_list else [window]
     mh_vals = _parse_list(min_hold_bars_list, int) if min_hold_bars_list else [min_hold_bars]
     cd_vals = _parse_list(cooldown_bars_list, int) if cooldown_bars_list else [cooldown_bars]
+    fm_list = [m.strip() for m in feature_modes.split(",") if m.strip()] if feature_modes else [feature_mode]
 
-    combos = list(product(rt_list, ec_list, lr_list, ns_list, bs_list, fee_vals, slip_vals, seed_vals, win_vals, mh_vals, cd_vals))
+    combos = list(product(rt_list, ec_list, lr_list, ns_list, bs_list, fee_vals, slip_vals, seed_vals, win_vals, mh_vals, cd_vals, fm_list))
     if len(combos) > max_trials:
         combos = combos[:max_trials]
 
     typer.echo(f"Running {len(combos)} trials. Results -> {results_csv}")
 
-    for idx, (rt, ec, lr, ns, bs, fee, slip, sd, wv, mhv, cdv) in enumerate(combos, start=1):
-        tag = f"{arch}_win-{wv}_mh-{mhv}_cd-{cdv}_rt-{rt}_ec-{ec}_lr-{lr}_ns-{ns}_bs-{bs}_fee-{fee}_slip-{slip}_seed-{sd}"
+    for idx, (rt, ec, lr, ns, bs, fee, slip, sd, wv, mhv, cdv, fm) in enumerate(combos, start=1):
+        tag = f"{arch}_fm-{fm}_win-{wv}_mh-{mhv}_cd-{cdv}_rt-{rt}_ec-{ec}_lr-{lr}_ns-{ns}_bs-{bs}_fee-{fee}_slip-{slip}_seed-{sd}"
         model_path = str(sweep_dir / f"{tag}.zip")
         params = TrainParams(
             userdir=userdir,
@@ -576,7 +596,7 @@ def sweep(
             cooldown_bars=cdv,
             random_reset=True,
             episode_max_steps=4096,
-            feature_mode=feature_mode,
+            feature_mode=fm,
             basic_lookback=basic_lookback,
             extra_timeframes=etf_list or None,
             eval_freq=eval_freq,
@@ -614,26 +634,27 @@ def sweep(
                 )
             row = {
                 "model_path": model_path,
+                "feature_mode": str(fm),
                 "window": int(wv),
                 "min_hold_bars": int(mhv),
                 "cooldown_bars": int(cdv),
                 "reward_type": rt,
-                "ent_coef": ec,
-                "learning_rate": lr,
-                "n_steps": ns,
-                "batch_size": bs,
-                "fee_bps": fee,
-                "slippage_bps": slip,
-                "seed": sd,
-                "final_equity": float(report.get("final_equity", float("nan"))),
-                "sharpe": float(report.get("sharpe", float("nan"))),
-                "max_drawdown": float(report.get("max_drawdown", float("nan"))),
-                "time_in_position_frac": float(report.get("time_in_position_frac", float("nan"))),
-                "bt_total_profit_pct": float(bt_metrics.get("bt_total_profit_pct", float("nan"))) if auto_backtest else float("nan"),
-                "bt_total_profit_abs": float(bt_metrics.get("bt_total_profit_abs", float("nan"))) if auto_backtest else float("nan"),
-                "bt_total_trades": int(bt_metrics.get("bt_total_trades", 0)) if auto_backtest else 0,
-                "bt_win_rate": float(bt_metrics.get("bt_win_rate", float("nan"))) if auto_backtest else float("nan"),
-                "bt_profit_factor": float(bt_metrics.get("bt_profit_factor", float("nan"))) if auto_backtest else float("nan"),
+                "ent_coef": _safe_float(ec),
+                "learning_rate": _safe_float(lr),
+                "n_steps": _safe_int(ns),
+                "batch_size": _safe_int(bs),
+                "fee_bps": _safe_float(fee),
+                "slippage_bps": _safe_float(slip),
+                "seed": _safe_int(sd),
+                "final_equity": _safe_float(report.get("final_equity")),
+                "sharpe": _safe_float(report.get("sharpe")),
+                "max_drawdown": _safe_float(report.get("max_drawdown")),
+                "time_in_position_frac": _safe_float(report.get("time_in_position_frac")),
+                "bt_total_profit_pct": _safe_float(bt_metrics.get("bt_total_profit_pct")) if auto_backtest else float("nan"),
+                "bt_total_profit_abs": _safe_float(bt_metrics.get("bt_total_profit_abs")) if auto_backtest else float("nan"),
+                "bt_total_trades": _safe_int(bt_metrics.get("bt_total_trades")) if auto_backtest else 0,
+                "bt_win_rate": _safe_float(bt_metrics.get("bt_win_rate")) if auto_backtest else float("nan"),
+                "bt_profit_factor": _safe_float(bt_metrics.get("bt_profit_factor")) if auto_backtest else float("nan"),
                 "bt_zip": str(bt_metrics.get("bt_zip", "")) if auto_backtest else "",
                 "bt_meta": str(bt_metrics.get("bt_meta", "")) if auto_backtest else "",
                 "bt_run_id": str(bt_metrics.get("bt_run_id", "")) if auto_backtest else "",
