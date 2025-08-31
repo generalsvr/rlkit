@@ -19,6 +19,7 @@ from datetime import datetime
 import csv
 
 from rl_lib.train_sb3 import TrainParams, train_ppo_from_freqtrade_data, validate_trained_model
+from rl_lib.train_sb3 import train_ppo_multi_from_freqtrade_data  # type: ignore
 from rl_lib.train_sb3 import _find_data_file as _find_data_file_internal, _load_ohlcv as _load_ohlcv_internal  # type: ignore
 from rl_lib.signal import compute_rl_signals
 
@@ -51,6 +52,28 @@ def download(
     ]
     typer.echo(f"Running: {' '.join(cmd)}")
     subprocess.run(cmd, check=True)
+
+
+def _ensure_dataset(userdir: str, pair: str, timeframe: str, exchange: str, timerange: str = "20190101-", fmt: str = "parquet"):
+    """Ensure dataset exists; if not, download via Freqtrade non-interactively."""
+    from rl_lib.train_sb3 import _find_data_file as _find
+    hit = _find(userdir, pair, timeframe, prefer_exchange=exchange)
+    if hit and os.path.exists(hit):
+        return hit
+    Path(userdir).mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "freqtrade", "download-data",
+        "--pairs", pair,
+        "--timeframes", timeframe,
+        "--userdir", userdir,
+        "--timerange", timerange,
+        "--exchange", exchange,
+        "--data-format-ohlcv", fmt,
+    ]
+    typer.echo(f"Downloading missing dataset: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True)
+    # Try find again
+    return _find(userdir, pair, timeframe, prefer_exchange=exchange)
 
 
 @app.command()
@@ -130,6 +153,90 @@ def train(
         n_epochs=n_epochs,
     )
     out = train_ppo_from_freqtrade_data(params)
+    typer.echo(f"Model saved: {out}")
+
+
+@app.command()
+def train_multi(
+    pairs: str = typer.Option("BTC/USDT:USDT,ETH/USDT:USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    window: int = typer.Option(128),
+    timesteps: int = typer.Option(200_000),
+    model_out: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "rl_ppo.zip"), "--model-out", "--model_out"),
+    arch: str = typer.Option("transformer_hybrid"),
+    exchange: str = typer.Option("bybit"),
+    device: str = typer.Option("cuda"),
+    # Env/training knobs
+    seed: int = typer.Option(42),
+    reward_type: str = typer.Option("vol_scaled"),
+    vol_lookback: int = typer.Option(20),
+    fee_bps: float = typer.Option(6.0),
+    slippage_bps: float = typer.Option(10.0),
+    turnover_penalty_bps: float = typer.Option(2.0),
+    min_hold_bars: int = typer.Option(3),
+    cooldown_bars: int = typer.Option(1),
+    random_reset: bool = typer.Option(True),
+    episode_max_steps: int = typer.Option(4096),
+    feature_mode: str = typer.Option("basic"),
+    basic_lookback: int = typer.Option(128),
+    extra_timeframes: str = typer.Option("4H,1D", "--extra-timeframes", "--extra_timeframes"),
+    # Auto-download knobs
+    autofetch: bool = typer.Option(True, help="Auto-download missing datasets"),
+    timerange: str = typer.Option("20190101-", help="Timerange for auto-download"),
+    also_timeframes: str = typer.Option("1h,4h,1d,1w", help="Also ensure these TFs exist"),
+):
+    """Train PPO on multiple symbols with vectorized envs. Auto-downloads datasets if missing."""
+    pair_list = _parse_list(pairs, str)
+    etf_list = _parse_list(extra_timeframes, str) if extra_timeframes else []
+    also_tfs = _parse_list(also_timeframes, str)
+
+    if autofetch:
+        # Ensure base timeframe and additional timeframes for each pair
+        tfs = sorted(set([timeframe] + also_tfs))
+        for pr in pair_list:
+            for tf in tfs:
+                try:
+                    _ = _ensure_dataset(userdir, pr, tf, exchange=exchange, timerange=timerange)
+                except Exception as e:
+                    typer.echo(f"Auto-download failed for {pr} {tf}: {e}")
+
+    params = TrainParams(
+        userdir=userdir,
+        pair=pair_list[0],  # used for metadata paths
+        timeframe=timeframe,
+        window=window,
+        total_timesteps=timesteps,
+        model_out_path=model_out,
+        arch=arch,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        idle_penalty_bps=0.0,
+        prefer_exchange=exchange,
+        device=device,
+        seed=seed,
+        reward_type=reward_type,
+        vol_lookback=vol_lookback,
+        turnover_penalty_bps=turnover_penalty_bps,
+        dd_penalty=0.05 if reward_type == "sharpe_proxy" else 0.0,
+        min_hold_bars=min_hold_bars,
+        cooldown_bars=cooldown_bars,
+        random_reset=random_reset,
+        episode_max_steps=episode_max_steps,
+        feature_mode=feature_mode,
+        basic_lookback=basic_lookback,
+        extra_timeframes=etf_list or None,
+        eval_freq=50000,
+        n_eval_episodes=1,
+        eval_max_steps=2000,
+        eval_log_path=str(Path(model_out).with_suffix("") ) + "_eval.csv",
+        ent_coef=0.02,
+        learning_rate=3e-4,
+        n_steps=2048,
+        batch_size=256,
+        n_epochs=10,
+    )
+    out = train_ppo_multi_from_freqtrade_data(params, pair_list)
     typer.echo(f"Model saved: {out}")
 
 

@@ -84,6 +84,27 @@ MultiTF:
 python rl_trader.py train --pair BTC/USDT:USDT --timeframe 1h --window 128 --timesteps 500000 --arch transformer_hybrid --reward-type vol_scaled --eval-freq 50000 --eval-max-steps 5000 --device cuda --extra-timeframes "4H,1D" --model-out ./models/newrl_ppo.zip 
 ```
 
+### 2b) Multi-ticker training (auto-download)
+
+Train across multiple symbols with vectorized envs. Automatically ensures datasets exist for 1h,4h,1d,1w (downloads missing ones via Freqtrade).
+
+```bash
+python rl_trader.py train_multi \
+  --pairs "BTC/USDT:USDT,ETH/USDT:USDT" \
+  --timeframe 1h \
+  --userdir /workspace/rlkit/freqtrade_userdir \
+  --model-out ./models/multi_ppo.zip \
+  --exchange bybit \
+  --also-timeframes "1h,4h,1d,1w" \
+  --timerange 20190101- \
+  --feature-mode basic --extra-timeframes "4H,1D" \
+  --arch transformer_hybrid --device cuda --timesteps 800000
+```
+
+Notes:
+- Auto-download can be disabled with `--no-autofetch`.
+- Use `--pairs` to add more symbols (comma-separated). Ensure the exchange supports them.
+
 ### 3) Validate
 ```bash
 python rl_trader.py validate --pair "BTC/USDT:USDT" --timeframe 1h \

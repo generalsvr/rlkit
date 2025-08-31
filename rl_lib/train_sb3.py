@@ -724,3 +724,280 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
     return params.model_out_path
 
 
+
+def train_ppo_multi_from_freqtrade_data(params: TrainParams, pairs: List[str]) -> str:
+    """Train PPO on multiple symbols simultaneously using a vectorized environment.
+
+    All datasets must share the same feature layout. We construct one env per symbol
+    (train split for each), and a single eval env on the first symbol's eval split.
+    """
+    import pandas as _pd  # local import to avoid polluting module namespace
+
+    # Load datasets and compute features for each
+    raw_dfs: List[_pd.DataFrame] = []
+    feat_train: List[_pd.DataFrame] = []
+    feat_eval: List[_pd.DataFrame] = []
+
+    for pr in pairs:
+        data_path = _find_data_file(params.userdir, pr, params.timeframe, prefer_exchange=params.prefer_exchange)
+        if not data_path:
+            raise FileNotFoundError(
+                f"No parquet found for {pr} {params.timeframe} under {params.userdir}/data. Run data download first."
+            )
+        raw = _load_ohlcv(data_path)
+        feats = make_features(
+            raw,
+            mode=params.feature_mode,
+            basic_lookback=params.basic_lookback,
+            extra_timeframes=params.extra_timeframes,
+        )
+        raw_dfs.append(raw)
+        # Split
+        n = len(feats)
+        cut = int(n * 0.8)
+        feat_train.append(feats.iloc[:cut].copy())
+        feat_eval.append(feats.iloc[cut - max(params.window, 1):].copy())
+
+    # Sanity: ensure consistent columns across all datasets
+    base_cols = list(feat_train[0].columns)
+    for df in feat_train[1:]:
+        if list(df.columns) != base_cols:
+            missing = [c for c in base_cols if c not in df.columns]
+            extra = [c for c in df.columns if c not in base_cols]
+            raise ValueError(f"Feature column mismatch across datasets. Missing={missing} extra={extra}")
+
+    tcfg = TradingConfig(
+        window=params.window,
+        fee_bps=params.fee_bps,
+        slippage_bps=params.slippage_bps,
+        reward_scale=params.reward_scale,
+        pnl_on_close=params.pnl_on_close,
+        idle_penalty_bps=params.idle_penalty_bps,
+        reward_type=params.reward_type,
+        vol_lookback=params.vol_lookback,
+        turnover_penalty_bps=params.turnover_penalty_bps,
+        dd_penalty=params.dd_penalty,
+        min_hold_bars=params.min_hold_bars,
+        cooldown_bars=params.cooldown_bars,
+        random_reset=params.random_reset,
+        episode_max_steps=params.episode_max_steps,
+    )
+
+    def make_train_env(df: _pd.DataFrame):
+        return lambda: FTTradingEnv(df, tcfg)
+
+    def make_eval_env(df: _pd.DataFrame):
+        env = FTTradingEnv(df, tcfg)
+        return Monitor(env)
+
+    # Vectorized training env across symbols
+    train_env = DummyVecEnv([make_train_env(df) for df in feat_train])
+    train_env = VecNormalize(train_env, norm_obs=True, norm_reward=False, clip_obs=10.0)
+
+    # Single-symbol eval env (first symbol)
+    eval_env = DummyVecEnv([lambda: make_eval_env(feat_eval[0])])
+    eval_env = VecNormalize(eval_env, training=False, norm_obs=True, norm_reward=False, clip_obs=10.0)
+
+    # Feature groups for multiscale extractor (based on first dataset)
+    group_to_indices: Dict[str, List[int]] = {"base": []}
+    if params.extra_timeframes:
+        for tf in params.extra_timeframes:
+            group_to_indices[tf] = []
+    for i, col in enumerate(base_cols):
+        matched = False
+        if params.extra_timeframes:
+            for tf in params.extra_timeframes:
+                prefix = f"{str(tf).upper()}_"
+                if col.startswith(prefix):
+                    group_to_indices[tf].append(i)
+                    matched = True
+                    break
+        if not matched:
+            group_to_indices["base"].append(i)
+    pos_index = len(base_cols)
+    group_to_indices["base"].append(pos_index)
+
+    strides: Dict[str, int] = {"base": 1}
+    if params.extra_timeframes:
+        for tf in params.extra_timeframes:
+            strides[tf] = _tf_stride(tf)
+
+    arch = params.arch.lower()
+    if arch == "lstm":
+        model = RecurrentPPO(
+            policy="MlpLstmPolicy",
+            env=train_env,
+            verbose=1,
+            seed=params.seed,
+            device=params.device,
+            n_steps=max(128, params.n_steps // 2),
+            batch_size=params.batch_size,
+            learning_rate=params.learning_rate,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            n_epochs=params.n_epochs,
+            ent_coef=params.ent_coef,
+            policy_kwargs=dict(lstm_hidden_size=128, net_arch=[128]),
+        )
+    elif arch == "transformer":
+        model = PPO(
+            policy="MlpPolicy",
+            env=train_env,
+            verbose=1,
+            seed=params.seed,
+            device=params.device,
+            n_steps=params.n_steps,
+            batch_size=params.batch_size,
+            learning_rate=params.learning_rate,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            n_epochs=params.n_epochs,
+            ent_coef=params.ent_coef,
+            policy_kwargs=dict(
+                net_arch=[],
+                features_extractor_class=TransformerExtractor,
+                features_extractor_kwargs=dict(window=params.window, d_model=96, nhead=4, num_layers=2, ff_dim=192),
+            ),
+        )
+    elif arch == "transformer_hybrid":
+        model = PPO(
+            policy="MlpPolicy",
+            env=train_env,
+            verbose=1,
+            seed=params.seed,
+            device=params.device,
+            n_steps=params.n_steps,
+            batch_size=params.batch_size,
+            learning_rate=params.learning_rate,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            n_epochs=params.n_epochs,
+            ent_coef=params.ent_coef,
+            policy_kwargs=dict(
+                net_arch=[],
+                features_extractor_class=HybridLSTMTransformerExtractor,
+                features_extractor_kwargs=dict(
+                    window=params.window,
+                    d_model=128,
+                    nhead=4,
+                    num_layers=2,
+                    ff_dim=256,
+                    dropout=0.1,
+                    lstm_hidden=128,
+                    bidirectional=True,
+                ),
+            ),
+        )
+    elif arch == "transformer_big":
+        model = PPO(
+            policy="MlpPolicy",
+            env=train_env,
+            verbose=1,
+            seed=params.seed,
+            device=params.device,
+            n_steps=params.n_steps,
+            batch_size=params.batch_size,
+            learning_rate=params.learning_rate,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            n_epochs=max(1, min(params.n_epochs, 20)),
+            ent_coef=max(0.0, params.ent_coef),
+            policy_kwargs=dict(
+                net_arch=[],
+                features_extractor_class=TransformerExtractor,
+                features_extractor_kwargs=dict(window=params.window, d_model=192, nhead=8, num_layers=4, ff_dim=768),
+            ),
+        )
+    elif arch == "multiscale":
+        model = PPO(
+            policy="MlpPolicy",
+            env=train_env,
+            verbose=1,
+            seed=params.seed,
+            device=params.device,
+            n_steps=params.n_steps,
+            batch_size=params.batch_size,
+            learning_rate=params.learning_rate,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            n_epochs=params.n_epochs,
+            ent_coef=params.ent_coef,
+            policy_kwargs=dict(
+                net_arch=[],
+                features_extractor_class=MultiScaleHTFExtractor,
+                features_extractor_kwargs=dict(
+                    window=params.window,
+                    groups=group_to_indices,
+                    strides=strides,
+                    d_model=128,
+                    ff_dim=256,
+                    nhead=4,
+                    num_layers=1,
+                    dropout=0.1,
+                ),
+            ),
+        )
+    else:
+        model = PPO(
+            policy="MlpPolicy",
+            env=train_env,
+            verbose=1,
+            seed=params.seed,
+            device=params.device,
+            n_steps=params.n_steps,
+            batch_size=params.batch_size,
+            learning_rate=params.learning_rate,
+            gamma=0.99,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            n_epochs=params.n_epochs,
+            ent_coef=params.ent_coef,
+            policy_kwargs=dict(net_arch=[128, 128]),
+        )
+
+    callbacks = []
+    if params.eval_freq and params.eval_freq > 0:
+        callbacks.append(EvalCallback(
+            eval_env,
+            best_model_save_path=os.path.dirname(params.model_out_path),
+            log_path=os.path.dirname(params.model_out_path),
+            eval_freq=params.eval_freq,
+            n_eval_episodes=int(params.n_eval_episodes),
+            deterministic=True,
+            render=False,
+        ))
+        callbacks.append(PnLEvalCallback(eval_env, eval_freq=params.eval_freq, max_steps=params.eval_max_steps, deterministic=True, verbose=1, eval_log_path=params.eval_log_path))
+
+    # Sync eval normalization stats with training env
+    if isinstance(train_env, VecNormalize) and isinstance(eval_env, VecNormalize):
+        eval_env.obs_rms = train_env.obs_rms
+
+    cb = CallbackList(callbacks) if callbacks else None
+    model.learn(total_timesteps=int(params.total_timesteps), callback=cb, progress_bar=True)
+    model.save(params.model_out_path)
+
+    # Persist training feature set for consistent inference
+    try:
+        import json as _json
+        feat_path = os.path.join(os.path.dirname(params.model_out_path), "feature_columns.json")
+        with open(feat_path, "w") as f:
+            _json.dump(base_cols, f)
+    except Exception:
+        pass
+    # Save normalization statistics alongside the model
+    if isinstance(train_env, VecNormalize):
+        stats_path = os.path.join(os.path.dirname(params.model_out_path), "vecnormalize.pkl")
+        train_env.save(stats_path)
+
+    # Quick validation rollout on first symbol
+    try:
+        _ = _run_validation_rollout(model, eval_env, max_steps=1000, deterministic=True)
+    except Exception:
+        pass
+    return params.model_out_path
+
