@@ -166,14 +166,11 @@ def make_features(
         alpha_gate = np.clip((tail_alpha - 1.5) / (3.5 - 1.5), 0.0, 1.0)
         risk_gate = np.clip(alpha_gate * vol_gate, 0.1, 1.0)
 
-        # EMA ratios and MACD histogram normalized by close
+        # EMA ratios (keep), remove MACD
         ema_fast = pd.Series(c).ewm(span=12, adjust=False).mean().to_numpy()
         ema_slow = pd.Series(c).ewm(span=26, adjust=False).mean().to_numpy()
         ema_fast_ratio = (ema_fast - c) / (c + 1e-12)
         ema_slow_ratio = (ema_slow - c) / (c + 1e-12)
-        macd = ema_fast - ema_slow
-        macd_signal = pd.Series(macd).ewm(span=9, adjust=False).mean().to_numpy()
-        macd_hist_norm = (macd - macd_signal) / (c + 1e-12)
 
         feats = pd.DataFrame({
             "open": base["open"].values,
@@ -194,8 +191,35 @@ def make_features(
             "risk_gate": risk_gate,
             "ema_fast_ratio": ema_fast_ratio,
             "ema_slow_ratio": ema_slow_ratio,
-            "macd_hist_norm": macd_hist_norm,
         }, index=base.index)
+
+        # Multi-timeframe moving averages inspired by Pine script (daily/weekly)
+        # Compute on resampled closes and forward-fill to align with base index
+        if isinstance(base.index, pd.DatetimeIndex):
+            close_series = base["close"].astype(float)
+            try:
+                daily_close = close_series.resample("1D").last()
+                weekly_close = close_series.resample("1W").last()
+                ma365d = daily_close.rolling(365, min_periods=1).mean().reindex(base.index).ffill().to_numpy()
+                ma200d = daily_close.rolling(200, min_periods=1).mean().reindex(base.index).ffill().to_numpy()
+                ma50d = daily_close.rolling(50, min_periods=1).mean().reindex(base.index).ffill().to_numpy()
+                ma20w = weekly_close.rolling(20, min_periods=1).mean().reindex(base.index).ffill().to_numpy()
+            except Exception:
+                # Fallback to zeros if resampling fails
+                ma365d = np.zeros(len(base), dtype=float)
+                ma200d = np.zeros(len(base), dtype=float)
+                ma50d = np.zeros(len(base), dtype=float)
+                ma20w = np.zeros(len(base), dtype=float)
+        else:
+            ma365d = np.zeros(len(base), dtype=float)
+            ma200d = np.zeros(len(base), dtype=float)
+            ma50d = np.zeros(len(base), dtype=float)
+            ma20w = np.zeros(len(base), dtype=float)
+
+        feats["MA365D"] = ma365d
+        feats["MA200D"] = ma200d
+        feats["MA50D"] = ma50d
+        feats["MA20W"] = ma20w
 
     # Add higher timeframe features (resampled and forward-filled) if requested
     if extra_timeframes:
@@ -250,9 +274,6 @@ def make_features(
                         ema_slow_tf = pd.Series(rc, index=res.index).ewm(span=26, adjust=False).mean().to_numpy()
                         ema_fast_ratio_tf = (ema_fast_tf - rc) / (rc + 1e-12)
                         ema_slow_ratio_tf = (ema_slow_tf - rc) / (rc + 1e-12)
-                        macd_tf = ema_fast_tf - ema_slow_tf
-                        macd_signal_tf = pd.Series(macd_tf, index=res.index).ewm(span=9, adjust=False).mean().to_numpy()
-                        macd_hist_norm_tf = (macd_tf - macd_signal_tf) / (rc + 1e-12)
                         feats_tf = pd.DataFrame({
                             f"{tf}_logret": logret_tf,
                             f"{tf}_hl_range": hl_range_tf,
@@ -264,7 +285,6 @@ def make_features(
                             f"{tf}_ret_std_14": ret_std_14_tf,
                             f"{tf}_ema_fast_ratio": ema_fast_ratio_tf,
                             f"{tf}_ema_slow_ratio": ema_slow_ratio_tf,
-                            f"{tf}_macd_hist_norm": macd_hist_norm_tf,
                         }, index=res.index)
                     # Align to base index causally
                     feats_tf_aligned = feats_tf.reindex(base.index).ffill().fillna(0.0)

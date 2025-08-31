@@ -81,7 +81,7 @@ python rl_trader.py train --pair "BTC/USDT:USDT" --timeframe 1h \
 ```
 MultiTF:
 ```bash
-python rl_trader.py train --pair BTC/USDT:USDT --timeframe 1h --window 128 --timesteps 500000 --arch transformer_hybrid --reward-type vol_scaled --eval-freq 50000 --eval-max-steps 5000 --device cuda --extra-timeframes "4H,1D" --model-out ./models/newrl_ppo.zip 
+python rl_trader.py train-multi   --pairs "BTC/USDT:USDT,ETH/USDT:USDT,SOL/USDT:USDT,BNB/USDT:USDT"   --timeframe 1h   --userdir freqtrade_userdir   --window 128   --timesteps 3000000   --model-out ./models/x.zip   --arch transformer_hybrid   --exchange bybit   --device cuda   --seed 42   --reward-type sharpe_proxy   --vol-lookback 20   --fee-bps 6   --slippage-bps 10   --turnover-penalty-bps 2   --min-hold-bars 3   --cooldown-bars 1   --random-reset   --episode-max-steps 4096   --feature-mode basic   --basic-lookback 128   --extra-timeframes "4H,1D"   --eval-freq 49152  --n-eval-episodes 1   --eval-max-steps 2000 --early-stop-metric sharpe --early-stop-patience 3 --early-stop-min-delta 0.001  --early-stop-degrade-ratio 0.2
 ```
 
 ### 2b) Multi-ticker training (auto-download)
@@ -114,16 +114,8 @@ python rl_trader.py validate --pair "BTC/USDT:USDT" --timeframe 1h \
 
 ### 4) Backtest with RLStrategy
 ```bash
-export RL_MODEL_PATH=/workspace/rlkit/models/rl_ppo.zip
-export RL_WINDOW=128
-freqtrade backtesting \
-  --userdir /workspace/rlkit/freqtrade_userdir \
-  --config /workspace/rlkit/freqtrade_userdir/config.json \
-  --strategy RLStrategy \
-  --timeframe 1h \
-  --pairs "BTC/USDT:USDT" \
-  --timerange 20240101-20250101 \
-  --data-format-ohlcv parquet | cat
+python rl_trader.py backtest --pair "BTC/USDT:USDT" --timeframe 1h   --window 128 --model-path /workspace/rlkit/model
+s/x.zip  --device cuda --timerange 20250101-
 ```
 
 ### Notes
