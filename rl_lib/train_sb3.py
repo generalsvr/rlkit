@@ -84,6 +84,31 @@ def _load_ohlcv(path: str) -> pd.DataFrame:
     return df
 
 
+def _slice_timerange_df(df: pd.DataFrame, timerange: Optional[str]) -> pd.DataFrame:
+    """Slice dataframe to timerange 'YYYYMMDD-YYYYMMDD' (either side optional)."""
+    if not timerange:
+        return df
+    try:
+        start_str, end_str = timerange.split('-', 1)
+        start = pd.to_datetime(start_str) if start_str else None
+        end = pd.to_datetime(end_str) if end_str else None
+        if isinstance(df.index, pd.DatetimeIndex):
+            idx = df.index
+            try:
+                idx_cmp = idx.tz_convert(None) if idx.tz is not None else idx
+            except Exception:
+                idx_cmp = idx.tz_localize(None) if getattr(idx, 'tz', None) is not None else idx
+            mask = pd.Series(True, index=idx)
+            if start is not None:
+                mask &= idx_cmp >= pd.to_datetime(start)
+            if end is not None:
+                mask &= idx_cmp <= pd.to_datetime(end)
+            return df.loc[mask]
+    except Exception:
+        return df
+    return df
+
+
 def _compute_risk_metrics(equities: np.ndarray) -> Dict[str, float]:
     if equities.size < 2:
         return {"sharpe": float("nan"), "sortino": float("nan"), "max_drawdown": float("nan"), "calmar": float("nan")}
@@ -502,6 +527,9 @@ class TrainParams:
     n_eval_episodes: int = 3
     eval_max_steps: int = 2000
     eval_log_path: Optional[str] = None
+    # Dataset slicing/alignment
+    timerange: Optional[str] = None  # e.g. "20190101-20240101"
+    align_mode: str = "union"  # union | intersection (multi-train only)
     # PPO hyperparams
     ent_coef: float = 0.02
     learning_rate: float = 3e-4
@@ -521,6 +549,8 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
             f"Run data download first."
         )
     raw = _load_ohlcv(data_path)
+    # Optional slicing by timerange
+    raw = _slice_timerange_df(raw, params.timerange)
     feats = make_features(raw, mode=params.feature_mode, basic_lookback=params.basic_lookback, extra_timeframes=params.extra_timeframes)
 
     # Simple split: 80/20 by time
@@ -783,6 +813,8 @@ def train_ppo_multi_from_freqtrade_data(params: TrainParams, pairs: List[str]) -
                 f"No parquet found for {pr} {params.timeframe} under {params.userdir}/data. Run data download first."
             )
         raw = _load_ohlcv(data_path)
+        # Per-pair slicing by provided timerange
+        raw = _slice_timerange_df(raw, params.timerange)
         feats = make_features(
             raw,
             mode=params.feature_mode,
@@ -795,6 +827,46 @@ def train_ppo_multi_from_freqtrade_data(params: TrainParams, pairs: List[str]) -
         cut = int(n * 0.8)
         feat_train.append(feats.iloc[:cut].copy())
         feat_eval.append(feats.iloc[cut - max(params.window, 1):].copy())
+
+    # If align_mode == intersection, slice all to common overlap window
+    if params.align_mode.lower() == "intersection" and len(raw_dfs) >= 2:
+        # Compute overlap across datetime indices
+        starts: List[pd.Timestamp] = []
+        ends: List[pd.Timestamp] = []
+        for raw in raw_dfs:
+            if isinstance(raw.index, pd.DatetimeIndex) and not raw.empty:
+                idx = raw.index
+                try:
+                    idx_cmp = idx.tz_convert(None) if idx.tz is not None else idx
+                except Exception:
+                    idx_cmp = idx.tz_localize(None) if getattr(idx, 'tz', None) is not None else idx
+                starts.append(pd.to_datetime(idx_cmp[0]))
+                ends.append(pd.to_datetime(idx_cmp[-1]))
+        if starts and ends:
+            start_i = max(starts)
+            end_i = min(ends)
+            if start_i < end_i:
+                # Recompute features with intersection slicing
+                raw_dfs_i: List[_pd.DataFrame] = []
+                feat_train = []
+                feat_eval = []
+                for raw in raw_dfs:
+                    if isinstance(raw.index, pd.DatetimeIndex):
+                        sliced = raw.loc[(raw.index >= start_i) & (raw.index <= end_i)]
+                    else:
+                        sliced = raw
+                    feats = make_features(
+                        sliced,
+                        mode=params.feature_mode,
+                        basic_lookback=params.basic_lookback,
+                        extra_timeframes=params.extra_timeframes,
+                    )
+                    raw_dfs_i.append(sliced)
+                    n = len(feats)
+                    cut = int(n * 0.8)
+                    feat_train.append(feats.iloc[:cut].copy())
+                    feat_eval.append(feats.iloc[cut - max(params.window, 1):].copy())
+                raw_dfs = raw_dfs_i
 
     # Sanity: ensure consistent columns across all datasets
     base_cols = list(feat_train[0].columns)

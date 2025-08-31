@@ -93,6 +93,8 @@ def train(
     # Auto-download
     autofetch: bool = typer.Option(True, help="Auto-download missing datasets (1h,4h,1d,1w)"),
     timerange: str = typer.Option("20190101-", help="Timerange for auto-download"),
+    # Training data slicing
+    train_timerange: str = typer.Option("", help="Optional timerange YYYYMMDD-YYYYMMDD to slice training dataset"),
     # New options
     seed: int = typer.Option(42, help="Random seed"),
     reward_type: str = typer.Option("raw", help="raw|vol_scaled|sharpe_proxy"),
@@ -162,6 +164,7 @@ def train(
         n_steps=n_steps,
         batch_size=batch_size,
         n_epochs=n_epochs,
+        timerange=(train_timerange or None),
     )
     out = train_ppo_from_freqtrade_data(params)
     typer.echo(f"Model saved: {out}")
@@ -199,6 +202,9 @@ def train_multi(
     # Auto-download knobs
     autofetch: bool = typer.Option(True, help="Auto-download missing datasets (1h,4h,1d,1w)"),
     timerange: str = typer.Option("20190101-", help="Timerange for auto-download"),
+    # Training data slicing
+    train_timerange: str = typer.Option("", help="Optional timerange YYYYMMDD-YYYYMMDD to slice training datasets"),
+    align_mode: str = typer.Option("union", help="multi-train alignment: union|intersection"),
 ):
     """Train PPO on multiple symbols with vectorized envs. Auto-downloads datasets if missing."""
     pair_list = _parse_list(pairs, str)
@@ -248,6 +254,8 @@ def train_multi(
         n_steps=2048,
         batch_size=256,
         n_epochs=10,
+        timerange=(train_timerange or None),
+        align_mode=str(align_mode).lower(),
     )
     out = train_ppo_multi_from_freqtrade_data(params, pair_list)
     typer.echo(f"Model saved: {out}")
