@@ -90,6 +90,9 @@ def train(
     idle_penalty_bps: float = typer.Option(0.02, help="Idle penalty in bps when flat (applied in env)"),
     exchange: str = typer.Option("bybit", help="Prefer this exchange's dataset when multiple exist"),
     device: str = typer.Option("cuda", help="Device for training: cuda|cpu"),
+    # Auto-download
+    autofetch: bool = typer.Option(True, help="Auto-download missing datasets (1h,4h,1d,1w)"),
+    timerange: str = typer.Option("20190101-", help="Timerange for auto-download"),
     # New options
     seed: int = typer.Option(42, help="Random seed"),
     reward_type: str = typer.Option("raw", help="raw|vol_scaled|sharpe_proxy"),
@@ -117,6 +120,14 @@ def train(
 ):
     """Train PPO on downloaded data using Stable-Baselines3."""
     etf_list = _parse_list(extra_timeframes, str) if extra_timeframes else []
+    if autofetch:
+        # Ensure base timeframe and common HTFs
+        tfs = sorted(set([timeframe, "1h", "4h", "1d", "1w"]))
+        for tf in tfs:
+            try:
+                _ = _ensure_dataset(userdir, pair, tf, exchange=exchange, timerange=timerange)
+            except Exception as e:
+                typer.echo(f"Auto-download failed for {pair} {tf}: {e}")
     params = TrainParams(
         userdir=userdir,
         pair=pair,
@@ -182,18 +193,16 @@ def train_multi(
     basic_lookback: int = typer.Option(128),
     extra_timeframes: str = typer.Option("4H,1D", "--extra-timeframes", "--extra_timeframes"),
     # Auto-download knobs
-    autofetch: bool = typer.Option(True, help="Auto-download missing datasets"),
+    autofetch: bool = typer.Option(True, help="Auto-download missing datasets (1h,4h,1d,1w)"),
     timerange: str = typer.Option("20190101-", help="Timerange for auto-download"),
-    also_timeframes: str = typer.Option("1h,4h,1d,1w", help="Also ensure these TFs exist"),
 ):
     """Train PPO on multiple symbols with vectorized envs. Auto-downloads datasets if missing."""
     pair_list = _parse_list(pairs, str)
     etf_list = _parse_list(extra_timeframes, str) if extra_timeframes else []
-    also_tfs = _parse_list(also_timeframes, str)
 
     if autofetch:
-        # Ensure base timeframe and additional timeframes for each pair
-        tfs = sorted(set([timeframe] + also_tfs))
+        # Ensure base timeframe and common HTFs for each pair
+        tfs = sorted(set([timeframe, "1h", "4h", "1d", "1w"]))
         for pr in pair_list:
             for tf in tfs:
                 try:

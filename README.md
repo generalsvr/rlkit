@@ -95,14 +95,13 @@ python rl_trader.py train_multi \
   --userdir /workspace/rlkit/freqtrade_userdir \
   --model-out ./models/multi_ppo.zip \
   --exchange bybit \
-  --also-timeframes "1h,4h,1d,1w" \
   --timerange 20190101- \
   --feature-mode basic --extra-timeframes "4H,1D" \
   --arch transformer_hybrid --device cuda --timesteps 800000
 ```
 
 Notes:
-- Auto-download can be disabled with `--no-autofetch`.
+- Auto-download grabs missing datasets for 1h,4h,1d,1w by default. Disable with `--no-autofetch`.
 - Use `--pairs` to add more symbols (comma-separated). Ensure the exchange supports them.
 
 ### 3) Validate
