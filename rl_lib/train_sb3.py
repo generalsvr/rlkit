@@ -14,11 +14,16 @@ from stable_baselines3.common.callbacks import EvalCallback, BaseCallback, Callb
 from stable_baselines3.common.monitor import Monitor
 from datetime import datetime
 import csv
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 from .features import make_features
 from .transformer_extractor import TransformerExtractor, HybridLSTMTransformerExtractor
 from .transformer_extractor import MultiScaleHTFExtractor  # type: ignore
 from .env import FTTradingEnv, TradingConfig
+from .signal import compute_rl_signals
 
 
 def _tf_stride(tf: str) -> int:
@@ -327,6 +332,96 @@ def validate_trained_model(params: TrainParams, max_steps: int = 2000, determini
     import os as _os
     model = PPO.load(params.model_out_path, device=_os.environ.get("RL_DEVICE", "cuda"))
     report = _run_validation_rollout(model, eval_env, max_steps=max_steps, deterministic=deterministic)
+
+    # -----------------------------
+    # Plot signals with numbering
+    # -----------------------------
+    try:
+        # Ensure gating matches env for signal generation
+        os.environ["RL_MIN_HOLD_BARS"] = str(int(params.min_hold_bars))
+        os.environ["RL_COOLDOWN_BARS"] = str(int(params.cooldown_bars))
+        os.environ["RL_DETERMINISTIC"] = "true" if bool(deterministic) else "false"
+
+        signals_df = compute_rl_signals(eval_df, params.model_out_path, window=int(params.window))
+        # Prepare output directory and filename prefix
+        outdir = os.path.join(os.path.dirname(params.model_out_path), "validate_plots")
+        os.makedirs(outdir, exist_ok=True)
+        ts_tag = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        base_name = f"{params.pair.replace('/', '_')}_{params.timeframe}_{ts_tag}".replace(":", "-")
+        prefix = os.path.join(outdir, base_name)
+
+        def _plot_signals(df: pd.DataFrame, title: str, save_path: str):
+            # X axis
+            x = df.index
+            # Use close price for plotting
+            y = df["close"].astype(float).values if "close" in df.columns else df.iloc[:, 0].astype(float).values
+
+            fig, ax = plt.subplots(figsize=(14, 7))
+            ax.plot(x, y, color="#2c3e50", linewidth=1.0, label="Close")
+
+            # Collect events
+            events = []
+            if "enter_long" in df.columns:
+                for idx in list(np.flatnonzero(df["enter_long"].values == 1)):
+                    events.append((idx, "LONG"))
+            if "enter_short" in df.columns:
+                for idx in list(np.flatnonzero(df["enter_short"].values == 1)):
+                    events.append((idx, "SHORT"))
+            # SELL is any exit (long or short)
+            if "exit_long" in df.columns:
+                for idx in list(np.flatnonzero(df["exit_long"].values == 1)):
+                    events.append((idx, "SELL"))
+            if "exit_short" in df.columns:
+                for idx in list(np.flatnonzero(df["exit_short"].values == 1)):
+                    events.append((idx, "SELL"))
+
+            # Stable chronological order
+            events.sort(key=lambda t: t[0])
+
+            # Separate counters
+            counters: Dict[str, int] = {"LONG": 0, "SHORT": 0, "SELL": 0}
+            # Colors and markers
+            color_map = {"LONG": "#2ecc71", "SHORT": "#e74c3c", "SELL": "#f1c40f"}
+            marker_map = {"LONG": "^", "SHORT": "v", "SELL": "x"}
+
+            # Plot markers and annotations
+            for idx, kind in events:
+                if idx < 0 or idx >= len(y):
+                    continue
+                counters[kind] += 1
+                label = f"{kind}{counters[kind]}"
+                xi = x[idx]
+                yi = y[idx]
+                ax.scatter([xi], [yi], marker=marker_map[kind], color=color_map[kind], s=40, zorder=3)
+                ax.annotate(label, (xi, yi), textcoords="offset points", xytext=(0, 8), ha="center",
+                            fontsize=8, color=color_map[kind], fontweight="bold")
+
+            ax.set_title(title)
+            ax.set_xlabel("Time")
+            ax.set_ylabel("Price")
+            ax.grid(True, alpha=0.25)
+            if isinstance(x, pd.DatetimeIndex):
+                locator = mdates.AutoDateLocator()
+                formatter = mdates.ConciseDateFormatter(locator)
+                ax.xaxis.set_major_locator(locator)
+                ax.xaxis.set_major_formatter(formatter)
+            ax.legend(loc="upper left")
+            fig.tight_layout()
+            fig.savefig(save_path, dpi=150)
+            plt.close(fig)
+
+        # Full overview
+        _plot_signals(signals_df, title=f"Validation Signals {params.pair} {params.timeframe}", save_path=f"{prefix}_overview.png")
+        # Zoomed window (tail)
+        zoom_bars = 400
+        if len(signals_df) > (zoom_bars + int(params.window)):
+            zoom_df = signals_df.iloc[-zoom_bars:].copy()
+            _plot_signals(zoom_df, title=f"Validation Signals (Zoom) {params.pair} {params.timeframe}", save_path=f"{prefix}_zoom.png")
+
+        print(f"Saved validation signal plots to: {outdir}")
+    except Exception as _e:
+        # Do not fail validation if plotting has issues
+        print(f"Plotting failed: {_e}")
     # Pretty print
     print("VALIDATION SUMMARY:")
     print(report)
