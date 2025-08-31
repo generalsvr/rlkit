@@ -17,6 +17,9 @@ import typer
 from itertools import product
 from datetime import datetime
 import csv
+import glob
+import zipfile
+from typing import Optional, Dict, Any
 
 from rl_lib.train_sb3 import TrainParams, train_ppo_from_freqtrade_data, validate_trained_model
 from rl_lib.train_sb3 import train_ppo_multi_from_freqtrade_data  # type: ignore
@@ -74,6 +77,149 @@ def _ensure_dataset(userdir: str, pair: str, timeframe: str, exchange: str, time
     subprocess.run(cmd, check=True)
     # Try find again
     return _find(userdir, pair, timeframe, prefer_exchange=exchange)
+
+
+def _ensure_backtest_config(userdir: str, timeframe: str, exchange: str, pair: str) -> Path:
+    """Ensure minimal freqtrade config.json exists for backtesting and return its path."""
+    config_path = Path(userdir) / "config.json"
+    if not config_path.exists():
+        cfg = {
+            "timeframe": timeframe,
+            "user_data_dir": str(userdir),
+            "strategy": "RLStrategy",
+            "exchange": {
+                "name": exchange,
+                "key": "",
+                "secret": "",
+                "pair_whitelist": [pair]
+            },
+            "stake_currency": "USDT",
+            "stake_amount": "unlimited",
+            "dry_run": True,
+            "max_open_trades": 1,
+            "trading_mode": "futures",
+            "margin_mode": "isolated",
+            "dataformat_ohlcv": "parquet"
+        }
+        os.makedirs(userdir, exist_ok=True)
+        with open(config_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+    return config_path
+
+
+def _find_latest_backtest_artifacts(backtest_dir: Path) -> Dict[str, Optional[str]]:
+    """Return paths to the latest backtest zip and meta.json if present."""
+    zips = sorted(glob.glob(str(backtest_dir / "backtest-result-*.zip")))
+    metas = sorted(glob.glob(str(backtest_dir / "backtest-result-*.meta.json")))
+    return {
+        "zip": zips[-1] if zips else None,
+        "meta": metas[-1] if metas else None,
+    }
+
+
+def _extract_metrics_from_backtest_zip(zip_path: str) -> Dict[str, Any]:
+    """Best-effort parse of metrics from Freqtrade backtest result zip.
+
+    Tries to locate a JSON file inside and extract common metrics if available.
+    Returns empty dict on failure.
+    """
+    out: Dict[str, Any] = {}
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zf:
+            # Prefer files that end with .json and contain 'result' or 'results'
+            json_names = [n for n in zf.namelist() if n.lower().endswith('.json')]
+            # Heuristic ordering
+            json_names.sort(key=lambda n: ("result" not in n.lower(), n))
+            for name in json_names:
+                try:
+                    with zf.open(name) as fh:
+                        data = json.load(fh)
+                        # Try common fields
+                        def _get(*keys):
+                            for k in keys:
+                                if isinstance(data, dict) and k in data and isinstance(data[k], (int, float)):
+                                    return data[k]
+                            return None
+                        # Flat keys
+                        out['bt_total_profit_abs'] = _get('profit_total_abs', 'total_profit', 'net_profit')
+                        out['bt_total_profit_pct'] = _get('profit_total_pct', 'total_profit_pct')
+                        out['bt_total_trades'] = _get('total_trades', 'trades')
+                        out['bt_win_rate'] = _get('winrate', 'win_rate')
+                        out['bt_profit_factor'] = _get('profit_factor', 'pf')
+                        # Stop at first JSON that yields any metric
+                        if any(v is not None for v in out.values()):
+                            out['bt_json_in_zip'] = name
+                            break
+                except Exception:
+                    continue
+    except Exception:
+        return {}
+    return out
+
+
+def _run_freqtrade_backtest(*, userdir: str, pair: str, timeframe: str, exchange: str, timerange: str, model_path: str, window: int, device: str, min_hold_bars: int, cooldown_bars: int) -> Dict[str, Any]:
+    """Run freqtrade backtesting for the given model and return artifact/metrics info."""
+    env = os.environ.copy()
+    env["RL_DEVICE"] = device
+    env["RL_MODEL_PATH"] = model_path
+    env["RL_WINDOW"] = str(window)
+    env["RL_MIN_HOLD_BARS"] = str(int(min_hold_bars))
+    env["RL_COOLDOWN_BARS"] = str(int(cooldown_bars))
+
+    config_path = _ensure_backtest_config(userdir, timeframe, exchange, pair)
+    backtest_dir = Path(userdir) / "backtest_results"
+    pre_existing = set(os.listdir(backtest_dir)) if backtest_dir.exists() else set()
+
+    cmd = [
+        "freqtrade", "backtesting",
+        "--userdir", userdir,
+        "--config", str(config_path),
+        "--strategy", "RLStrategy",
+        "--timeframe", timeframe,
+        "--pairs", pair,
+    ]
+    if timerange:
+        cmd.extend(["--timerange", timerange])
+    try:
+        subprocess.run(cmd, check=True, env=env)
+    except Exception as e:
+        return {"bt_error": str(e), "bt_cmd": " ".join(cmd)}
+
+    # Detect newly created artifacts
+    backtest_dir.mkdir(parents=True, exist_ok=True)
+    post_existing = set(os.listdir(backtest_dir))
+    new_files = post_existing - pre_existing
+    artifacts = _find_latest_backtest_artifacts(backtest_dir)
+
+    result: Dict[str, Any] = {
+        "bt_zip": artifacts.get("zip"),
+        "bt_meta": artifacts.get("meta"),
+        "bt_cmd": " ".join(cmd),
+    }
+    # Attach meta info if present
+    try:
+        if result.get("bt_meta") and os.path.exists(result["bt_meta"]):
+            with open(result["bt_meta"], "r") as f:
+                meta = json.load(f)
+            if isinstance(meta, dict):
+                # Expect strategy name key like 'RLStrategy'
+                for k, v in meta.items():
+                    if isinstance(v, dict):
+                        result['bt_run_id'] = v.get('run_id')
+                        result['bt_timeframe'] = v.get('timeframe')
+                        result['bt_start_ts'] = v.get('backtest_start_ts')
+                        result['bt_end_ts'] = v.get('backtest_end_ts')
+                        break
+    except Exception:
+        pass
+    # Try to parse metrics from zip
+    try:
+        if result.get("bt_zip") and os.path.exists(result["bt_zip"]):
+            result.update(_extract_metrics_from_backtest_zip(result["bt_zip"]))
+    except Exception:
+        pass
+    result['bt_new_files_count'] = len(new_files)
+    return result
 
 
 @app.command()
@@ -357,8 +503,20 @@ def sweep(
     cooldown_bars: int = typer.Option(0),
     feature_mode: str = typer.Option("basic"),
     basic_lookback: int = typer.Option(128),
-    # Eval
+    windows_list: str = typer.Option("", help="Comma-separated window sizes; if empty, uses --window"),
+    min_hold_bars_list: str = typer.Option("", help="Comma-separated min-hold bars values"),
+    cooldown_bars_list: str = typer.Option("", help="Comma-separated cooldown bars values"),
+    # Eval and early stop
     eval_max_steps: int = typer.Option(5000),
+    eval_freq: int = typer.Option(50000, help="Evaluate every N steps; enable >0 for early stopping"),
+    early_stop_metric: str = typer.Option("sharpe", help="sharpe|final_equity|max_drawdown"),
+    early_stop_patience: int = typer.Option(3),
+    early_stop_min_delta: float = typer.Option(0.0),
+    early_stop_degrade_ratio: float = typer.Option(0.0),
+    # Auto backtest
+    auto_backtest: bool = typer.Option(True, help="Run freqtrade backtest per model"),
+    backtest_timerange: str = typer.Option("", help="YYYYMMDD-YYYYMMDD for freqtrade backtests; empty uses training eval slice"),
+    backtest_exchange: str = typer.Option("bybit"),
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "sweeps")),
     max_trials: int = typer.Option(50, help="Hard cap to avoid huge grids"),
 ):
@@ -369,8 +527,10 @@ def sweep(
     results_csv = sweep_dir / "results.csv"
     with open(results_csv, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=[
-            "model_path","reward_type","ent_coef","learning_rate","n_steps","batch_size","fee_bps","slippage_bps","seed",
-            "final_equity","sharpe","max_drawdown","time_in_position_frac"
+            "model_path","window","min_hold_bars","cooldown_bars","reward_type","ent_coef","learning_rate","n_steps","batch_size","fee_bps","slippage_bps","seed",
+            "final_equity","sharpe","max_drawdown","time_in_position_frac",
+            "bt_total_profit_pct","bt_total_profit_abs","bt_total_trades","bt_win_rate","bt_profit_factor",
+            "bt_zip","bt_meta","bt_run_id"
         ])
         writer.writeheader()
 
@@ -383,21 +543,24 @@ def sweep(
     slip_vals = _parse_list(slip_list, float)
     seed_vals = _parse_list(seeds, int)
     etf_list = _parse_list(extra_timeframes, str) if extra_timeframes else []
+    win_vals = _parse_list(windows_list, int) if windows_list else [window]
+    mh_vals = _parse_list(min_hold_bars_list, int) if min_hold_bars_list else [min_hold_bars]
+    cd_vals = _parse_list(cooldown_bars_list, int) if cooldown_bars_list else [cooldown_bars]
 
-    combos = list(product(rt_list, ec_list, lr_list, ns_list, bs_list, fee_vals, slip_vals, seed_vals))
+    combos = list(product(rt_list, ec_list, lr_list, ns_list, bs_list, fee_vals, slip_vals, seed_vals, win_vals, mh_vals, cd_vals))
     if len(combos) > max_trials:
         combos = combos[:max_trials]
 
     typer.echo(f"Running {len(combos)} trials. Results -> {results_csv}")
 
-    for idx, (rt, ec, lr, ns, bs, fee, slip, sd) in enumerate(combos, start=1):
-        tag = f"{arch}_rt-{rt}_ec-{ec}_lr-{lr}_ns-{ns}_bs-{bs}_fee-{fee}_slip-{slip}_seed-{sd}"
+    for idx, (rt, ec, lr, ns, bs, fee, slip, sd, wv, mhv, cdv) in enumerate(combos, start=1):
+        tag = f"{arch}_win-{wv}_mh-{mhv}_cd-{cdv}_rt-{rt}_ec-{ec}_lr-{lr}_ns-{ns}_bs-{bs}_fee-{fee}_slip-{slip}_seed-{sd}"
         model_path = str(sweep_dir / f"{tag}.zip")
         params = TrainParams(
             userdir=userdir,
             pair=pair,
             timeframe=timeframe,
-            window=window,
+            window=wv,
             total_timesteps=timesteps,
             model_out_path=model_path,
             arch=arch,
@@ -409,14 +572,14 @@ def sweep(
             vol_lookback=20,
             turnover_penalty_bps=turnover_penalty_bps,
             dd_penalty=0.05 if rt == "sharpe_proxy" else 0.0,
-            min_hold_bars=min_hold_bars,
-            cooldown_bars=cooldown_bars,
+            min_hold_bars=mhv,
+            cooldown_bars=cdv,
             random_reset=True,
             episode_max_steps=4096,
             feature_mode=feature_mode,
             basic_lookback=basic_lookback,
             extra_timeframes=etf_list or None,
-            eval_freq=0,
+            eval_freq=eval_freq,
             n_eval_episodes=1,
             eval_max_steps=eval_max_steps,
             eval_log_path=str(sweep_dir / "eval_log.csv"),
@@ -426,13 +589,34 @@ def sweep(
             n_steps=ns,
             batch_size=bs,
             n_epochs=10,
+            early_stop_metric=(early_stop_metric or None),
+            early_stop_patience=int(early_stop_patience),
+            early_stop_min_delta=float(early_stop_min_delta),
+            early_stop_degrade_ratio=float(early_stop_degrade_ratio),
         )
         typer.echo(f"[{idx}/{len(combos)}] Training {tag}")
         try:
             _ = train_ppo_from_freqtrade_data(params)
             report = validate_trained_model(params, max_steps=eval_max_steps, deterministic=True)
+            bt_metrics: Dict[str, Any] = {}
+            if auto_backtest:
+                bt_metrics = _run_freqtrade_backtest(
+                    userdir=userdir,
+                    pair=pair,
+                    timeframe=timeframe,
+                    exchange=backtest_exchange,
+                    timerange=(backtest_timerange or (params.timerange or "")) or "",
+                    model_path=model_path,
+                    window=wv,
+                    device=device,
+                    min_hold_bars=mhv,
+                    cooldown_bars=cdv,
+                )
             row = {
                 "model_path": model_path,
+                "window": int(wv),
+                "min_hold_bars": int(mhv),
+                "cooldown_bars": int(cdv),
                 "reward_type": rt,
                 "ent_coef": ec,
                 "learning_rate": lr,
@@ -445,6 +629,14 @@ def sweep(
                 "sharpe": float(report.get("sharpe", float("nan"))),
                 "max_drawdown": float(report.get("max_drawdown", float("nan"))),
                 "time_in_position_frac": float(report.get("time_in_position_frac", float("nan"))),
+                "bt_total_profit_pct": float(bt_metrics.get("bt_total_profit_pct", float("nan"))) if auto_backtest else float("nan"),
+                "bt_total_profit_abs": float(bt_metrics.get("bt_total_profit_abs", float("nan"))) if auto_backtest else float("nan"),
+                "bt_total_trades": int(bt_metrics.get("bt_total_trades", 0)) if auto_backtest else 0,
+                "bt_win_rate": float(bt_metrics.get("bt_win_rate", float("nan"))) if auto_backtest else float("nan"),
+                "bt_profit_factor": float(bt_metrics.get("bt_profit_factor", float("nan"))) if auto_backtest else float("nan"),
+                "bt_zip": str(bt_metrics.get("bt_zip", "")) if auto_backtest else "",
+                "bt_meta": str(bt_metrics.get("bt_meta", "")) if auto_backtest else "",
+                "bt_run_id": str(bt_metrics.get("bt_run_id", "")) if auto_backtest else "",
             }
             with open(results_csv, "a", newline="") as f:
                 writer = csv.DictWriter(f, fieldnames=row.keys())
