@@ -142,6 +142,34 @@ def _extract_metrics_from_backtest_zip(zip_path: str) -> Dict[str, Any]:
     Returns empty dict on failure.
     """
     out: Dict[str, Any] = {}
+
+    def _find_first_numeric(d: Any, keys: list[str]) -> Optional[float]:
+        # Recursive search by key name across nested dict/list
+        try:
+            if isinstance(d, dict):
+                # Strategy-nested single key unwrap (e.g., {"RLStrategy": {...}})
+                if len(d) == 1:
+                    only_key = next(iter(d))
+                    inner = d[only_key]
+                    if isinstance(inner, (dict, list)):
+                        val = _find_first_numeric(inner, keys)
+                        if val is not None:
+                            return val
+                for k, v in d.items():
+                    if isinstance(k, str) and k in keys and isinstance(v, (int, float)):
+                        return float(v)
+                for v in d.values():
+                    val = _find_first_numeric(v, keys)
+                    if val is not None:
+                        return val
+            elif isinstance(d, list):
+                for it in d:
+                    val = _find_first_numeric(it, keys)
+                    if val is not None:
+                        return val
+        except Exception:
+            return None
+        return None
     try:
         with zipfile.ZipFile(zip_path, 'r') as zf:
             # Prefer files that end with .json and contain 'result' or 'results'
@@ -152,20 +180,68 @@ def _extract_metrics_from_backtest_zip(zip_path: str) -> Dict[str, Any]:
                 try:
                     with zf.open(name) as fh:
                         data = json.load(fh)
-                        # Try common fields
-                        def _get(*keys):
-                            for k in keys:
-                                if isinstance(data, dict) and k in data and isinstance(data[k], (int, float)):
-                                    return data[k]
-                            return None
-                        # Flat keys
-                        out['bt_total_profit_abs'] = _get('profit_total_abs', 'total_profit', 'net_profit')
-                        out['bt_total_profit_pct'] = _get('profit_total_pct', 'total_profit_pct')
-                        out['bt_total_trades'] = _get('total_trades', 'trades')
-                        out['bt_win_rate'] = _get('winrate', 'win_rate')
-                        out['bt_profit_factor'] = _get('profit_factor', 'pf')
+                        # Try aggregate keys (possibly nested)
+                        agg_keys = {
+                            'bt_total_profit_abs': ['profit_total_abs', 'total_profit', 'net_profit'],
+                            'bt_total_profit_pct': ['profit_total_pct', 'total_profit_pct'],
+                            'bt_total_trades': ['total_trades', 'trades'],
+                            'bt_win_rate': ['winrate', 'win_rate'],
+                            'bt_profit_factor': ['profit_factor', 'pf']
+                        }
+                        got_any = False
+                        for out_k, keys in agg_keys.items():
+                            val = _find_first_numeric(data, keys)
+                            if val is not None:
+                                out[out_k] = val
+                                got_any = True
+
+                        # If aggregates missing, compute from trades list if present
+                        if not got_any:
+                            trades_list = None
+                            # Common names inside exports
+                            for tkey in ['trades', 'closed_trades', 'results_trades', 'backtest_trades']:
+                                if isinstance(data, dict) and tkey in data and isinstance(data[tkey], list):
+                                    trades_list = data[tkey]
+                                    break
+                            if trades_list is None and isinstance(data, list):
+                                # Some exports are a raw trades array
+                                trades_list = data
+                            if isinstance(trades_list, list) and trades_list:
+                                total_trades = len(trades_list)
+                                wins = 0
+                                pl_sum = 0.0
+                                pos_sum = 0.0
+                                neg_sum = 0.0
+                                for tr in trades_list:
+                                    try:
+                                        p = None
+                                        # Prefer absolute profit if available
+                                        if isinstance(tr, dict):
+                                            if 'profit_abs' in tr and isinstance(tr['profit_abs'], (int, float)):
+                                                p = float(tr['profit_abs'])
+                                            elif 'profit' in tr and isinstance(tr['profit'], (int, float)):
+                                                p = float(tr['profit'])
+                                            elif 'profit_ratio' in tr and isinstance(tr['profit_ratio'], (int, float)):
+                                                p = float(tr['profit_ratio'])
+                                        if p is not None:
+                                            pl_sum += p
+                                            if p > 0:
+                                                wins += 1
+                                                pos_sum += p
+                                            elif p < 0:
+                                                neg_sum += p
+                                    except Exception:
+                                        continue
+                                out['bt_total_trades'] = float(total_trades)
+                                if total_trades > 0:
+                                    out['bt_win_rate'] = 100.0 * (wins / total_trades)
+                                # Use sums as proxies
+                                out['bt_total_profit_abs'] = pl_sum
+                                if pos_sum > 0 and neg_sum < 0:
+                                    out['bt_profit_factor'] = pos_sum / abs(neg_sum)
+
                         # Stop at first JSON that yields any metric
-                        if any(v is not None for v in out.values()):
+                        if any(k in out for k in ('bt_total_profit_abs','bt_total_profit_pct','bt_total_trades','bt_win_rate','bt_profit_factor')):
                             out['bt_json_in_zip'] = name
                             break
                 except Exception:
@@ -198,6 +274,8 @@ def _run_freqtrade_backtest(*, userdir: str, pair: str, timeframe: str, exchange
     ]
     if timerange:
         cmd.extend(["--timerange", timerange])
+    # Ensure trade exports are included in zip for metric parsing
+    cmd.extend(["--export", "trades"])
     try:
         subprocess.run(cmd, check=True, env=env)
     except Exception as e:
