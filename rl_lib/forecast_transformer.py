@@ -689,6 +689,8 @@ def forecast_autoregressive(
     input_mu: np.ndarray = info["input_mu"]
     input_std: np.ndarray = info["input_std"]
     window: int = int(info["window"]) if info.get("window") is not None else 128
+    target_mode: str = str(info.get("target_mode", "price")).lower()
+    target_cols: List[str] = info.get("target_columns", [])
 
     x = features_df[feat_cols].astype(float).to_numpy(copy=False)
     i0 = start_index - window
@@ -698,7 +700,30 @@ def forecast_autoregressive(
     x_ctx = x[i0:i1]
     x_ctx_n = (x_ctx - input_mu) / input_std
     x_tensor = torch.as_tensor(x_ctx_n, dtype=torch.float32, device=device).unsqueeze(0)  # (1, T, F)
-    start = torch.zeros((1, 1, len(target_mu)), device=device, dtype=torch.float32)
+    # Build start token
+    if target_mode == "price":
+        # Use last known target(s) normalized for continuity
+        try:
+            if target_cols and all(c in features_df.columns for c in target_cols):
+                last_vals = features_df[target_cols].astype(float).iloc[start_index - 1].to_numpy()
+            else:
+                # Fallback: use close
+                last_vals = np.asarray([float(features_df["close"].astype(float).iloc[start_index - 1])])
+        except Exception:
+            last_vals = np.zeros((len(target_mu),), dtype=float)
+        last_vals = last_vals.astype(float)
+        if last_vals.shape[0] != len(target_mu):
+            # Broadcast or trim to match
+            if last_vals.shape[0] < len(target_mu):
+                pad = np.zeros((len(target_mu) - last_vals.shape[0],), dtype=float)
+                last_vals = np.concatenate([last_vals, pad], axis=0)
+            else:
+                last_vals = last_vals[: len(target_mu)]
+        start_n = (last_vals - target_mu) / target_std
+    else:
+        # Logret: neutral start at 0
+        start_n = np.zeros((len(target_mu),), dtype=float)
+    start = torch.as_tensor(start_n, dtype=torch.float32, device=device).view(1, 1, -1)
     y_hat_n = model.infer_autoregressive(x_tensor, start_token=start, horizon=horizon)
     y_hat = (y_hat_n.cpu().numpy() * target_std) + target_mu
     return y_hat[0]
@@ -789,14 +814,24 @@ def evaluate_forecaster(
     # Metrics
     if target_mode == "price":
         metrics_all = _metrics_denorm(y_true_all_arr, y_pred_all_arr)
-        # Direction accuracy on next-step close
+        # Direction accuracy and correlation on next-step deltas
         last_close_series = feats["close"].astype(float).to_numpy()
         last_known = np.asarray([last_close_series[i - 1] for i in range(start, end)])
-        true_ret = np.sign(y_true_1_arr - last_known)
-        pred_ret = np.sign(y_pred_1_arr - last_known)
+        nxt_true_delta = y_true_1_arr - last_known
+        nxt_pred_delta = y_pred_1_arr - last_known
+        true_ret = np.sign(nxt_true_delta)
+        pred_ret = np.sign(nxt_pred_delta)
         dir_acc = float(np.mean((true_ret == pred_ret).astype(float)))
+        # Correlations
+        try:
+            import pandas as _pd  # local to avoid polluting namespace
+            corr_p = float(_pd.Series(nxt_pred_delta).corr(_pd.Series(nxt_true_delta), method="pearson"))
+            corr_s = float(_pd.Series(nxt_pred_delta).corr(_pd.Series(nxt_true_delta), method="spearman"))
+        except Exception:
+            corr_p = float("nan")
+            corr_s = float("nan")
     else:
-        # Logret metrics
+        # Logret metrics and correlation
         diff = y_pred_all_arr - y_true_all_arr
         metrics_all = {
             "mse": float(np.mean(diff ** 2)),
@@ -805,6 +840,13 @@ def evaluate_forecaster(
         }
         last_known = np.zeros_like(y_true_1_arr)  # not used for logret
         dir_acc = float(np.mean((np.sign(y_pred_all_arr[:, 0, 0]) == np.sign(y_true_all_arr[:, 0, 0])).astype(float)))
+        try:
+            import pandas as _pd
+            corr_p = float(_pd.Series(y_pred_1_arr).corr(_pd.Series(y_true_1_arr), method="pearson"))
+            corr_s = float(_pd.Series(y_pred_1_arr).corr(_pd.Series(y_true_1_arr), method="spearman"))
+        except Exception:
+            corr_p = float("nan")
+            corr_s = float("nan")
 
     # Per-horizon MSE on close
     mse_per_h = []
@@ -949,6 +991,8 @@ def evaluate_forecaster(
             **metrics_all,
             "direction_accuracy_next": dir_acc,
             "mse_per_h_close": mse_per_h,
+            "corr_next_pearson": corr_p,
+            "corr_next_spearman": corr_s,
         },
         "artifacts": {
             "next_step_csv": csv_1,
