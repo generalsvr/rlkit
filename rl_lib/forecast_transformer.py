@@ -824,12 +824,21 @@ def evaluate_forecaster(
         dir_acc = float(np.mean((true_ret == pred_ret).astype(float)))
         # Correlations
         try:
-            import pandas as _pd  # local to avoid polluting namespace
-            corr_p = float(_pd.Series(nxt_pred_delta).corr(_pd.Series(nxt_true_delta), method="pearson"))
-            corr_s = float(_pd.Series(nxt_pred_delta).corr(_pd.Series(nxt_true_delta), method="spearman"))
+            tp = nxt_true_delta.astype(float)
+            pp = nxt_pred_delta.astype(float)
+            std_t = float(np.std(tp))
+            std_p = float(np.std(pp))
+            if std_t > 0 and std_p > 0:
+                corr_p = float(np.corrcoef(pp, tp)[0,1])
+                # Spearman via ranking
+                from scipy.stats import rankdata  # type: ignore
+                corr_s = float(np.corrcoef(rankdata(pp), rankdata(tp))[0,1])
+            else:
+                corr_p = 0.0
+                corr_s = 0.0
         except Exception:
-            corr_p = float("nan")
-            corr_s = float("nan")
+            corr_p = 0.0
+            corr_s = 0.0
     else:
         # Logret metrics and correlation
         diff = y_pred_all_arr - y_true_all_arr
@@ -841,12 +850,20 @@ def evaluate_forecaster(
         last_known = np.zeros_like(y_true_1_arr)  # not used for logret
         dir_acc = float(np.mean((np.sign(y_pred_all_arr[:, 0, 0]) == np.sign(y_true_all_arr[:, 0, 0])).astype(float)))
         try:
-            import pandas as _pd
-            corr_p = float(_pd.Series(y_pred_1_arr).corr(_pd.Series(y_true_1_arr), method="pearson"))
-            corr_s = float(_pd.Series(y_pred_1_arr).corr(_pd.Series(y_true_1_arr), method="spearman"))
+            tp = y_true_1_arr.astype(float)
+            pp = y_pred_1_arr.astype(float)
+            std_t = float(np.std(tp))
+            std_p = float(np.std(pp))
+            if std_t > 0 and std_p > 0:
+                corr_p = float(np.corrcoef(pp, tp)[0,1])
+                from scipy.stats import rankdata  # type: ignore
+                corr_s = float(np.corrcoef(rankdata(pp), rankdata(tp))[0,1])
+            else:
+                corr_p = 0.0
+                corr_s = 0.0
         except Exception:
-            corr_p = float("nan")
-            corr_s = float("nan")
+            corr_p = 0.0
+            corr_s = 0.0
 
     # Per-horizon MSE on close
     mse_per_h = []
