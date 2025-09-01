@@ -739,16 +739,29 @@ def load_forecaster(bundle_path: str, device: str = "cuda") -> Tuple[CandleDecod
     arch = ckpt.get("arch", {})
     feature_cols: List[str] = ckpt["feature_columns"]
     target_cols: List[str] = ckpt["target_columns"]
-    model = CandleDecoder(
-        input_dim=len(feature_cols),
-        target_dim=len(target_cols),
-        d_model=int(arch.get("d_model", 128)),
-        nhead=int(arch.get("nhead", 4)),
-        num_encoder_layers=int(arch.get("num_encoder_layers", 2)),
-        num_decoder_layers=int(arch.get("num_decoder_layers", 2)),
-        ff_dim=int(arch.get("ff_dim", 256)),
-        dropout=float(arch.get("dropout", 0.1)),
-    ).to(device)
+    forecast_arch = str(ckpt.get("forecast_arch", "encdec")).lower()
+    if forecast_arch == "decoder_only":
+        num_layers = max(1, int(arch.get("num_encoder_layers", 0)) + int(arch.get("num_decoder_layers", 0)))
+        model = DecoderOnly(
+            input_dim=len(feature_cols),
+            target_dim=len(target_cols),
+            d_model=int(arch.get("d_model", 128)),
+            nhead=int(arch.get("nhead", 4)),
+            num_layers=num_layers,
+            ff_dim=int(arch.get("ff_dim", 256)),
+            dropout=float(arch.get("dropout", 0.1)),
+        ).to(device)
+    else:
+        model = CandleDecoder(
+            input_dim=len(feature_cols),
+            target_dim=len(target_cols),
+            d_model=int(arch.get("d_model", 128)),
+            nhead=int(arch.get("nhead", 4)),
+            num_encoder_layers=int(arch.get("num_encoder_layers", 2)),
+            num_decoder_layers=int(arch.get("num_decoder_layers", 2)),
+            ff_dim=int(arch.get("ff_dim", 256)),
+            dropout=float(arch.get("dropout", 0.1)),
+        ).to(device)
     model.load_state_dict(ckpt["state_dict"])
     model.eval()
     info = {
@@ -761,6 +774,7 @@ def load_forecaster(bundle_path: str, device: str = "cuda") -> Tuple[CandleDecod
         "window": ckpt.get("window"),
         "horizon": ckpt.get("horizon"),
         "target_mode": ckpt.get("target_mode", "price"),
+        "forecast_arch": forecast_arch,
     }
     return model, info
 
