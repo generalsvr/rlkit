@@ -211,6 +211,96 @@ class CandleDecoder(nn.Module):
         return y_hat
 
 
+class DecoderOnly(nn.Module):
+    """
+    GPT-style decoder-only forecaster.
+
+    We concatenate encoder context features and (shifted) target tokens into one sequence
+    by projecting features to target-dim tokens. Causal self-attention attends over both
+    past features and previously generated targets.
+    """
+
+    def __init__(
+        self,
+        input_dim: int,
+        target_dim: int,
+        d_model: int = 128,
+        nhead: int = 4,
+        num_layers: int = 4,
+        ff_dim: int = 256,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.input_dim = int(input_dim)
+        self.target_dim = int(target_dim)
+        self.d_model = int(d_model)
+
+        # Project feature tokens and target tokens into common d_model
+        self.feat_in = nn.Linear(self.input_dim, d_model)
+        self.tgt_in = nn.Linear(self.target_dim, d_model)
+        self.pos = PositionalEncoding(d_model)
+
+        layer = nn.TransformerDecoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=ff_dim, dropout=dropout,
+            batch_first=True, activation="gelu"
+        )
+        self.decoder = nn.TransformerDecoder(layer, num_layers=num_layers)
+        self.norm = nn.LayerNorm(d_model)
+        self.out = nn.Linear(d_model, self.target_dim)
+
+    @staticmethod
+    def _causal_mask(T: int, device: torch.device) -> torch.Tensor:
+        return torch.triu(torch.ones(T, T, device=device), diagonal=1).bool()
+
+    def forward(self, x_feat: torch.Tensor, y_in: torch.Tensor) -> torch.Tensor:
+        """
+        x_feat: (B, T, F) normalized features context
+        y_in:   (B, H, D) normalized targets (teacher-forced, shifted)
+        Returns y_hat: (B, H, D)
+        """
+        device = x_feat.device
+        B, T, F = x_feat.shape
+        _, H, D = y_in.shape
+        xf = self.feat_in(x_feat)
+        yt = self.tgt_in(y_in)
+        # Concat: [feat tokens | target tokens]
+        cat = torch.cat([xf, yt], dim=1)  # (B, T+H, d)
+        cat = self.pos(cat)
+        # Use zeros memory; TransformerDecoder with empty memory works as self-attn stack
+        # Build causal mask over full length
+        L = T + H
+        mask = self._causal_mask(L, device=device)
+        # PyTorch TransformerDecoder expects tgt query and memory separately.
+        # We'll split: query = cat[:, T:, :], memory = cat[:, :T, :]
+        query = cat[:, T:, :]
+        memory = cat[:, :T, :]
+        # To ensure causal among targets as well, provide tgt_mask over H
+        tgt_mask = self._causal_mask(H, device=device)
+        dec = self.decoder(tgt=query, memory=memory, tgt_mask=tgt_mask)
+        dec = self.norm(dec)
+        y_hat = self.out(dec)
+        return y_hat
+
+    @torch.no_grad()
+    def infer_autoregressive(self, x_feat: torch.Tensor, start_token: torch.Tensor, horizon: int) -> torch.Tensor:
+        device = x_feat.device
+        B, T, F = x_feat.shape
+        xf = self.feat_in(x_feat)
+        tokens = [start_token]
+        for _ in range(horizon):
+            yt = self.tgt_in(torch.cat(tokens, dim=1))  # (B, L, d)
+            cat = torch.cat([xf, yt], dim=1)
+            cat = self.pos(cat)
+            query = cat[:, xf.size(1):, :]
+            memory = cat[:, :xf.size(1), :]
+            tgt_mask = self._causal_mask(query.size(1), device=device)
+            dec = self.decoder(tgt=query, memory=memory, tgt_mask=tgt_mask)
+            dec = self.norm(dec)
+            y_step = self.out(dec[:, -1:, :])
+            tokens.append(y_step)
+        return torch.cat(tokens[1:], dim=1)
+
+
 @dataclass
 class ForecastTrainParams:
     userdir: str
@@ -226,6 +316,7 @@ class ForecastTrainParams:
     horizon: int = 16
     target_columns: Optional[List[str]] = None  # default OHLCV if None
     target_mode: str = "price"  # price | logret
+    forecast_arch: str = "encdec"  # encdec | decoder_only
 
     # Model
     d_model: int = 128
@@ -369,6 +460,7 @@ def _save_bundle(
             "dropout": params.dropout,
         },
         "target_mode": (params.target_mode or "price").lower(),
+        "forecast_arch": (params.forecast_arch or "encdec").lower(),
         "meta": asdict(params),
     }
     torch.save(ckpt, out_path)
@@ -412,16 +504,28 @@ def train_transformer_forecaster(params: ForecastTrainParams) -> Dict[str, Any]:
     train_ds, valid_ds, feature_cols, target_cols = _build_datasets(raw, params)
 
     device = torch.device(params.device if torch.cuda.is_available() or params.device == "cpu" else "cpu")
-    model = CandleDecoder(
-        input_dim=len(feature_cols),
-        target_dim=len(target_cols),
-        d_model=params.d_model,
-        nhead=params.nhead,
-        num_encoder_layers=params.num_encoder_layers,
-        num_decoder_layers=params.num_decoder_layers,
-        ff_dim=params.ff_dim,
-        dropout=params.dropout,
-    ).to(device)
+    arch = (params.forecast_arch or "encdec").lower()
+    if arch == "decoder_only":
+        model = DecoderOnly(
+            input_dim=len(feature_cols),
+            target_dim=len(target_cols),
+            d_model=params.d_model,
+            nhead=params.nhead,
+            num_layers=max(1, params.num_encoder_layers + params.num_decoder_layers),
+            ff_dim=params.ff_dim,
+            dropout=params.dropout,
+        ).to(device)
+    else:
+        model = CandleDecoder(
+            input_dim=len(feature_cols),
+            target_dim=len(target_cols),
+            d_model=params.d_model,
+            nhead=params.nhead,
+            num_encoder_layers=params.num_encoder_layers,
+            num_decoder_layers=params.num_decoder_layers,
+            ff_dim=params.ff_dim,
+            dropout=params.dropout,
+        ).to(device)
 
     train_loader = DataLoader(train_ds, batch_size=int(params.batch_size), shuffle=True, drop_last=True)
     valid_loader = DataLoader(valid_ds, batch_size=int(params.batch_size), shuffle=False, drop_last=False)
@@ -444,7 +548,7 @@ def train_transformer_forecaster(params: ForecastTrainParams) -> Dict[str, Any]:
         num_params = sum(p.numel() for p in model.parameters())
     except Exception:
         num_params = -1
-    print(f"MODEL: CandleDecoder d_model={params.d_model} nhead={params.nhead} enc_layers={params.num_encoder_layers} dec_layers={params.num_decoder_layers} ff={params.ff_dim} params={num_params}")
+    print(f"MODEL: {arch} d_model={params.d_model} nhead={params.nhead} enc_layers={params.num_encoder_layers} dec_layers={params.num_decoder_layers} ff={params.ff_dim} params={num_params}")
     print(f"DATA: train_samples={len(train_ds)} valid_samples={len(valid_ds)} window={params.window} horizon={params.horizon} input_dim={len(feature_cols)} target_dim={len(target_cols)} batch_size={params.batch_size}")
 
     for epoch in range(int(params.epochs)):
