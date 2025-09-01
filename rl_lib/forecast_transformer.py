@@ -225,6 +225,7 @@ class ForecastTrainParams:
     window: int = 128
     horizon: int = 16
     target_columns: Optional[List[str]] = None  # default OHLCV if None
+    target_mode: str = "price"  # price | logret
 
     # Model
     d_model: int = 128
@@ -264,9 +265,17 @@ def _build_datasets(
         extra_timeframes=params.extra_timeframes,
     )
 
-    # Default targets: OHLCV (if present)
-    default_targets = [c for c in ["open", "high", "low", "close", "volume"] if c in feats.columns]
-    target_cols = params.target_columns or default_targets
+    # Ensure logret exists if requested
+    if (params.target_mode or "price").lower() == "logret":
+        if "logret" not in feats.columns:
+            c = feats["close"].astype(float).to_numpy()
+            logret = np.diff(np.log(c + 1e-12), prepend=np.log(c[0] + 1e-12))
+            feats["logret"] = logret
+        target_cols = ["logret"]
+    else:
+        # Default targets: OHLCV (if present)
+        default_targets = [c for c in ["open", "high", "low", "close", "volume"] if c in feats.columns]
+        target_cols = params.target_columns or default_targets
     if not target_cols:
         raise ValueError("No target columns available in features dataframe.")
 
@@ -359,6 +368,7 @@ def _save_bundle(
             "ff_dim": params.ff_dim,
             "dropout": params.dropout,
         },
+        "target_mode": (params.target_mode or "price").lower(),
         "meta": asdict(params),
     }
     torch.save(ckpt, out_path)
@@ -380,6 +390,7 @@ def _save_bundle(
             "ff_dim": params.ff_dim,
             "dropout": params.dropout,
         },
+        "target_mode": (params.target_mode or "price").lower(),
     }
     with open(os.path.splitext(out_path)[0] + ".json", "w") as f:
         json.dump(side_json, f)
@@ -645,6 +656,7 @@ def load_forecaster(bundle_path: str, device: str = "cuda") -> Tuple[CandleDecod
         "target_std": ckpt["target_std"],
         "window": ckpt.get("window"),
         "horizon": ckpt.get("horizon"),
+        "target_mode": ckpt.get("target_mode", "price"),
     }
     return model, info
 
@@ -745,8 +757,9 @@ def evaluate_forecaster(
     start = max(window, n - max_windows - horizon)
     end = n - horizon
 
-    # Select close column if present for visuals
-    close_idx = target_cols.index("close") if "close" in target_cols else 0
+    # Target visualization selector
+    target_mode = str(info.get("target_mode", "price")).lower()
+    close_idx = (target_cols.index("close") if "close" in target_cols else 0) if target_mode == "price" else 0
     times = feats.index
 
     # Collect predictions and metrics
@@ -774,14 +787,24 @@ def evaluate_forecaster(
     y_pred_1_arr = np.asarray(y_pred_1)
 
     # Metrics
-    metrics_all = _metrics_denorm(y_true_all_arr, y_pred_all_arr)
-    # Direction accuracy on next-step close
-    # Compare sign of next close change vs predicted change from last known close
-    last_close_series = feats["close"].astype(float).to_numpy()
-    last_known = np.asarray([last_close_series[i - 1] for i in range(start, end)])
-    true_ret = np.sign(y_true_1_arr - last_known)
-    pred_ret = np.sign(y_pred_1_arr - last_known)
-    dir_acc = float(np.mean((true_ret == pred_ret).astype(float)))
+    if target_mode == "price":
+        metrics_all = _metrics_denorm(y_true_all_arr, y_pred_all_arr)
+        # Direction accuracy on next-step close
+        last_close_series = feats["close"].astype(float).to_numpy()
+        last_known = np.asarray([last_close_series[i - 1] for i in range(start, end)])
+        true_ret = np.sign(y_true_1_arr - last_known)
+        pred_ret = np.sign(y_pred_1_arr - last_known)
+        dir_acc = float(np.mean((true_ret == pred_ret).astype(float)))
+    else:
+        # Logret metrics
+        diff = y_pred_all_arr - y_true_all_arr
+        metrics_all = {
+            "mse": float(np.mean(diff ** 2)),
+            "mae": float(np.mean(np.abs(diff))),
+            "mape": float(np.mean(np.abs(diff) / (np.maximum(np.abs(y_true_all_arr), 1e-8)))),
+        }
+        last_known = np.zeros_like(y_true_1_arr)  # not used for logret
+        dir_acc = float(np.mean((np.sign(y_pred_all_arr[:, 0, 0]) == np.sign(y_true_all_arr[:, 0, 0])).astype(float)))
 
     # Per-horizon MSE on close
     mse_per_h = []
@@ -804,30 +827,36 @@ def evaluate_forecaster(
 
     # Plot 1-step predictions vs actual
     fig, ax = plt.subplots(figsize=(14, 6))
-    ax.plot(t_stamps, y_true_1_arr, label="True next close", color="#2c3e50")
-    ax.plot(t_stamps, y_pred_1_arr, label="Pred next close", color="#e67e22", alpha=0.9)
-    ax.set_title(f"Next-step close forecast: {pair} {timeframe}")
+    if target_mode == "price":
+        ax.plot(t_stamps, y_true_1_arr, label="True next close", color="#2c3e50")
+        ax.plot(t_stamps, y_pred_1_arr, label="Pred next close", color="#e67e22", alpha=0.9)
+        ax.set_title(f"Next-step close forecast: {pair} {timeframe}")
+        ax.set_ylabel("Price")
+    else:
+        ax.plot(t_stamps, y_true_1_arr, label="True next logret", color="#2c3e50")
+        ax.plot(t_stamps, y_pred_1_arr, label="Pred next logret", color="#e67e22", alpha=0.9)
+        ax.set_title(f"Next-step logret forecast: {pair} {timeframe}")
+        ax.set_ylabel("Log return")
     ax.set_xlabel("Time")
-    ax.set_ylabel("Price")
     ax.grid(True, alpha=0.3)
     ax.legend()
     fig.tight_layout()
-    fig.savefig(os.path.join(base_dir, "next_step_close.png"), dpi=150)
+    fig.savefig(os.path.join(base_dir, "next_step_target.png"), dpi=150)
     plt.close(fig)
 
-    # Plot last window multi-step path (close)
+    # Plot last window multi-step path (target)
     last_true = y_true_all_arr[-1, :, close_idx]
     last_pred = y_pred_all_arr[-1, :, close_idx]
     fig2, ax2 = plt.subplots(figsize=(10, 5))
     ax2.plot(range(1, horizon + 1), last_true, label="True path", marker="o", color="#2ecc71")
     ax2.plot(range(1, horizon + 1), last_pred, label="Pred path", marker="x", color="#c0392b")
     ax2.set_xlabel("Steps ahead")
-    ax2.set_ylabel("Close")
-    ax2.set_title(f"Multi-step path at tail window: H={horizon}")
+    ax2.set_ylabel("Close" if target_mode == "price" else "Log return")
+    ax2.set_title(f"Multi-step {'close' if target_mode=='price' else 'logret'} path at tail window: H={horizon}")
     ax2.grid(True, alpha=0.3)
     ax2.legend()
     fig2.tight_layout()
-    fig2.savefig(os.path.join(base_dir, "tail_multistep_close.png"), dpi=150)
+    fig2.savefig(os.path.join(base_dir, "tail_multistep_target.png"), dpi=150)
     plt.close(fig2)
 
     # Optional animation (next-step rolling prediction or rolling path)
@@ -872,29 +901,34 @@ def evaluate_forecaster(
             fig3, ax3 = plt.subplots(figsize=(14, 6))
             ax3.set_title(f"Rolling next-step forecast: {pair} {timeframe}")
             ax3.set_xlabel("Time")
-            ax3.set_ylabel("Close")
+            ax3.set_ylabel("Close" if target_mode == "price" else "Log return")
             ax3.grid(True, alpha=0.3)
 
-            line_true, = ax3.plot([], [], label="True next close", color="#2c3e50")
-            line_pred, = ax3.plot([], [], label="Pred next close", color="#e67e22")
-            line_last, = ax3.plot([], [], label="Last close", color="#95a5a6", alpha=0.6)
+            line_true, = ax3.plot([], [], label=("True next close" if target_mode=="price" else "True next logret"), color="#2c3e50")
+            line_pred, = ax3.plot([], [], label=("Pred next close" if target_mode=="price" else "Pred next logret"), color="#e67e22")
+            if target_mode == "price":
+                line_last, = ax3.plot([], [], label="Last close", color="#95a5a6", alpha=0.6)
+            else:
+                line_last = None
             ax3.legend(loc="upper left")
 
             def init():
                 line_true.set_data([], [])
                 line_pred.set_data([], [])
-                line_last.set_data([], [])
-                return line_true, line_pred, line_last
+                if line_last is not None:
+                    line_last.set_data([], [])
+                return (line_true, line_pred, line_last) if line_last is not None else (line_true, line_pred)
 
             xs = np.asarray(t_stamps)
             def update(frame: int):
                 i = max(1, frame)
                 line_true.set_data(xs[:i], y_true_1_arr[:i])
                 line_pred.set_data(xs[:i], y_pred_1_arr[:i])
-                line_last.set_data(xs[:i], last_known[:i])
+                if line_last is not None:
+                    line_last.set_data(xs[:i], last_known[:i])
                 ax3.relim()
                 ax3.autoscale_view()
-                return line_true, line_pred, line_last
+                return (line_true, line_pred, line_last) if line_last is not None else (line_true, line_pred)
 
             ani = FuncAnimation(fig3, update, frames=len(t_stamps), init_func=init, interval=1000.0/anim_fps, blit=True)
             anim_path = os.path.join(base_dir, "rolling_next_step.mp4")
@@ -918,8 +952,8 @@ def evaluate_forecaster(
         },
         "artifacts": {
             "next_step_csv": csv_1,
-            "next_step_plot": os.path.join(base_dir, "next_step_close.png"),
-            "tail_multistep_plot": os.path.join(base_dir, "tail_multistep_close.png"),
+            "next_step_plot": os.path.join(base_dir, "next_step_target.png"),
+            "tail_multistep_plot": os.path.join(base_dir, "tail_multistep_target.png"),
             "outdir": base_dir,
             "animation": anim_path,
         },
