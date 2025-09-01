@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import json
 from dataclasses import dataclass, asdict
+import time
 from typing import List, Optional, Tuple, Dict, Any
 
 import numpy as np
@@ -416,10 +417,21 @@ def train_transformer_forecaster(params: ForecastTrainParams) -> Dict[str, Any]:
     best_val = float("inf")
     best_ckpt: Optional[Dict[str, Any]] = None
 
+    # Diagnostics at start
+    try:
+        num_params = sum(p.numel() for p in model.parameters())
+    except Exception:
+        num_params = -1
+    print(f"MODEL: CandleDecoder d_model={params.d_model} nhead={params.nhead} enc_layers={params.num_encoder_layers} dec_layers={params.num_decoder_layers} ff={params.ff_dim} params={num_params}")
+    print(f"DATA: train_samples={len(train_ds)} valid_samples={len(valid_ds)} window={params.window} horizon={params.horizon} input_dim={len(feature_cols)} target_dim={len(target_cols)} batch_size={params.batch_size}")
+
     for epoch in range(int(params.epochs)):
+        epoch_t0 = time.time()
         model.train()
         total_loss = 0.0
         num_batches = 0
+        grad_norm_sum = 0.0
+        grad_norm_cnt = 0
         for batch in train_loader:
             x = batch["x"].to(device)  # (B, T, F)
             y = batch["y"].to(device)  # (B, H, D)
@@ -431,7 +443,12 @@ def train_transformer_forecaster(params: ForecastTrainParams) -> Dict[str, Any]:
             scaler.scale(loss).backward()
             if params.grad_clip_norm and params.grad_clip_norm > 0:
                 scaler.unscale_(opt)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), float(params.grad_clip_norm))
+                gn = torch.nn.utils.clip_grad_norm_(model.parameters(), float(params.grad_clip_norm))
+                try:
+                    grad_norm_sum += float(gn)
+                    grad_norm_cnt += 1
+                except Exception:
+                    pass
             scaler.step(opt)
             scaler.update()
             total_loss += float(loss.item())
@@ -442,6 +459,11 @@ def train_transformer_forecaster(params: ForecastTrainParams) -> Dict[str, Any]:
         model.eval()
         val_loss = 0.0
         val_batches = 0
+        # Denorm per-horizon close MSE@1 and @H
+        close_idx = target_cols.index("close") if "close" in target_cols else 0
+        mse1_sum = 0.0
+        mseH_sum = 0.0
+        mse_count = 0
         with torch.no_grad():
             for batch in valid_loader:
                 x = batch["x"].to(device)
@@ -451,9 +473,25 @@ def train_transformer_forecaster(params: ForecastTrainParams) -> Dict[str, Any]:
                 loss = loss_fn(y_hat, y)
                 val_loss += float(loss.item())
                 val_batches += 1
+                # Denormalize close for MSE@1 and @H
+                try:
+                    y_dn = (y.cpu().numpy() * valid_ds.target_std) + valid_ds.target_mu
+                    yhat_dn = (y_hat.cpu().numpy() * valid_ds.target_std) + valid_ds.target_mu
+                    mse1_sum += float(((yhat_dn[:, 0, close_idx] - y_dn[:, 0, close_idx]) ** 2).mean())
+                    mseH_sum += float(((yhat_dn[:, -1, close_idx] - y_dn[:, -1, close_idx]) ** 2).mean())
+                    mse_count += 1
+                except Exception:
+                    pass
         avg_val = val_loss / max(1, val_batches)
-
-        print(f"EPOCH {epoch+1}/{params.epochs} train={avg_train:.6f} valid={avg_val:.6f}")
+        # Learning rate (assumes single group)
+        try:
+            curr_lr = float(opt.param_groups[0]["lr"]) if opt.param_groups else float(params.learning_rate)
+        except Exception:
+            curr_lr = float(params.learning_rate)
+        avg_gn = (grad_norm_sum / max(1, grad_norm_cnt)) if grad_norm_cnt > 0 else float("nan")
+        mse1 = (mse1_sum / max(1, mse_count)) if mse_count > 0 else float("nan")
+        mseH = (mseH_sum / max(1, mse_count)) if mse_count > 0 else float("nan")
+        best_marker = ""
         if avg_val < best_val:
             best_val = avg_val
             best_ckpt = {
@@ -463,6 +501,12 @@ def train_transformer_forecaster(params: ForecastTrainParams) -> Dict[str, Any]:
                 "target_mu": train_ds.target_mu,
                 "target_std": train_ds.target_std,
             }
+            best_marker = "*"
+        epoch_secs = time.time() - epoch_t0
+        print(
+            f"EPOCH {epoch+1}/{params.epochs} train={avg_train:.6f} valid={avg_val:.6f}{best_marker} "
+            f"mse1_close={mse1:.2f} mseH_close={mseH:.2f} grad_norm={avg_gn:.2f} lr={curr_lr:.6g} secs={epoch_secs:.1f}"
+        )
 
     # Save best
     if best_ckpt is None:
