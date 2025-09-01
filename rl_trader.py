@@ -25,6 +25,8 @@ from rl_lib.train_sb3 import TrainParams, train_ppo_from_freqtrade_data, validat
 from rl_lib.train_sb3 import train_ppo_multi_from_freqtrade_data  # type: ignore
 from rl_lib.train_sb3 import _find_data_file as _find_data_file_internal, _load_ohlcv as _load_ohlcv_internal  # type: ignore
 from rl_lib.signal import compute_rl_signals
+from rl_lib.forecast_transformer import ForecastTrainParams, train_transformer_forecaster  # type: ignore
+from rl_lib.forecast_transformer import evaluate_forecaster  # type: ignore
 
 
 app = typer.Typer(add_completion=False)
@@ -879,6 +881,108 @@ def validate(
     )
     os.environ["RL_DEVICE"] = device
     _ = validate_trained_model(params, max_steps=max_steps, deterministic=deterministic, timerange=timerange)
+
+
+@app.command()
+def forecast_train(
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    # Data slice
+    timerange: str = typer.Option("", help="YYYYMMDD-YYYYMMDD"),
+    feature_mode: str = typer.Option("full", help="full|basic|ohlcv"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("", help="e.g., '4H,1D'"),
+    # Model/data
+    window: int = typer.Option(128),
+    horizon: int = typer.Option(16),
+    target_columns: str = typer.Option("open,high,low,close,volume", help="Comma-separated targets; empty=auto OHLCV if present"),
+    d_model: int = typer.Option(128),
+    nhead: int = typer.Option(4),
+    num_encoder_layers: int = typer.Option(2),
+    num_decoder_layers: int = typer.Option(2),
+    ff_dim: int = typer.Option(256),
+    dropout: float = typer.Option(0.1),
+    # Training
+    batch_size: int = typer.Option(128),
+    epochs: int = typer.Option(10),
+    learning_rate: float = typer.Option(3e-4),
+    weight_decay: float = typer.Option(1e-4),
+    grad_clip_norm: float = typer.Option(1.0),
+    device: str = typer.Option("cuda", help="cuda|cpu"),
+    seed: int = typer.Option(42),
+    # Output
+    model_out: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "forecaster.pt"), "--model-out", "--model_out"),
+):
+    """Train a Transformer decoder forecaster to predict next N candles (autoregressive)."""
+    etf_list = [s.strip() for s in extra_timeframes.split(",") if s.strip()] if extra_timeframes else []
+    tcols = [s.strip() for s in target_columns.split(",") if s.strip()] if target_columns else None
+    params = ForecastTrainParams(
+        userdir=userdir,
+        pair=pair,
+        timeframe=timeframe,
+        feature_mode=feature_mode,
+        basic_lookback=basic_lookback,
+        extra_timeframes=(etf_list or None),
+        timerange=(timerange or None),
+        window=window,
+        horizon=horizon,
+        target_columns=tcols,
+        d_model=d_model,
+        nhead=nhead,
+        num_encoder_layers=num_encoder_layers,
+        num_decoder_layers=num_decoder_layers,
+        ff_dim=ff_dim,
+        dropout=dropout,
+        batch_size=batch_size,
+        epochs=epochs,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        grad_clip_norm=grad_clip_norm,
+        device=device,
+        seed=seed,
+        model_out_path=model_out,
+    )
+    report = train_transformer_forecaster(params)
+    typer.echo(json.dumps(report, default=lambda o: float(o) if hasattr(o, "__float__") else str(o)))
+
+
+@app.command()
+def forecast_eval(
+    model_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "forecaster.pt"), "--model-path", "--model_path"),
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    timerange: str = typer.Option("", help="YYYYMMDD-YYYYMMDD for evaluation slice"),
+    feature_mode: str = typer.Option("full", help="full|basic|ohlcv"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("", help="e.g., '4H,1D'"),
+    device: str = typer.Option("cuda"),
+    max_windows: int = typer.Option(1200),
+    outdir: str = typer.Option("", help="Output dir for plots/CSVs; default under model folder"),
+    make_animation: bool = typer.Option(False, help="Save animation"),
+    anim_fps: int = typer.Option(12, help="Animation FPS"),
+    animation_mode: str = typer.Option("next", help="next|path"),
+):
+    """Evaluate a trained forecaster and save plots and CSVs for inspection."""
+    etf_list = [s.strip() for s in extra_timeframes.split(",") if s.strip()] if extra_timeframes else []
+    report = evaluate_forecaster(
+        model_path=model_path,
+        userdir=userdir,
+        pair=pair,
+        timeframe=timeframe,
+        feature_mode=feature_mode,
+        basic_lookback=basic_lookback,
+        extra_timeframes=(etf_list or None),
+        timerange=(timerange or None),
+        device=device,
+        max_windows=int(max_windows),
+        outdir=(outdir or None),
+        make_animation=bool(make_animation),
+        anim_fps=int(anim_fps),
+        animation_mode=str(animation_mode),
+    )
+    typer.echo(json.dumps(report, default=lambda o: float(o) if hasattr(o, "__float__") else str(o)))
 
 
 if __name__ == "__main__":
