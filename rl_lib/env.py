@@ -23,6 +23,12 @@ class TradingConfig:
     dd_penalty: float = 0.0
     min_hold_bars: int = 0
     cooldown_bars: int = 0
+    # Additional risk shaping
+    position_penalty_bps: float = 0.0  # per-step penalty when in position
+    loss_hold_penalty_bps: float = 0.0  # per-step penalty scaled by consecutive loss bars while holding
+    cvar_alpha: float = 0.0  # e.g., 0.05 for 5% CVaR; 0 disables
+    cvar_coef: float = 0.0   # scales CVaR penalty when in position
+    max_position_bars: int = 0  # optional soft cap; >0 enables extra penalty beyond this
     # Training ergonomics
     random_reset: bool = False
     episode_max_steps: int = 0  # 0 means run to end of dataset
@@ -47,6 +53,9 @@ class FTTradingEnv(gym.Env):
         self.last_pos_change_step = -10**9
         self.cooldown_until_step = -1
         self.max_equity_seen = 1.0
+        # Tracking for exposure and loss duration
+        self.bars_since_entry = 0
+        self.bars_in_loss = 0
 
         # Price series for PnL
         if "close" not in self.df.columns:
@@ -112,6 +121,8 @@ class FTTradingEnv(gym.Env):
         self.equity = 1.0
         self.equity_curve = [self.equity]
         self.max_equity_seen = self.equity
+        self.bars_since_entry = 0
+        self.bars_in_loss = 0
         self._pending_target_pos = None
         obs = self._obs()
         return obs, {}
@@ -188,6 +199,9 @@ class FTTradingEnv(gym.Env):
                 self.cooldown_until_step = self.episode_steps + self.cfg.cooldown_bars
             executed_change = True
             self._pending_target_pos = None
+            # Reset bars counters on change
+            self.bars_since_entry = 0 if new_pos != 0 else 0
+            self.bars_in_loss = 0
         else:
             # Optional idle penalty when flat
             if self.position == 0 and self.cfg.idle_penalty_bps > 0.0 and not self.done:
@@ -216,6 +230,59 @@ class FTTradingEnv(gym.Env):
                 reward = reward / (sigma + 1e-8)
                 dd = max(0.0, (self.max_equity_seen - self.equity) / (self.max_equity_seen + 1e-12))
                 reward -= float(self.cfg.dd_penalty) * dd
+        # Exposure and risk penalties applied every step (position-based)
+        g_step = float(self._get_risk_gate(self.ptr - 1))
+        if self.position != 0 and not self.done:
+            # Increment bars since entry
+            self.bars_since_entry += 1
+            # Per-step exposure penalty to reduce time in market
+            if self.cfg.position_penalty_bps > 0.0:
+                pos_cost = (self.cfg.position_penalty_bps * 1e-4) * g_step
+                reward -= pos_cost
+                self.equity *= (1.0 - pos_cost)
+            # Loss-duration penalty (unrealized PnL negative over consecutive bars)
+            try:
+                if self.entry_price is not None:
+                    # Unrealized return using last close
+                    uret = (float(self.close[self.ptr - 1]) - float(self.entry_price)) / (float(self.entry_price) + 1e-12)
+                    uret = uret if self.position == +1 else -uret
+                    if uret < 0.0:
+                        self.bars_in_loss = int(self.bars_in_loss + 1)
+                    else:
+                        self.bars_in_loss = 0
+            except Exception:
+                self.bars_in_loss = 0
+            if self.cfg.loss_hold_penalty_bps > 0.0 and self.bars_in_loss > 0:
+                loss_cost = (self.cfg.loss_hold_penalty_bps * 1e-4) * float(self.bars_in_loss) * g_step
+                reward -= loss_cost
+                self.equity *= (1.0 - loss_cost)
+            # Soft cap beyond max_position_bars
+            if self.cfg.max_position_bars > 0 and self.bars_since_entry > int(self.cfg.max_position_bars):
+                over_cost = 1e-4 * g_step  # 1 bps per bar over cap
+                reward -= over_cost
+                self.equity *= (1.0 - over_cost)
+        else:
+            # Reset counters when flat
+            self.bars_since_entry = 0
+            self.bars_in_loss = 0
+        # CVaR penalty based on recent market returns to discourage exposure in adverse tails
+        if self.cfg.cvar_alpha and self.cfg.cvar_coef and self.position != 0 and not self.done:
+            try:
+                L = max(10, int(self.cfg.vol_lookback))
+                start = max(0, (self.ptr - 1) - L)
+                window_rets = self.simple_ret[start:(self.ptr - 1)]
+                if window_rets.size >= 10:
+                    alpha = float(min(max(self.cfg.cvar_alpha, 0.001), 0.5))
+                    var = float(np.quantile(window_rets, alpha))
+                    tail = window_rets[window_rets <= var]
+                    if tail.size > 0:
+                        es = float(np.mean(tail))
+                        cvar_pen = float(self.cfg.cvar_coef) * float(max(0.0, -es))
+                        if cvar_pen > 0.0:
+                            reward -= cvar_pen
+                            self.equity *= (1.0 - cvar_pen)
+            except Exception:
+                pass
         info = {"equity": float(self.equity), "position": int(self.position), "risk_gate": float(self._get_risk_gate(self.ptr - 1))}
         return obs, float(reward * self.cfg.reward_scale), terminated, truncated, info
 

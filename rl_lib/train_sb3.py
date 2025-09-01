@@ -545,6 +545,12 @@ class TrainParams:
     dd_penalty: float = 0.0
     min_hold_bars: int = 0
     cooldown_bars: int = 0
+    # New risk shaping knobs
+    position_penalty_bps: float = 0.0
+    loss_hold_penalty_bps: float = 0.0
+    cvar_alpha: float = 0.0
+    cvar_coef: float = 0.0
+    max_position_bars: int = 0
     random_reset: bool = False
     episode_max_steps: int = 0
     # Feature pipeline
@@ -606,6 +612,11 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
         dd_penalty=params.dd_penalty,
         min_hold_bars=params.min_hold_bars,
         cooldown_bars=params.cooldown_bars,
+        position_penalty_bps=params.position_penalty_bps,
+        loss_hold_penalty_bps=params.loss_hold_penalty_bps,
+        cvar_alpha=params.cvar_alpha,
+        cvar_coef=params.cvar_coef,
+        max_position_bars=params.max_position_bars,
         random_reset=params.random_reset,
         episode_max_steps=params.episode_max_steps,
     )
@@ -934,6 +945,11 @@ def train_ppo_multi_from_freqtrade_data(params: TrainParams, pairs: List[str]) -
         dd_penalty=params.dd_penalty,
         min_hold_bars=params.min_hold_bars,
         cooldown_bars=params.cooldown_bars,
+        position_penalty_bps=params.position_penalty_bps,
+        loss_hold_penalty_bps=params.loss_hold_penalty_bps,
+        cvar_alpha=params.cvar_alpha,
+        cvar_coef=params.cvar_coef,
+        max_position_bars=params.max_position_bars,
         random_reset=params.random_reset,
         episode_max_steps=params.episode_max_steps,
     )
