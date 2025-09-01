@@ -625,6 +625,12 @@ def sweep(
     cvar_alpha: float = typer.Option(0.0),
     cvar_coef: float = typer.Option(0.0),
     max_position_bars: int = typer.Option(0),
+    # Risk shaping list variants for grid search
+    position_penalty_bps_list: str = typer.Option("", help="Comma-separated list for position penalty bps"),
+    loss_hold_penalty_bps_list: str = typer.Option("", help="Comma-separated list for loss-hold penalty bps"),
+    cvar_alpha_list: str = typer.Option("", help="Comma-separated list for CVaR alpha"),
+    cvar_coef_list: str = typer.Option("", help="Comma-separated list for CVaR coef"),
+    max_position_bars_list: str = typer.Option("", help="Comma-separated list for max position bars"),
     feature_mode: str = typer.Option("basic"),
     basic_lookback: int = typer.Option(128),
     windows_list: str = typer.Option("", help="Comma-separated window sizes; if empty, uses --window"),
@@ -678,6 +684,12 @@ def sweep(
     mh_vals = _parse_list(min_hold_bars_list, int) if min_hold_bars_list else [min_hold_bars]
     cd_vals = _parse_list(cooldown_bars_list, int) if cooldown_bars_list else [cooldown_bars]
     fm_list = [m.strip() for m in feature_modes.split(",") if m.strip()] if feature_modes else [feature_mode]
+    # Risk shaping grids (fallback to scalar if list not provided)
+    pp_vals = _parse_list(position_penalty_bps_list, float) if position_penalty_bps_list else [position_penalty_bps]
+    lh_vals = _parse_list(loss_hold_penalty_bps_list, float) if loss_hold_penalty_bps_list else [loss_hold_penalty_bps]
+    ca_vals = _parse_list(cvar_alpha_list, float) if cvar_alpha_list else [cvar_alpha]
+    cc_vals = _parse_list(cvar_coef_list, float) if cvar_coef_list else [cvar_coef]
+    mpb_vals = _parse_list(max_position_bars_list, int) if max_position_bars_list else [max_position_bars]
 
     # Ensure datasets exist if requested
     if autofetch:
@@ -688,13 +700,16 @@ def sweep(
             except Exception as e:
                 typer.echo(f"Auto-download failed for {pair} {tf}: {e}")
 
-    combos = list(product(rt_list, ec_list, lr_list, ns_list, bs_list, fee_vals, slip_vals, seed_vals, win_vals, mh_vals, cd_vals, fm_list))
+    combos = list(product(
+        rt_list, ec_list, lr_list, ns_list, bs_list, fee_vals, slip_vals, seed_vals,
+        win_vals, mh_vals, cd_vals, fm_list, pp_vals, lh_vals, ca_vals, cc_vals, mpb_vals
+    ))
     if len(combos) > max_trials:
         combos = combos[:max_trials]
 
     typer.echo(f"Running {len(combos)} trials. Results -> {results_csv}")
 
-    for idx, (rt, ec, lr, ns, bs, fee, slip, sd, wv, mhv, cdv, fm) in enumerate(combos, start=1):
+    for idx, (rt, ec, lr, ns, bs, fee, slip, sd, wv, mhv, cdv, fm, ppv, lhv, cav, ccv, mpbv) in enumerate(combos, start=1):
         tag = f"{arch}_fm-{fm}_win-{wv}_mh-{mhv}_cd-{cdv}_rt-{rt}_ec-{ec}_lr-{lr}_ns-{ns}_bs-{bs}_fee-{fee}_slip-{slip}_seed-{sd}"
         model_path = str(sweep_dir / f"{tag}.zip")
         params = TrainParams(
@@ -714,11 +729,11 @@ def sweep(
             vol_lookback=20,
             turnover_penalty_bps=turnover_penalty_bps,
             dd_penalty=0.05 if rt == "sharpe_proxy" else 0.0,
-            position_penalty_bps=position_penalty_bps,
-            loss_hold_penalty_bps=loss_hold_penalty_bps,
-            cvar_alpha=cvar_alpha,
-            cvar_coef=cvar_coef,
-            max_position_bars=max_position_bars,
+            position_penalty_bps=ppv,
+            loss_hold_penalty_bps=lhv,
+            cvar_alpha=cav,
+            cvar_coef=ccv,
+            max_position_bars=mpbv,
             min_hold_bars=mhv,
             cooldown_bars=cdv,
             random_reset=True,
