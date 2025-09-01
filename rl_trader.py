@@ -662,13 +662,17 @@ def sweep(
     sweep_dir = Path(outdir) / ts
     sweep_dir.mkdir(parents=True, exist_ok=True)
     results_csv = sweep_dir / "results.csv"
+    fields = [
+        "model_path","feature_mode","window","min_hold_bars","cooldown_bars",
+        "position_penalty_bps","loss_hold_penalty_bps","cvar_alpha","cvar_coef","max_position_bars",
+        "turnover_penalty_bps","extra_timeframes","reward_type","ent_coef","learning_rate","n_steps","batch_size","fee_bps","slippage_bps","seed",
+        "eval_timerange","backtest_timerange","exchange",
+        "final_equity","sharpe","max_drawdown","time_in_position_frac",
+        "bt_total_profit_pct","bt_total_profit_abs","bt_total_trades","bt_win_rate","bt_profit_factor",
+        "bt_zip","bt_meta","bt_run_id"
+    ]
     with open(results_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "model_path","feature_mode","window","min_hold_bars","cooldown_bars","reward_type","ent_coef","learning_rate","n_steps","batch_size","fee_bps","slippage_bps","seed",
-            "final_equity","sharpe","max_drawdown","time_in_position_frac",
-            "bt_total_profit_pct","bt_total_profit_abs","bt_total_trades","bt_win_rate","bt_profit_factor",
-            "bt_zip","bt_meta","bt_run_id"
-        ])
+        writer = csv.DictWriter(f, fieldnames=fields)
         writer.writeheader()
 
     rt_list = _parse_list(reward_types, str)
@@ -780,6 +784,13 @@ def sweep(
                 "window": int(wv),
                 "min_hold_bars": int(mhv),
                 "cooldown_bars": int(cdv),
+                "position_penalty_bps": _safe_float(ppv),
+                "loss_hold_penalty_bps": _safe_float(lhv),
+                "cvar_alpha": _safe_float(cav),
+                "cvar_coef": _safe_float(ccv),
+                "max_position_bars": _safe_int(mpbv),
+                "turnover_penalty_bps": _safe_float(turnover_penalty_bps),
+                "extra_timeframes": ",".join(etf_list) if etf_list else "",
                 "reward_type": rt,
                 "ent_coef": _safe_float(ec),
                 "learning_rate": _safe_float(lr),
@@ -788,6 +799,9 @@ def sweep(
                 "fee_bps": _safe_float(fee),
                 "slippage_bps": _safe_float(slip),
                 "seed": _safe_int(sd),
+                "eval_timerange": str(eval_timerange),
+                "backtest_timerange": str(backtest_timerange or ""),
+                "exchange": str(exchange),
                 "final_equity": _safe_float(report.get("final_equity")),
                 "sharpe": _safe_float(report.get("sharpe")),
                 "max_drawdown": _safe_float(report.get("max_drawdown")),
@@ -802,7 +816,7 @@ def sweep(
                 "bt_run_id": str(bt_metrics.get("bt_run_id", "")) if auto_backtest else "",
             }
             with open(results_csv, "a", newline="") as f:
-                writer = csv.DictWriter(f, fieldnames=row.keys())
+                writer = csv.DictWriter(f, fieldnames=fields)
                 writer.writerow(row)
         except Exception as e:
             typer.echo(f"Trial failed: {tag} -> {e}")

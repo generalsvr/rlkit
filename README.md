@@ -117,6 +117,53 @@ python rl_trader.py validate --pair "BTC/USDT:USDT" --timeframe 1h \
 python rl_trader.py backtest --pair "BTC/USDT:USDT" --timeframe 1h   --window 128 --model-path /workspace/rlkit/models/x.zip  --device cuda --timerange 20250101-
 ```
 
+### 5) SWEEP
+
+```bash
+python rl_trader.py sweep \
+  --pair BTC/USDT:USDT \
+  --timeframe 1h \
+  --userdir /workspace/rlkit/freqtrade_userdir \
+  --timesteps 300000 \
+  --arch transformer_hybrid \
+  --device cuda \
+  --reward-types sharpe_proxy \
+  --ent-coefs 0.02 \
+  --lrs 0.0003 \
+  --n-steps-list 2048 \
+  --batch-sizes 256 \
+  --fee-list 6 \
+  --slip-list 2 \
+  --seeds 42 \
+  --extra-timeframes 4H,1D \
+  --turnover-penalty-bps 4 \
+  --feature-modes full \
+  --basic-lookback 128 \
+  --windows-list 128,192,256 \
+  --min-hold-bars-list 1,2 \
+  --cooldown-bars-list 2,3 \
+  --position-penalty-bps-list 1,2,3 \
+  --loss-hold-penalty-bps-list 1,2,3 \
+  --cvar-alpha-list 0.05 \
+  --cvar-coef-list 0.1,0.2,0.3 \
+  --max-position-bars-list 64,96,128 \
+  --eval-max-steps 4000 \
+  --eval-freq 49152 \
+  --eval-timerange 20240101-20250101 \
+  --early-stop-metric sharpe \
+  --early-stop-patience 3 \
+  --early-stop-min-delta 0.001 \
+  --early-stop-degrade-ratio 0.2 \
+  --auto-backtest \
+  --backtest-timerange 20250101- \
+  --backtest-exchange bybit \
+  --autofetch \
+  --timerange 20170101- \
+  --exchange bybit \
+  --outdir /workspace/rlkit/models/sweeps \
+  --max-trials 99999
+```
+
 ### Notes
 - Strategy file: `freqtrade_userdir/strategies/RLStrategy.py`
 - RL signals: `rl_lib/signal.py` produces `enter_long/exit_long/enter_short/exit_short` for Freqtrade.
