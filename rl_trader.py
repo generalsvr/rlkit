@@ -99,7 +99,7 @@ def _ensure_dataset(userdir: str, pair: str, timeframe: str, exchange: str, time
     exc_l = str(exchange).lower()
     last_err: Optional[Exception] = None
     for pv in variants:
-        # Base download cmd
+        # Base download cmd (no margin/trading-mode flags; not supported by download-data)
         cmd = [
             "freqtrade", "download-data",
             "--pairs", pv,
@@ -109,9 +109,6 @@ def _ensure_dataset(userdir: str, pair: str, timeframe: str, exchange: str, time
             "--exchange", exchange,
             "--data-format-ohlcv", fmt,
         ]
-        # Bybit futures heuristic
-        if exc_l == "bybit" and ":USDT" in pv:
-            cmd += ["--trading-mode", "futures", "--margin-mode", "isolated"]
         try:
             typer.echo(f"Downloading missing dataset: {' '.join(cmd)}")
             subprocess.run(cmd, check=True)
