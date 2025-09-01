@@ -527,7 +527,22 @@ def train_transformer_forecaster(params: ForecastTrainParams) -> Dict[str, Any]:
 
 
 def load_forecaster(bundle_path: str, device: str = "cuda") -> Tuple[CandleDecoder, Dict[str, Any]]:
-    ckpt = torch.load(bundle_path, map_location=device)
+    # PyTorch 2.6 changed default torch.load(weights_only=True). Handle robustly.
+    try:
+        ckpt = torch.load(bundle_path, map_location=device)
+    except Exception:
+        # Retry with safe globals and weights_only=False (only if you trust the source)
+        try:
+            try:
+                from torch.serialization import add_safe_globals  # type: ignore
+                import numpy as _np  # type: ignore
+                # Allowlist numpy reconstruct used by older numpy pickles
+                add_safe_globals([_np.core.multiarray._reconstruct])  # type: ignore
+            except Exception:
+                pass
+            ckpt = torch.load(bundle_path, map_location=device, weights_only=False)  # type: ignore[arg-type]
+        except Exception as e:
+            raise e
     arch = ckpt.get("arch", {})
     feature_cols: List[str] = ckpt["feature_columns"]
     target_cols: List[str] = ckpt["target_columns"]
