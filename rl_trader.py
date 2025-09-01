@@ -78,24 +78,54 @@ def download(
 
 
 def _ensure_dataset(userdir: str, pair: str, timeframe: str, exchange: str, timerange: str = "20190101-", fmt: str = "parquet"):
-    """Ensure dataset exists; if not, download via Freqtrade non-interactively."""
+    """Ensure dataset exists; if not, download via Freqtrade non-interactively.
+
+    Tries a few pair naming variants and, for Bybit futures, adds trading-mode flags.
+    """
     from rl_lib.train_sb3 import _find_data_file as _find
+    # Fast path
     hit = _find(userdir, pair, timeframe, prefer_exchange=exchange)
     if hit and os.path.exists(hit):
         return hit
+
     Path(userdir).mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "freqtrade", "download-data",
-        "--pairs", pair,
-        "--timeframes", timeframe,
-        "--userdir", userdir,
-        "--timerange", timerange,
-        "--exchange", exchange,
-        "--data-format-ohlcv", fmt,
-    ]
-    typer.echo(f"Downloading missing dataset: {' '.join(cmd)}")
-    subprocess.run(cmd, check=True)
-    # Try find again
+
+    # Pair variants
+    variants = {pair}
+    up = pair.upper()
+    if ":" not in pair and (up.endswith("/USDT") or up.endswith("_USDT")):
+        variants.add(f"{pair}:USDT")
+
+    exc_l = str(exchange).lower()
+    last_err: Optional[Exception] = None
+    for pv in variants:
+        # Base download cmd
+        cmd = [
+            "freqtrade", "download-data",
+            "--pairs", pv,
+            "--timeframes", timeframe,
+            "--userdir", userdir,
+            "--timerange", timerange,
+            "--exchange", exchange,
+            "--data-format-ohlcv", fmt,
+        ]
+        # Bybit futures heuristic
+        if exc_l == "bybit" and ":USDT" in pv:
+            cmd += ["--trading-mode", "futures", "--margin-mode", "isolated"]
+        try:
+            typer.echo(f"Downloading missing dataset: {' '.join(cmd)}")
+            subprocess.run(cmd, check=True)
+        except Exception as e:
+            last_err = e
+            continue
+        # Check after attempt
+        hit = _find(userdir, pv, timeframe, prefer_exchange=exchange)
+        if hit and os.path.exists(hit):
+            return hit
+
+    # Final attempt: return whatever was initially found (None) or raise
+    if last_err is not None:
+        typer.echo(f"Download attempts failed for variants {list(variants)}: {last_err}")
     return _find(userdir, pair, timeframe, prefer_exchange=exchange)
 
 
