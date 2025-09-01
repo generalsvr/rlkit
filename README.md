@@ -114,8 +114,7 @@ python rl_trader.py validate --pair "BTC/USDT:USDT" --timeframe 1h \
 
 ### 4) Backtest with RLStrategy
 ```bash
-python rl_trader.py backtest --pair "BTC/USDT:USDT" --timeframe 1h   --window 128 --model-path /workspace/rlkit/model
-s/x.zip  --device cuda --timerange 20250101-
+python rl_trader.py backtest --pair "BTC/USDT:USDT" --timeframe 1h   --window 128 --model-path /workspace/rlkit/models/x.zip  --device cuda --timerange 20250101-
 ```
 
 ### Notes

@@ -614,6 +614,10 @@ def sweep(
     auto_backtest: bool = typer.Option(True, help="Run freqtrade backtest per model"),
     backtest_timerange: str = typer.Option("", help="YYYYMMDD-YYYYMMDD for freqtrade backtests; empty uses training eval slice"),
     backtest_exchange: str = typer.Option("bybit"),
+    # Auto-download datasets
+    autofetch: bool = typer.Option(True, help="Auto-download missing datasets (1h,4h,1d,1w)"),
+    timerange: str = typer.Option("20190101-", help="Timerange for auto-download"),
+    exchange: str = typer.Option("bybit", help="Exchange name for dataset download and preference"),
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "sweeps")),
     max_trials: int = typer.Option(50, help="Hard cap to avoid huge grids"),
 ):
@@ -645,6 +649,15 @@ def sweep(
     cd_vals = _parse_list(cooldown_bars_list, int) if cooldown_bars_list else [cooldown_bars]
     fm_list = [m.strip() for m in feature_modes.split(",") if m.strip()] if feature_modes else [feature_mode]
 
+    # Ensure datasets exist if requested
+    if autofetch:
+        tfs = sorted(set([timeframe, "1h", "4h", "1d", "1w"]))
+        for tf in tfs:
+            try:
+                _ = _ensure_dataset(userdir, pair, tf, exchange=exchange, timerange=timerange)
+            except Exception as e:
+                typer.echo(f"Auto-download failed for {pair} {tf}: {e}")
+
     combos = list(product(rt_list, ec_list, lr_list, ns_list, bs_list, fee_vals, slip_vals, seed_vals, win_vals, mh_vals, cd_vals, fm_list))
     if len(combos) > max_trials:
         combos = combos[:max_trials]
@@ -663,6 +676,7 @@ def sweep(
             model_out_path=model_path,
             arch=arch,
             device=device,
+            prefer_exchange=exchange,
             fee_bps=fee,
             slippage_bps=slip,
             idle_penalty_bps=0.0,
