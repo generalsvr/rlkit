@@ -915,7 +915,7 @@ def forecast_train(
     model_out: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "forecaster.pt"), "--model-out", "--model_out"),
     # Auto-download
     autofetch: bool = typer.Option(True, help="Auto-download 1h,4h,1d,1w datasets if missing"),
-    timerange: str = typer.Option("20190101-", help="Timerange for auto-download"),
+    download_timerange: str = typer.Option("20190101-", help="Timerange for auto-download (YYYYMMDD-YYYYMMDD)"),
     exchange: str = typer.Option("bybit", help="Prefer this exchange's dataset when multiple exist"),
 ):
     """Train a Transformer decoder forecaster to predict next N candles (autoregressive)."""
@@ -926,7 +926,7 @@ def forecast_train(
         tfs = sorted(set([timeframe, "1h", "4h", "1d", "1w"]))
         for tf in tfs:
             try:
-                _ = _ensure_dataset(userdir, pair, tf, exchange=exchange, timerange=timerange)
+                _ = _ensure_dataset(userdir, pair, tf, exchange=exchange, timerange=download_timerange)
             except Exception as e:
                 typer.echo(f"Auto-download failed for {pair} {tf}: {e}")
 
