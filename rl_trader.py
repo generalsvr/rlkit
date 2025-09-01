@@ -614,6 +614,8 @@ def sweep(
     auto_backtest: bool = typer.Option(True, help="Run freqtrade backtest per model"),
     backtest_timerange: str = typer.Option("", help="YYYYMMDD-YYYYMMDD for freqtrade backtests; empty uses training eval slice"),
     backtest_exchange: str = typer.Option("bybit"),
+    # Validation slice after training
+    eval_timerange: str = typer.Option("20240101-20250101", help="Timerange for post-train validation report"),
     # Auto-download datasets
     autofetch: bool = typer.Option(True, help="Auto-download missing datasets (1h,4h,1d,1w)"),
     timerange: str = typer.Option("20190101-", help="Timerange for auto-download"),
@@ -709,7 +711,7 @@ def sweep(
         typer.echo(f"[{idx}/{len(combos)}] Training {tag}")
         try:
             _ = train_ppo_from_freqtrade_data(params)
-            report = validate_trained_model(params, max_steps=eval_max_steps, deterministic=True)
+            report = validate_trained_model(params, max_steps=eval_max_steps, deterministic=True, timerange=eval_timerange)
             bt_metrics: Dict[str, Any] = {}
             if auto_backtest:
                 bt_metrics = _run_freqtrade_backtest(
