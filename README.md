@@ -164,6 +164,17 @@ python rl_trader.py sweep \
   --max-trials 99999
 ```
 
+### 6) DECODER OHLCV
+
+```bash
+python rl_trader.py forecast_train \
+  --pair BTC/USDT --timeframe 1h \
+  --feature-mode ohlcv \
+  --window 128 --horizon 16 \
+  --epochs 20 --device cuda \
+  --model-out freqtrade_userdir/models/forecaster.pt
+```
+
 ### Notes
 - Strategy file: `freqtrade_userdir/strategies/RLStrategy.py`
 - RL signals: `rl_lib/signal.py` produces `enter_long/exit_long/enter_short/exit_short` for Freqtrade.

@@ -219,6 +219,7 @@ class ForecastTrainParams:
     basic_lookback: int = 64
     extra_timeframes: Optional[List[str]] = None
     timerange: Optional[str] = None
+    prefer_exchange: Optional[str] = None
 
     window: int = 128
     horizon: int = 16
@@ -383,7 +384,7 @@ def train_transformer_forecaster(params: ForecastTrainParams) -> Dict[str, Any]:
     torch.manual_seed(int(params.seed))
     np.random.seed(int(params.seed))
 
-    data_path = _find_data_file(params.userdir, params.pair, params.timeframe)
+    data_path = _find_data_file(params.userdir, params.pair, params.timeframe, prefer_exchange=params.prefer_exchange)
     if not data_path:
         raise FileNotFoundError(
             f"No dataset found for {params.pair} {params.timeframe} in {params.userdir}/data"
@@ -613,6 +614,7 @@ def evaluate_forecaster(
     make_animation: bool = False,
     anim_fps: int = 12,
     animation_mode: str = "next",  # 'next' (rolling next-step) | 'path' (rolling multistep path)
+    prefer_exchange: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Load a trained forecaster and evaluate on a validation slice.
@@ -630,7 +632,7 @@ def evaluate_forecaster(
     horizon: int = int(info.get("horizon") or 16)
 
     # Data
-    data_path = _find_data_file(userdir, pair, timeframe)
+    data_path = _find_data_file(userdir, pair, timeframe, prefer_exchange=prefer_exchange)
     if not data_path:
         raise FileNotFoundError("No dataset found for evaluation.")
     raw = _load_ohlcv(data_path)

@@ -913,10 +913,23 @@ def forecast_train(
     seed: int = typer.Option(42),
     # Output
     model_out: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "forecaster.pt"), "--model-out", "--model_out"),
+    # Auto-download
+    autofetch: bool = typer.Option(True, help="Auto-download 1h,4h,1d,1w datasets if missing"),
+    timerange: str = typer.Option("20190101-", help="Timerange for auto-download"),
+    exchange: str = typer.Option("bybit", help="Prefer this exchange's dataset when multiple exist"),
 ):
     """Train a Transformer decoder forecaster to predict next N candles (autoregressive)."""
     etf_list = [s.strip() for s in extra_timeframes.split(",") if s.strip()] if extra_timeframes else []
     tcols = [s.strip() for s in target_columns.split(",") if s.strip()] if target_columns else None
+    # Optional auto-download
+    if autofetch:
+        tfs = sorted(set([timeframe, "1h", "4h", "1d", "1w"]))
+        for tf in tfs:
+            try:
+                _ = _ensure_dataset(userdir, pair, tf, exchange=exchange, timerange=timerange)
+            except Exception as e:
+                typer.echo(f"Auto-download failed for {pair} {tf}: {e}")
+
     params = ForecastTrainParams(
         userdir=userdir,
         pair=pair,
@@ -942,6 +955,7 @@ def forecast_train(
         device=device,
         seed=seed,
         model_out_path=model_out,
+        prefer_exchange=exchange,
     )
     report = train_transformer_forecaster(params)
     typer.echo(json.dumps(report, default=lambda o: float(o) if hasattr(o, "__float__") else str(o)))
@@ -953,6 +967,7 @@ def forecast_eval(
     pair: str = typer.Option("BTC/USDT"),
     timeframe: str = typer.Option("1h"),
     userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    exchange: str = typer.Option("bybit", help="Prefer this exchange's dataset when multiple exist"),
     timerange: str = typer.Option("", help="YYYYMMDD-YYYYMMDD for evaluation slice"),
     feature_mode: str = typer.Option("full", help="full|basic|ohlcv"),
     basic_lookback: int = typer.Option(64),
@@ -981,6 +996,7 @@ def forecast_eval(
         make_animation=bool(make_animation),
         anim_fps=int(anim_fps),
         animation_mode=str(animation_mode),
+        prefer_exchange=exchange,
     )
     typer.echo(json.dumps(report, default=lambda o: float(o) if hasattr(o, "__float__") else str(o)))
 
