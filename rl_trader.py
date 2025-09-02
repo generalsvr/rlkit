@@ -675,7 +675,7 @@ def sweep(
     early_stop_degrade_ratio: float = typer.Option(0.0),
     # Auto backtest
     auto_backtest: bool = typer.Option(True, help="Run freqtrade backtest per model"),
-    backtest_timerange: str = typer.Option("", help="YYYYMMDD-YYYYMMDD for freqtrade backtests; empty uses training eval slice"),
+    backtest_timerange: str = typer.Option("20250101-", help="YYYYMMDD-YYYYMMDD for freqtrade backtests; default recent to speed up"),
     backtest_exchange: str = typer.Option("bybit"),
     # Validation slice after training
     eval_timerange: str = typer.Option("20240101-20250101", help="Timerange for post-train validation report"),
@@ -1011,6 +1011,7 @@ def tune(
     windows_list: str = typer.Option("", help="Comma-separated window sizes to search; empty uses defaults"),
     min_hold_bars_list: str = typer.Option("", help="Comma-separated min-hold values to search"),
     cooldown_bars_list: str = typer.Option("", help="Comma-separated cooldown values to search"),
+    idle_penalty_range: str = typer.Option("0.0,0.05", help="Range for idle_penalty_bps as 'low,high' for TPE/Random; grid uses fixed set"),
     # Fixed env knobs
     turnover_penalty_bps: float = typer.Option(1.0),
     min_hold_bars: int = typer.Option(2),
@@ -1095,6 +1096,14 @@ def tune(
         cvar_alpha = trial.suggest_categorical("cvar_alpha", [0.0, 0.01, 0.05]) if search_space != "minimal" else 0.0
         cvar_coef = trial.suggest_float("cvar_coef", 0.0, 2.0) if search_space == "wide" else 0.0
         max_position_bars = trial.suggest_categorical("max_position_bars", [0, 24, 48, 96]) if search_space != "minimal" else 0
+        # Idle penalty encourages not staying flat forever (drives trades)
+        try:
+            _lo, _hi = [float(x.strip()) for x in idle_penalty_range.split(',')[:2]]
+            if _lo > _hi:
+                _lo, _hi = _hi, _lo
+        except Exception:
+            _lo, _hi = 0.0, 0.05
+        idle_penalty_bps = trial.suggest_float("idle_penalty_bps", _lo, _hi) if search_space != "minimal" else 0.02
 
         # Features / window
         feature_mode = trial.suggest_categorical("feature_mode", ["basic", "full"]) if search_space != "minimal" else "basic"
@@ -1115,6 +1124,7 @@ def tune(
             "cvar_alpha": cvar_alpha,
             "cvar_coef": cvar_coef,
             "max_position_bars": max_position_bars,
+            "idle_penalty_bps": idle_penalty_bps,
             "feature_mode": feature_mode,
             "window": win,
             "min_hold_bars": min_hold,
@@ -1135,6 +1145,7 @@ def tune(
         "cvar_alpha": [0.0, 0.05],
         "cvar_coef": [0.0, 0.5],
         "max_position_bars": [0, 48],
+        "idle_penalty_bps": [0.0, 0.02, 0.05],
         "feature_mode": ["basic", "full"],
         "window": window_candidates if windows_list else [window],
         "min_hold_bars": min_hold_candidates if min_hold_bars_list else [min_hold_bars],
@@ -1174,6 +1185,8 @@ def tune(
             fee_bps=float(cfg["fee_bps"]),
             slippage_bps=float(cfg["slippage_bps"]),
             idle_penalty_bps=0.0,
+            # override with tuned idle penalty when present (kept default 0.0 for safety)
+            idle_penalty_bps=float(cfg.get("idle_penalty_bps", 0.0)),
             reward_type=str(cfg["reward_type"]),
             vol_lookback=20,
             turnover_penalty_bps=float(turnover_penalty_bps),
