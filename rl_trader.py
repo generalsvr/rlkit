@@ -993,6 +993,308 @@ def forecast_train(
 
 
 @app.command()
+def tune(
+    pair: str = typer.Option("BTC/USDT:USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    window: int = typer.Option(128),
+    timesteps: int = typer.Option(300_000),
+    arch: str = typer.Option("transformer_hybrid"),
+    device: str = typer.Option("cuda"),
+    # Search space toggles
+    search_space: str = typer.Option("default", help="default|minimal|wide"),
+    sampler: str = typer.Option("tpe", help="tpe|random|grid"),
+    n_trials: int = typer.Option(30, help="Number of trials (ignored for pure grid if grid > n_trials)"),
+    seed: int = typer.Option(42),
+    extra_timeframes: str = typer.Option("", help="Optional comma-separated HTFs for all trials"),
+    # Search ranges (overrides defaults when provided)
+    windows_list: str = typer.Option("", help="Comma-separated window sizes to search; empty uses defaults"),
+    min_hold_bars_list: str = typer.Option("", help="Comma-separated min-hold values to search"),
+    cooldown_bars_list: str = typer.Option("", help="Comma-separated cooldown values to search"),
+    # Fixed env knobs
+    turnover_penalty_bps: float = typer.Option(1.0),
+    min_hold_bars: int = typer.Option(2),
+    cooldown_bars: int = typer.Option(0),
+    # Eval and early stop
+    eval_max_steps: int = typer.Option(5000),
+    eval_freq: int = typer.Option(50000, help="Evaluate every N steps; enable >0 for early stopping"),
+    early_stop_metric: str = typer.Option("sharpe", help="sharpe|final_equity|max_drawdown"),
+    early_stop_patience: int = typer.Option(3),
+    early_stop_min_delta: float = typer.Option(0.0),
+    early_stop_degrade_ratio: float = typer.Option(0.0),
+    # Auto backtest
+    auto_backtest: bool = typer.Option(True, help="Run freqtrade backtest per model"),
+    backtest_timerange: str = typer.Option("", help="YYYYMMDD-YYYYMMDD for freqtrade backtests; empty uses training eval slice"),
+    backtest_exchange: str = typer.Option("bybit"),
+    # Validation slice after training
+    eval_timerange: str = typer.Option("20240101-20250101", help="Timerange for post-train validation report"),
+    # Auto-download datasets
+    autofetch: bool = typer.Option(True, help="Auto-download missing datasets (1h,4h,1d,1w)"),
+    timerange: str = typer.Option("20190101-", help="Timerange for auto-download"),
+    exchange: str = typer.Option("bybit", help="Exchange name for dataset download and preference"),
+    outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "optuna")),
+):
+    """Hyperparameter tuning using Optuna (TPE=Bayesian, Random, or Grid).
+
+    Optimizes PPO hyperparams and environment shaping. Stores per-trial artifacts and CSV.
+    """
+    try:
+        import optuna
+        from optuna.samplers import TPESampler, RandomSampler, GridSampler
+    except Exception as e:
+        raise RuntimeError("Optuna not installed. Run: pip install -r requirements.txt") from e
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    tune_dir = Path(outdir) / ts
+    tune_dir.mkdir(parents=True, exist_ok=True)
+    results_csv = tune_dir / "results.csv"
+    fields = [
+        "trial_number","value","model_path","feature_mode","window","min_hold_bars","cooldown_bars",
+        "position_penalty_bps","loss_hold_penalty_bps","cvar_alpha","cvar_coef","max_position_bars",
+        "turnover_penalty_bps","extra_timeframes","reward_type","ent_coef","learning_rate","n_steps","batch_size","fee_bps","slippage_bps","seed",
+        "eval_timerange","backtest_timerange","exchange",
+        "final_equity","sharpe","max_drawdown","time_in_position_frac",
+        "bt_total_profit_pct","bt_total_profit_abs","bt_total_trades","bt_win_rate","bt_profit_factor",
+        "bt_zip","bt_meta","bt_run_id"
+    ]
+    with open(results_csv, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+
+    etf_list = _parse_list(extra_timeframes, str) if extra_timeframes else []
+
+    # Ensure datasets exist if requested
+    if autofetch:
+        tfs = sorted(set([timeframe, "1h", "4h", "1d", "1w"]))
+        for tf in tfs:
+            try:
+                _ = _ensure_dataset(userdir, pair, tf, exchange=exchange, timerange=timerange)
+            except Exception as e:
+                typer.echo(f"Auto-download failed for {pair} {tf}: {e}")
+
+    # Candidate lists
+    window_candidates = _parse_list(windows_list, int) if windows_list else [64, 96, 128, 192, 256, 384]
+    min_hold_candidates = _parse_list(min_hold_bars_list, int) if min_hold_bars_list else [0, 1, 2, 3, 5, 8]
+    cooldown_candidates = _parse_list(cooldown_bars_list, int) if cooldown_bars_list else [0, 1, 2, 3, 5]
+
+    # Define search spaces
+    def suggest_space(trial):
+        # Core PPO
+        ent_coef = trial.suggest_float("ent_coef", 1e-4, 0.2, log=True)
+        learning_rate = trial.suggest_float("learning_rate", 1e-5, 5e-3, log=True)
+        n_steps = trial.suggest_categorical("n_steps", [512, 1024, 2048, 4096])
+        batch_size = trial.suggest_categorical("batch_size", [128, 256, 512, 1024])
+
+        # Reward/env shaping
+        reward_type = trial.suggest_categorical("reward_type", ["vol_scaled", "sharpe_proxy", "raw"]) if search_space != "minimal" else trial.suggest_categorical("reward_type", ["vol_scaled", "raw"]) 
+        fee_bps = trial.suggest_float("fee_bps", 1.0, 10.0) if search_space == "wide" else trial.suggest_categorical("fee_bps", [2.0, 6.0])
+        slippage_bps = trial.suggest_float("slippage_bps", 1.0, 15.0) if search_space == "wide" else trial.suggest_categorical("slippage_bps", [5.0, 10.0])
+
+        position_penalty_bps = trial.suggest_float("position_penalty_bps", 0.0, 5.0) if search_space != "minimal" else 0.0
+        loss_hold_penalty_bps = trial.suggest_float("loss_hold_penalty_bps", 0.0, 5.0) if search_space == "wide" else 0.0
+        cvar_alpha = trial.suggest_categorical("cvar_alpha", [0.0, 0.01, 0.05]) if search_space != "minimal" else 0.0
+        cvar_coef = trial.suggest_float("cvar_coef", 0.0, 2.0) if search_space == "wide" else 0.0
+        max_position_bars = trial.suggest_categorical("max_position_bars", [0, 24, 48, 96]) if search_space != "minimal" else 0
+
+        # Features / window
+        feature_mode = trial.suggest_categorical("feature_mode", ["basic", "full"]) if search_space != "minimal" else "basic"
+        win = trial.suggest_categorical("window", window_candidates) if search_space != "minimal" else window
+        min_hold = trial.suggest_categorical("min_hold_bars", min_hold_candidates) if search_space != "minimal" else min_hold_bars
+        cooldown = trial.suggest_categorical("cooldown_bars", cooldown_candidates) if search_space != "minimal" else cooldown_bars
+
+        return {
+            "ent_coef": ent_coef,
+            "learning_rate": learning_rate,
+            "n_steps": n_steps,
+            "batch_size": batch_size,
+            "reward_type": reward_type,
+            "fee_bps": fee_bps,
+            "slippage_bps": slippage_bps,
+            "position_penalty_bps": position_penalty_bps,
+            "loss_hold_penalty_bps": loss_hold_penalty_bps,
+            "cvar_alpha": cvar_alpha,
+            "cvar_coef": cvar_coef,
+            "max_position_bars": max_position_bars,
+            "feature_mode": feature_mode,
+            "window": win,
+            "min_hold_bars": min_hold,
+            "cooldown_bars": cooldown,
+        }
+
+    # Grid definitions for GridSampler
+    grid = {
+        "ent_coef": [0.01, 0.02, 0.05, 0.1],
+        "learning_rate": [3e-4, 5e-4, 1e-4],
+        "n_steps": [1024, 2048],
+        "batch_size": [256, 512],
+        "reward_type": ["vol_scaled", "sharpe_proxy", "raw"],
+        "fee_bps": [2.0, 6.0],
+        "slippage_bps": [5.0, 10.0],
+        "position_penalty_bps": [0.0, 1.0],
+        "loss_hold_penalty_bps": [0.0, 1.0],
+        "cvar_alpha": [0.0, 0.05],
+        "cvar_coef": [0.0, 0.5],
+        "max_position_bars": [0, 48],
+        "feature_mode": ["basic", "full"],
+        "window": window_candidates if windows_list else [window],
+        "min_hold_bars": min_hold_candidates if min_hold_bars_list else [min_hold_bars],
+        "cooldown_bars": cooldown_candidates if cooldown_bars_list else [cooldown_bars],
+    }
+
+    if sampler.lower() == "tpe":
+        smp = TPESampler(seed=seed)
+    elif sampler.lower() == "random":
+        smp = RandomSampler(seed=seed)
+    elif sampler.lower() == "grid":
+        smp = GridSampler(grid)
+    else:
+        raise typer.BadParameter("sampler must be tpe|random|grid")
+
+    def objective(trial: "optuna.trial.Trial") -> float:
+        cfg = suggest_space(trial) if not isinstance(smp, GridSampler) else {k: trial.suggest_categorical(k, v) for k, v in grid.items()}
+
+        tag = (
+            f"{arch}_fm-{cfg['feature_mode']}_win-{cfg['window']}"
+            f"_mh-{cfg['min_hold_bars']}_cd-{cfg['cooldown_bars']}"
+            f"_rt-{cfg['reward_type']}_ec-{cfg['ent_coef']}_lr-{cfg['learning_rate']}"
+            f"_ns-{cfg['n_steps']}_bs-{cfg['batch_size']}_fee-{cfg['fee_bps']}_slip-{cfg['slippage_bps']}_seed-{seed}"
+        )
+        model_path = str(tune_dir / f"{tag}.zip")
+
+        params = TrainParams(
+            userdir=userdir,
+            pair=pair,
+            timeframe=timeframe,
+            window=int(cfg["window"]),
+            total_timesteps=int(timesteps),
+            model_out_path=model_path,
+            arch=arch,
+            device=device,
+            prefer_exchange=exchange,
+            fee_bps=float(cfg["fee_bps"]),
+            slippage_bps=float(cfg["slippage_bps"]),
+            idle_penalty_bps=0.0,
+            reward_type=str(cfg["reward_type"]),
+            vol_lookback=20,
+            turnover_penalty_bps=float(turnover_penalty_bps),
+            dd_penalty=0.05 if cfg["reward_type"] == "sharpe_proxy" else 0.0,
+            position_penalty_bps=float(cfg["position_penalty_bps"]),
+            loss_hold_penalty_bps=float(cfg["loss_hold_penalty_bps"]),
+            cvar_alpha=float(cfg["cvar_alpha"]),
+            cvar_coef=float(cfg["cvar_coef"]),
+            max_position_bars=int(cfg["max_position_bars"]),
+            min_hold_bars=int(cfg["min_hold_bars"]),
+            cooldown_bars=int(cfg["cooldown_bars"]),
+            random_reset=True,
+            episode_max_steps=4096,
+            feature_mode=str(cfg["feature_mode"]),
+            basic_lookback=128 if str(cfg["feature_mode"]) == "basic" else 64,
+            extra_timeframes=etf_list or None,
+            eval_freq=eval_freq,
+            n_eval_episodes=1,
+            eval_max_steps=eval_max_steps,
+            eval_log_path=str(tune_dir / "eval_log.csv"),
+            seed=seed,
+            ent_coef=float(cfg["ent_coef"]),
+            learning_rate=float(cfg["learning_rate"]),
+            n_steps=int(cfg["n_steps"]),
+            batch_size=int(cfg["batch_size"]),
+            n_epochs=10,
+            early_stop_metric=(early_stop_metric or None),
+            early_stop_patience=int(early_stop_patience),
+            early_stop_min_delta=float(early_stop_min_delta),
+            early_stop_degrade_ratio=float(early_stop_degrade_ratio),
+        )
+
+        try:
+            _ = train_ppo_from_freqtrade_data(params)
+            report = validate_trained_model(params, max_steps=eval_max_steps, deterministic=True, timerange=eval_timerange)
+            bt_metrics: Dict[str, Any] = {}
+            if auto_backtest:
+                bt_metrics = _run_freqtrade_backtest(
+                    userdir=userdir,
+                    pair=pair,
+                    timeframe=timeframe,
+                    exchange=backtest_exchange,
+                    timerange=(backtest_timerange or (params.timerange or "")) or "",
+                    model_path=model_path,
+                    window=int(cfg["window"]),
+                    device=device,
+                    min_hold_bars=int(cfg["min_hold_bars"]),
+                    cooldown_bars=int(cfg["cooldown_bars"]),
+                )
+        except Exception as e:
+            typer.echo(f"Trial failed: {tag} -> {e}")
+            raise
+
+        # Choose objective: maximize Sharpe (Optuna minimizes by default -> return -sharpe)
+        sharpe = _safe_float(report.get("sharpe"))
+        value = sharpe if sharpe == sharpe else float("-inf")  # NaN guard
+
+        row = {
+            "trial_number": trial.number,
+            "value": float(value),
+            "model_path": model_path,
+            "feature_mode": str(cfg["feature_mode"]),
+            "window": int(cfg["window"]),
+            "min_hold_bars": int(cfg["min_hold_bars"]),
+            "cooldown_bars": int(cfg["cooldown_bars"]),
+            "position_penalty_bps": _safe_float(cfg["position_penalty_bps"]),
+            "loss_hold_penalty_bps": _safe_float(cfg["loss_hold_penalty_bps"]),
+            "cvar_alpha": _safe_float(cfg["cvar_alpha"]),
+            "cvar_coef": _safe_float(cfg["cvar_coef"]),
+            "max_position_bars": _safe_int(cfg["max_position_bars"]),
+            "turnover_penalty_bps": _safe_float(turnover_penalty_bps),
+            "extra_timeframes": ",".join(etf_list) if etf_list else "",
+            "reward_type": str(cfg["reward_type"]),
+            "ent_coef": _safe_float(cfg["ent_coef"]),
+            "learning_rate": _safe_float(cfg["learning_rate"]),
+            "n_steps": _safe_int(cfg["n_steps"]),
+            "batch_size": _safe_int(cfg["batch_size"]),
+            "fee_bps": _safe_float(cfg["fee_bps"]),
+            "slippage_bps": _safe_float(cfg["slippage_bps"]),
+            "seed": _safe_int(seed),
+            "eval_timerange": str(eval_timerange),
+            "backtest_timerange": str(backtest_timerange or ""),
+            "exchange": str(exchange),
+            "final_equity": _safe_float(report.get("final_equity")),
+            "sharpe": _safe_float(report.get("sharpe")),
+            "max_drawdown": _safe_float(report.get("max_drawdown")),
+            "time_in_position_frac": _safe_float(report.get("time_in_position_frac")),
+            "bt_total_profit_pct": _safe_float(bt_metrics.get("bt_total_profit_pct")) if auto_backtest else float("nan"),
+            "bt_total_profit_abs": _safe_float(bt_metrics.get("bt_total_profit_abs")) if auto_backtest else float("nan"),
+            "bt_total_trades": _safe_int(bt_metrics.get("bt_total_trades")) if auto_backtest else 0,
+            "bt_win_rate": _safe_float(bt_metrics.get("bt_win_rate")) if auto_backtest else float("nan"),
+            "bt_profit_factor": _safe_float(bt_metrics.get("bt_profit_factor")) if auto_backtest else float("nan"),
+            "bt_zip": str(bt_metrics.get("bt_zip", "")) if auto_backtest else "",
+            "bt_meta": str(bt_metrics.get("bt_meta", "")) if auto_backtest else "",
+            "bt_run_id": str(bt_metrics.get("bt_run_id", "")) if auto_backtest else "",
+        }
+        with open(results_csv, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writerow(row)
+
+        # Optuna maximizes when direction='maximize'
+        return value
+
+    study = optuna.create_study(direction="maximize", sampler=smp)
+    typer.echo(f"Starting Optuna study: {study.study_name} -> dir {tune_dir}")
+    if isinstance(smp, GridSampler):
+        grid_size = 1
+        for v in grid.values():
+            grid_size *= max(1, len(v))
+        study.optimize(objective, n_trials=grid_size)
+    else:
+        study.optimize(objective, n_trials=n_trials)
+
+    # Save best params
+    with open(tune_dir / "best_params.json", "w") as f:
+        json.dump(study.best_params, f, indent=2)
+    with open(tune_dir / "best_value.txt", "w") as f:
+        f.write(str(study.best_value))
+    typer.echo(f"Best value: {study.best_value}\nBest params: {json.dumps(study.best_params)}")
+
+@app.command()
 def forecast_eval(
     model_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "forecaster.pt"), "--model-path", "--model_path"),
     pair: str = typer.Option("BTC/USDT"),

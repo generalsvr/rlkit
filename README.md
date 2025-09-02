@@ -164,6 +164,31 @@ python rl_trader.py sweep \
   --max-trials 99999
 ```
 
+### 5b) Optuna Tuning (Bayesian/Random/Grid)
+
+Bayesian (TPE) example:
+```bash
+python rl_trader.py tune \
+  --pair BTC/USDT:USDT --timeframe 1h \
+  --userdir /workspace/rlkit/freqtrade_userdir \
+  --timesteps 300000 --arch transformer_hybrid --device cuda \
+  --sampler tpe --n-trials 30 --seed 42 \
+  --eval-max-steps 4000 --eval-freq 49152 \
+  --early-stop-metric sharpe --early-stop-patience 3 \
+  --auto-backtest --backtest-exchange bybit \
+  --outdir /workspace/rlkit/models/optuna
+```
+
+Grid search with Optuna's GridSampler:
+```bash
+python rl_trader.py tune --sampler grid --n-trials 999999 \
+  --pair BTC/USDT:USDT --timeframe 1h --userdir /workspace/rlkit/freqtrade_userdir \
+  --timesteps 300000 --device cuda --arch transformer_hybrid
+```
+
+Outputs:
+- Per-trial models, `results.csv`, `best_params.json`, and `best_value.txt` under `models/optuna/<timestamp>/`.
+
 ### 6) DECODER OHLCV
 
 ```bash
@@ -173,21 +198,13 @@ python rl_trader.py forecast_train \
   --window 128 --horizon 16 \
   --epochs 20 --device cuda \
   --model-out freqtrade_userdir/models/forecaster.pt
+  
 ```
 
 ### 7. LOGRET
 
 ```bash
-python rl_trader.py forecast-train \
-  --pair BTC/USDT --timeframe 15m \
-  --feature-mode full --extra-timeframes 1h,4h,1D \
-  --target-mode logret \
-  --window 512 --horizon 4 \
-  --d-model 128 --nhead 4 --num-encoder-layers 2 --num-decoder-layers 2 --ff-dim 256 \
-  --dropout 0.3 --weight-decay 0.003 \
-  --learning-rate 1e-4 --batch-size 512 --epochs 8 --device cuda \
-  --autofetch --exchange bybit --download-timerange 20160101- \
-  --model-out freqtrade_userdir/models/forecaster_15m_logret.pt
+python rl_trader.py forecast-train   --pair BTC/USDT --timeframe 15m   --feature-mode full --extra-timeframes 1h,4h,1D   --target-mode logret --forecast-arch decoder_only   --window 512 --horizon 4   --d-model 128 --nhead 4 --num-encoder-layers 2 --num-decoder-layers 2 --ff-dim 256   --dropout 0.3 --weight-decay 0.003 --learning-rate 1e-4 --batch-size 512 --epochs 10 --device cuda   --autofetch --exchange bybit --download-timerange 20160101-   --model-out freqtrade_userdir/models/forecaster_15m_logret_decoder.pt
 ```
 
 ### Notes
