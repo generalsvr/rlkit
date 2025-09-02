@@ -1184,7 +1184,6 @@ def tune(
             prefer_exchange=exchange,
             fee_bps=float(cfg["fee_bps"]),
             slippage_bps=float(cfg["slippage_bps"]),
-            idle_penalty_bps=0.0,
             # override with tuned idle penalty when present (kept default 0.0 for safety)
             idle_penalty_bps=float(cfg.get("idle_penalty_bps", 0.0)),
             reward_type=str(cfg["reward_type"]),
