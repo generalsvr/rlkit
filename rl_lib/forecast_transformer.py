@@ -336,6 +336,11 @@ class ForecastTrainParams:
     seed: int = 42
 
     model_out_path: str = "models/forecaster.pt"
+    # Early stopping / LR scheduling
+    early_stop_patience: int = 0
+    lr_plateau_patience: int = 0
+    lr_factor: float = 0.5
+    min_lr: float = 1e-6
     # Training control
     early_stop_patience: int = 0
     lr_plateau_patience: int = 2
@@ -531,19 +536,30 @@ def train_transformer_forecaster(params: ForecastTrainParams) -> Dict[str, Any]:
     valid_loader = DataLoader(valid_ds, batch_size=int(params.batch_size), shuffle=False, drop_last=False)
 
     opt = torch.optim.AdamW(model.parameters(), lr=float(params.learning_rate), weight_decay=float(params.weight_decay))
-    # Prefer new torch.amp API when available; fallback for older torch
+    # AMP scaler
     try:
         scaler = torch.amp.GradScaler("cuda", enabled=(params.device.startswith("cuda") and torch.cuda.is_available()))
         use_new_amp = True
     except Exception:
         scaler = torch.cuda.amp.GradScaler(enabled=(params.device.startswith("cuda") and torch.cuda.is_available()))
         use_new_amp = False
-    loss_fn = nn.SmoothL1Loss()  # Huber for robustness
+    loss_fn = nn.SmoothL1Loss()
 
     best_val = float("inf")
     best_ckpt: Optional[Dict[str, Any]] = None
+    no_improve = 0
+    # Optional LR scheduler
+    scheduler = None
+    if int(getattr(params, "lr_plateau_patience", 0)) > 0:
+        try:
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                opt, mode="min", factor=float(params.lr_factor), patience=int(params.lr_plateau_patience),
+                min_lr=float(params.min_lr), verbose=False
+            )
+        except Exception:
+            scheduler = None
 
-    # Diagnostics at start
+    # Diagnostics
     try:
         num_params = sum(p.numel() for p in model.parameters())
     except Exception:
@@ -559,14 +575,11 @@ def train_transformer_forecaster(params: ForecastTrainParams) -> Dict[str, Any]:
         grad_norm_sum = 0.0
         grad_norm_cnt = 0
         for batch in train_loader:
-            x = batch["x"].to(device)  # (B, T, F)
-            y = batch["y"].to(device)  # (B, H, D)
+            x = batch["x"].to(device)
+            y = batch["y"].to(device)
             y_in = _prepare_decoder_inputs(y)
             opt.zero_grad(set_to_none=True)
-            if use_new_amp:
-                ctx = torch.amp.autocast("cuda", enabled=scaler.is_enabled())
-            else:
-                ctx = torch.cuda.amp.autocast(enabled=scaler.is_enabled())
+            ctx = torch.amp.autocast("cuda", enabled=scaler.is_enabled()) if use_new_amp else torch.cuda.amp.autocast(enabled=scaler.is_enabled())
             with ctx:
                 y_hat = model(x, y_in)
                 loss = loss_fn(y_hat, y)
@@ -589,7 +602,6 @@ def train_transformer_forecaster(params: ForecastTrainParams) -> Dict[str, Any]:
         model.eval()
         val_loss = 0.0
         val_batches = 0
-        # Denorm per-horizon close MSE@1 and @H
         close_idx = target_cols.index("close") if "close" in target_cols else 0
         mse1_sum = 0.0
         mseH_sum = 0.0
@@ -603,7 +615,6 @@ def train_transformer_forecaster(params: ForecastTrainParams) -> Dict[str, Any]:
                 loss = loss_fn(y_hat, y)
                 val_loss += float(loss.item())
                 val_batches += 1
-                # Denormalize close for MSE@1 and @H
                 try:
                     y_dn = (y.cpu().numpy() * valid_ds.target_std) + valid_ds.target_mu
                     yhat_dn = (y_hat.cpu().numpy() * valid_ds.target_std) + valid_ds.target_mu
@@ -613,7 +624,6 @@ def train_transformer_forecaster(params: ForecastTrainParams) -> Dict[str, Any]:
                 except Exception:
                     pass
         avg_val = val_loss / max(1, val_batches)
-        # Learning rate (assumes single group)
         try:
             curr_lr = float(opt.param_groups[0]["lr"]) if opt.param_groups else float(params.learning_rate)
         except Exception:
@@ -632,28 +642,23 @@ def train_transformer_forecaster(params: ForecastTrainParams) -> Dict[str, Any]:
                 "target_std": train_ds.target_std,
             }
             best_marker = "*"
-            no_improve = 0 if 'no_improve' in locals() else 0
+            no_improve = 0
         else:
-            no_improve = (no_improve + 1) if 'no_improve' in locals() else 1
+            no_improve += 1
         epoch_secs = time.time() - epoch_t0
         print(
             f"EPOCH {epoch+1}/{params.epochs} train={avg_train:.6f} valid={avg_val:.6f}{best_marker} "
             f"mse1_close={mse1:.2f} mseH_close={mseH:.2f} grad_norm={avg_gn:.2f} lr={curr_lr:.6g} secs={epoch_secs:.1f}"
         )
 
-        # LR scheduler on plateau
-        try:
-            if 'scheduler' not in locals():
-                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                    opt, mode="min", factor=float(params.lr_factor), patience=int(params.lr_plateau_patience),
-                    min_lr=float(params.min_lr), verbose=False
-                )
-            scheduler.step(avg_val)
-        except Exception:
-            pass
-
+        # LR scheduler step
+        if scheduler is not None:
+            try:
+                scheduler.step(avg_val)
+            except Exception:
+                pass
         # Early stopping
-        if int(getattr(params, 'early_stop_patience', 0)) > 0 and no_improve >= int(params.early_stop_patience):
+        if int(getattr(params, "early_stop_patience", 0)) > 0 and no_improve >= int(params.early_stop_patience):
             print(f"EARLY STOP: no improvement for {no_improve} epochs (best={best_val:.6f})")
             break
 
