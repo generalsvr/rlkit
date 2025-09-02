@@ -940,6 +940,11 @@ def forecast_train(
     grad_clip_norm: float = typer.Option(1.0),
     device: str = typer.Option("cuda", help="cuda|cpu"),
     seed: int = typer.Option(42),
+    # Early stop / LR schedule
+    early_stop_patience: int = typer.Option(0, help="Stop if no val improvement for N epochs (0=off)"),
+    lr_plateau_patience: int = typer.Option(0, help="Reduce LR on plateau after N epochs (0=off)"),
+    lr_factor: float = typer.Option(0.5, help="LR reduction factor on plateau"),
+    min_lr: float = typer.Option(1e-6, help="Minimum learning rate for scheduler"),
     # Output
     model_out: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "forecaster.pt"), "--model-out", "--model_out"),
     # Auto-download
@@ -987,6 +992,10 @@ def forecast_train(
         seed=seed,
         model_out_path=model_out,
         prefer_exchange=exchange,
+        early_stop_patience=int(early_stop_patience),
+        lr_plateau_patience=int(lr_plateau_patience),
+        lr_factor=float(lr_factor),
+        min_lr=float(min_lr),
     )
     report = train_transformer_forecaster(params)
     typer.echo(json.dumps(report, default=lambda o: float(o) if hasattr(o, "__float__") else str(o)))
