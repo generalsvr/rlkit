@@ -1642,62 +1642,34 @@ def xgb_tune(
         if X_train.empty or X_val.empty:
             return float("-inf")
 
-        # Use native Booster API for maximum compatibility across XGBoost versions
-        params_native = {
-            "objective": "reg:squarederror",
-            "device": dev,
-            "tree_method": "hist",
-            "eta": float(cfg["learning_rate"]),
-            "max_depth": int(cfg["max_depth"]),
-            "min_child_weight": float(cfg["min_child_weight"]),
-            "subsample": float(cfg["subsample"]),
-            "colsample_bytree": float(cfg["colsample_bytree"]),
-            "reg_alpha": float(cfg["reg_alpha"]),
-            "reg_lambda": float(cfg["reg_lambda"]),
-            "eval_metric": "rmse",
-            "nthread": (int(n_jobs) if int(n_jobs) > 0 else -1),
-        }
+        model = xgb.XGBRegressor(
+            objective="reg:squarederror",
+            tree_method="hist",
+            random_state=int(seed),
+            n_jobs=(int(n_jobs) if int(n_jobs) > 0 else -1),
+            device=dev,
+            learning_rate=float(cfg["learning_rate"]),
+            max_depth=int(cfg["max_depth"]),
+            min_child_weight=float(cfg["min_child_weight"]),
+            subsample=float(cfg["subsample"]),
+            colsample_bytree=float(cfg["colsample_bytree"]),
+            reg_alpha=float(cfg["reg_alpha"]),
+            reg_lambda=float(cfg["reg_lambda"]),
+            n_estimators=int(cfg["n_estimators"]),
+        )
         try:
-            # Prefer QuantileDMatrix on GPU; fallback to DMatrix
-            try:
-                dtrain = xgb.QuantileDMatrix(X_train.values, y_train)
-                dvalid = xgb.QuantileDMatrix(X_val.values, y_val)
-            except Exception:
-                dtrain = xgb.DMatrix(X_train.values, label=y_train)
-                dvalid = xgb.DMatrix(X_val.values, label=y_val)
-            callbacks = []
-            try:
-                callbacks = [xgb.callback.EarlyStopping(rounds=50, save_best=True)]
-            except Exception:
-                callbacks = []
-            booster = xgb.train(
-                params_native,
-                dtrain,
-                num_boost_round=int(cfg["n_estimators"]),
-                evals=[(dvalid, "eval")],
-                callbacks=callbacks if callbacks else None,
-                verbose_eval=False,
+            model.fit(
+                X_train.values, y_train,
+                eval_set=[(X_val.values, y_val)],
+                eval_metric="rmse",
+                verbose=False,
+                early_stopping_rounds=50,
             )
         except Exception as e:
             typer.echo(f"Trial fit failed: {e}")
             return float("-inf")
 
-        # Predict with best iteration if available
-        try:
-            best_it = int(getattr(booster, "best_iteration", -1))
-        except Exception:
-            best_it = -1
-        try:
-            dvalid_pred = xgb.DMatrix(X_val.values)
-        except Exception:
-            dvalid_pred = dvalid
-        try:
-            if best_it is not None and best_it >= 0:
-                y_pred = booster.predict(dvalid_pred, iteration_range=(0, best_it + 1))
-            else:
-                y_pred = booster.predict(dvalid_pred)
-        except Exception:
-            y_pred = booster.predict(dvalid_pred)
+        y_pred = model.predict(X_val.values)
         ic_s = _ic(y_val, y_pred, method="spearman")
         ic_p = _ic(y_val, y_pred, method="pearson")
         import numpy as _np2
@@ -1715,7 +1687,7 @@ def xgb_tune(
         model_path = str(tune_dir / f"xgb_{tag}.json")
         try:
             if value > float(best.get("value", float("-inf"))):
-                booster.save_model(model_path)
+                model.save_model(model_path)
                 feat_cols_path = str(Path(model_path).with_suffix("").as_posix()) + "_feature_columns.json"
                 with open(feat_cols_path, "w") as f:
                     json.dump(list(X.columns), f)

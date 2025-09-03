@@ -418,8 +418,7 @@ def make_features(
             for tf in extra_timeframes:
                 try:
                     tf_str = str(tf).upper()
-                    # Normalize pandas resample aliases (e.g., weekly must be 'W' not 'w')
-                    resample_tf = tf_str.upper()
+                    resample_tf = tf_str.lower()
                     agg = {
                         "open": "first",
                         "high": "max",
