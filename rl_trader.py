@@ -1061,7 +1061,7 @@ def tune(
     tune_dir.mkdir(parents=True, exist_ok=True)
     results_csv = tune_dir / "results.csv"
     fields = [
-        "trial_number","value","model_path","feature_mode","window","min_hold_bars","cooldown_bars",
+        "trial_number","value","model_path","feature_mode","features_used","window","min_hold_bars","cooldown_bars",
         "position_penalty_bps","loss_hold_penalty_bps","cvar_alpha","cvar_coef","max_position_bars",
         "turnover_penalty_bps","extra_timeframes","reward_type","ent_coef","learning_rate","n_steps","batch_size","fee_bps","slippage_bps","seed",
         "eval_timerange","backtest_timerange","exchange",
@@ -1319,6 +1319,7 @@ def tune(
             "value": float(value),
             "model_path": model_path,
             "feature_mode": str(cfg["feature_mode"]),
+            "features_used": ",".join(list(cfg.get("feature_whitelist", []))) if cfg.get("feature_whitelist") else "",
             "window": int(cfg["window"]),
             "min_hold_bars": int(cfg["min_hold_bars"]),
             "cooldown_bars": int(cfg["cooldown_bars"]),
