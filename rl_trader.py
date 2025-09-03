@@ -1642,12 +1642,11 @@ def xgb_tune(
         if X_train.empty or X_val.empty:
             return float("-inf")
 
-        model = xgb.XGBRegressor(
+        # Build model with broad version compatibility (XGBoost >=2 uses 'device', older uses 'gpu_hist')
+        base_params = dict(
             objective="reg:squarederror",
-            tree_method="hist",
             random_state=int(seed),
             n_jobs=(int(n_jobs) if int(n_jobs) > 0 else -1),
-            device=dev,
             learning_rate=float(cfg["learning_rate"]),
             max_depth=int(cfg["max_depth"]),
             min_child_weight=float(cfg["min_child_weight"]),
@@ -1656,15 +1655,46 @@ def xgb_tune(
             reg_alpha=float(cfg["reg_alpha"]),
             reg_lambda=float(cfg["reg_lambda"]),
             n_estimators=int(cfg["n_estimators"]),
+            eval_metric="rmse",
         )
+        # Prefer 'device' if available
+        model = None
         try:
+            params_try = base_params.copy()
+            params_try["device"] = dev
+            # Use fast histogram algorithm by default
+            params_try["tree_method"] = "hist"
+            model = xgb.XGBRegressor(**params_try)
+        except TypeError:
+            # Fallback for pre-2.0: use gpu_hist for CUDA
+            params_try = base_params.copy()
+            params_try["tree_method"] = ("gpu_hist" if dev == "cuda" else "hist")
+            model = xgb.XGBRegressor(**params_try)
+        except Exception as e:
+            typer.echo(f"XGB model init failed: {e}")
+            return float("-inf")
+
+        # Early stopping via callbacks (preferred), with fallback to legacy arg
+        try:
+            cb = [xgb.callback.EarlyStopping(rounds=50, save_best=True)]
             model.fit(
                 X_train.values, y_train,
                 eval_set=[(X_val.values, y_val)],
-                eval_metric="rmse",
+                callbacks=cb,
                 verbose=False,
-                early_stopping_rounds=50,
             )
+        except TypeError:
+            # Older API without callbacks
+            try:
+                model.fit(
+                    X_train.values, y_train,
+                    eval_set=[(X_val.values, y_val)],
+                    early_stopping_rounds=50,
+                    verbose=False,
+                )
+            except Exception as e:
+                typer.echo(f"Trial fit failed: {e}")
+                return float("-inf")
         except Exception as e:
             typer.echo(f"Trial fit failed: {e}")
             return float("-inf")
