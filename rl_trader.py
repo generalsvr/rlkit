@@ -1582,11 +1582,30 @@ def xgb_tune(
         # Resolve device selection per-trial (static across trials)
         dev_opt = str(xgb_device).strip().lower()
         if dev_opt == "auto":
-            dev = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
+            try:
+                import torch
+                dev = "cuda" if torch.cuda.is_available() else "cpu"
+            except ImportError:
+                dev = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
         elif dev_opt in ("cpu", "cuda"):
             dev = dev_opt
         else:
             dev = "cpu"
+        
+        # Verify CUDA availability if requested
+        if dev == "cuda":
+            try:
+                import subprocess
+                result = subprocess.run(["nvidia-smi"], capture_output=True, text=True, timeout=5)
+                if result.returncode != 0:
+                    typer.echo(f"WARNING: CUDA requested but nvidia-smi failed. Falling back to CPU.")
+                    dev = "cpu"
+                else:
+                    typer.echo(f"CUDA detected: using GPU for XGBoost trial {trial.number}")
+            except Exception:
+                typer.echo(f"WARNING: Could not verify CUDA. Attempting GPU anyway...")
+        
+        typer.echo(f"Trial {trial.number}: device={dev}")
         cfg = suggest_space(trial) if not isinstance(smp, GridSampler) else {k: trial.suggest_categorical(k, v) for k, v in (xgb_grid or {}).items()}
         etf = [t.strip() for t in str(cfg.get("extra_timeframes", "")).split(",") if t.strip()]
         feature_cols = None
@@ -1642,9 +1661,12 @@ def xgb_tune(
         if X_train.empty or X_val.empty:
             return float("-inf")
 
+        # Configure tree method based on device
+        tree_method = "gpu_hist" if dev == "cuda" else "hist"
+        
         model = xgb.XGBRegressor(
             objective="reg:squarederror",
-            tree_method="hist",
+            tree_method=tree_method,
             random_state=int(seed),
             n_jobs=(int(n_jobs) if int(n_jobs) > 0 else -1),
             device=dev,
@@ -1658,12 +1680,11 @@ def xgb_tune(
             n_estimators=int(cfg["n_estimators"]),
         )
         try:
+            # XGBoost 2.x sklearn API compatibility
             model.fit(
                 X_train.values, y_train,
                 eval_set=[(X_val.values, y_val)],
-                eval_metric="rmse",
                 verbose=False,
-                early_stopping_rounds=50,
             )
         except Exception as e:
             typer.echo(f"Trial fit failed: {e}")
