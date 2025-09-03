@@ -1379,6 +1379,367 @@ def tune(
     typer.echo(f"Best value: {study.best_value}\nBest params: {json.dumps(study.best_params)}")
 
 @app.command()
+def xgb_tune(
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    # Data
+    timerange: str = typer.Option("20190101-", help="YYYYMMDD-YYYYMMDD slice for dataset"),
+    exchange: str = typer.Option("bybit", help="Prefer this exchange's dataset when multiple exist"),
+    eval_timerange: str = typer.Option("", help="Optional explicit validation slice YYYYMMDD-YYYYMMDD; train is before start"),
+    train_ratio: float = typer.Option(0.8, help="Train fraction if eval_timerange not set"),
+    feature_mode: str = typer.Option("full", help="full|basic for feature generation"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("", help="Optional HTFs, e.g., '4H,1D' or multiple options with ';'"),
+    horizon: int = typer.Option(1, help="Predict sum of next H log-returns (H>=1)"),
+    # Search
+    sampler: str = typer.Option("tpe", help="tpe|random|grid"),
+    n_trials: int = typer.Option(40, help="Number of trials (grid uses its own size)"),
+    seed: int = typer.Option(42),
+    optimize_features: bool = typer.Option(True, help="Search per-feature subset from hand-made features"),
+    max_features: int = typer.Option(0, help="Cap number of selected features (0=no cap)"),
+    ic_metric: str = typer.Option("spearman", help="IC metric: spearman|pearson"),
+    n_jobs: int = typer.Option(0, help="Threads for XGBoost; 0=all cores"),
+    autofetch: bool = typer.Option(True, help="Auto-download dataset if missing"),
+    outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_optuna")),
+):
+    """Optuna tuning for XGBoost on hand-made features, optimizing validation IC.
+
+    Trains a fast GBT regressor to predict next-H log return. Objective is IC on
+    a held-out validation set (Spearman by default). Also searches a feature subset.
+    """
+    try:
+        import optuna
+        from optuna.samplers import TPESampler, RandomSampler, GridSampler
+    except Exception as e:
+        raise RuntimeError("Optuna not installed. Run: pip install -r requirements.txt") from e
+    try:
+        import numpy as np  # type: ignore
+        import pandas as pd  # type: ignore
+        import xgboost as xgb  # type: ignore
+    except Exception as e:
+        raise RuntimeError("Missing deps. Install xgboost, numpy, pandas.") from e
+
+    # Resolve optional extra timeframe candidates (mirrors PPO tuner)
+    etf_list_fixed = _parse_list(extra_timeframes, str) if extra_timeframes else []
+    if extra_timeframes and ";" in extra_timeframes:
+        etf_candidates_str = [
+            ",".join([t.strip().lower() for t in opt.split(",") if t.strip()])
+            for opt in extra_timeframes.split(";") if opt.strip()
+        ]
+    elif extra_timeframes:
+        etf_candidates_str = [
+            ",".join([t.strip().lower() for t in extra_timeframes.split(",") if t.strip()])
+        ]
+    else:
+        etf_candidates_str = ["", "4h", "1d", "4h,1d", "4h,1d,1w"]
+
+    # Ensure dataset exists (optional)
+    if autofetch:
+        try:
+            _ = _ensure_dataset(userdir, pair, timeframe, exchange=exchange, timerange=timerange)
+        except Exception as e:
+            typer.echo(f"Auto-download failed for {pair} {timeframe}: {e}")
+
+    # Locate and load
+    data_path = _find_data_file_internal(userdir, pair, timeframe, prefer_exchange=exchange)
+    if not data_path:
+        raise FileNotFoundError("No dataset found. Run download or set correct userdir/pair/timeframe.")
+    raw = _load_ohlcv_internal(data_path)
+
+    # Helper: timerange slicing
+    def _slice_df(df, tr: str | None):
+        if not tr:
+            return df
+        try:
+            start_str, end_str = tr.split('-', 1)
+            import pandas as _pd
+            start = _pd.to_datetime(start_str) if start_str else None
+            end = _pd.to_datetime(end_str) if end_str else None
+            if isinstance(df.index, _pd.DatetimeIndex):
+                idx = df.index
+                try:
+                    idx_cmp = idx.tz_convert(None) if idx.tz is not None else idx
+                except Exception:
+                    idx_cmp = idx.tz_localize(None) if getattr(idx, 'tz', None) is not None else idx
+                import pandas as _pd2
+                mask = _pd2.Series(True, index=idx)
+                if start is not None:
+                    mask &= idx_cmp >= _pd2.to_datetime(start)
+                if end is not None:
+                    mask &= idx_cmp <= _pd2.to_datetime(end)
+                return df.loc[mask]
+        except Exception:
+            return df
+        return df
+
+    raw = _slice_df(raw, timerange)
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    tune_dir = Path(outdir) / ts
+    tune_dir.mkdir(parents=True, exist_ok=True)
+    results_csv = tune_dir / "results.csv"
+    fields = [
+        "trial_number","value","ic_spearman","ic_pearson","mse","acc_dir",
+        "features_used","feature_mode","extra_timeframes","horizon","seed",
+        "learning_rate","max_depth","min_child_weight","subsample","colsample_bytree","reg_alpha","reg_lambda","n_estimators",
+        "eval_start","eval_end","model_path"
+    ]
+    with open(results_csv, "w", newline="") as f:
+        csv.DictWriter(f, fieldnames=fields).writeheader()
+
+    # Candidate per-feature whitelist (hand-made features from features.py)
+    base_feature_list = [
+        "logret","hl_range","upper_wick","lower_wick","rsi","vol_z","atr","ret_std_14","hurst","tail_alpha","risk_gate","ema_fast_ratio","ema_slow_ratio",
+        "sma_ratio","ema_cross_angle","lr_slope_90","macd_line","macd_signal","stoch_k","stoch_d","roc_10",
+        "bb_width_20","donchian_width_20","true_range_pct","vol_skewness_30","volatility_regime",
+        "obv_z","volume_delta_z","vwap_ratio_20",
+        "candle_body_frac","upper_shadow_frac","lower_shadow_frac","candle_trend_persistence","kurtosis_rolling_100",
+        "dfa_exponent_64","entropy_return_64",
+        "drawdown_z_64","expected_shortfall_0_05_128",
+        "MA365D","MA200D","MA50D","MA20W",
+    ]
+
+    # Build sampler
+    xgb_grid = None
+    if sampler.lower() == "tpe":
+        smp = TPESampler(seed=seed)
+    elif sampler.lower() == "random":
+        smp = RandomSampler(seed=seed)
+    elif sampler.lower() == "grid":
+        xgb_grid = {
+            "learning_rate": [0.03, 0.05, 0.1],
+            "max_depth": [3, 5, 7],
+            "min_child_weight": [1.0, 3.0, 5.0],
+            "subsample": [0.7, 0.9, 1.0],
+            "colsample_bytree": [0.7, 0.9, 1.0],
+            "reg_alpha": [0.0, 0.001, 0.01],
+            "reg_lambda": [1.0, 3.0, 5.0],
+            "n_estimators": [400, 800, 1200],
+            "extra_timeframes": etf_candidates_str,
+        }
+        smp = GridSampler(xgb_grid)
+    else:
+        raise typer.BadParameter("sampler must be tpe|random|grid")
+
+    def suggest_space(trial):
+        cfg = {
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "max_depth": trial.suggest_int("max_depth", 2, 8),
+            "min_child_weight": trial.suggest_float("min_child_weight", 0.5, 10.0, log=True),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-5, 1.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.5, 20.0, log=True),
+            "n_estimators": trial.suggest_int("n_estimators", 400, 2000, step=100),
+            "extra_timeframes": trial.suggest_categorical("extra_timeframes", etf_candidates_str),
+        }
+        chosen = []
+        if optimize_features:
+            for fname in base_feature_list:
+                use = trial.suggest_categorical(f"f_{fname}", [True, False])
+                if use:
+                    chosen.append(fname)
+            if max_features and len(chosen) > max_features:
+                chosen = chosen[:max_features]
+            if not chosen:
+                chosen = ["logret","rsi","atr"]
+            cfg["feature_whitelist"] = chosen
+        return cfg
+
+    best = {"value": float("-inf"), "path": ""}
+
+    def _ic(y_true, y_pred, method: str = "spearman") -> float:
+        try:
+            import pandas as _pd
+            s1 = _pd.Series(y_true)
+            s2 = _pd.Series(y_pred)
+            if method == "pearson":
+                v = float(s1.corr(s2, method="pearson"))
+            else:
+                v = float(s1.corr(s2, method="spearman"))
+            if v != v:
+                return float("-inf")
+            return v
+        except Exception:
+            return float("-inf")
+
+    study = optuna.create_study(direction="maximize", sampler=smp)
+    typer.echo(f"Starting XGB Optuna study: {study.study_name} -> dir {tune_dir}")
+
+    eval_start = eval_end = None
+    if eval_timerange:
+        try:
+            import pandas as _pd
+            s, e = eval_timerange.split('-', 1)
+            eval_start = _pd.to_datetime(s) if s else None
+            eval_end = _pd.to_datetime(e) if e else None
+        except Exception:
+            eval_start = eval_end = None
+
+    def objective(trial):
+        cfg = suggest_space(trial) if not isinstance(smp, GridSampler) else {k: trial.suggest_categorical(k, v) for k, v in (xgb_grid or {}).items()}
+        etf = [t.strip() for t in str(cfg.get("extra_timeframes", "")).split(",") if t.strip()]
+        feature_cols = None
+        if optimize_features:
+            keep = ["open","high","low","close","volume"] + list(cfg.get("feature_whitelist", []))
+            feature_cols = keep
+            fm = "full"
+        else:
+            fm = feature_mode
+        from rl_lib.features import make_features as _make_features
+        feats = _make_features(
+            raw,
+            feature_columns=feature_cols,
+            mode=fm,
+            basic_lookback=int(basic_lookback),
+            extra_timeframes=([s.upper() for s in etf] if etf else (etf_list_fixed or None)),
+        )
+        c = feats["close"].astype(float).values if "close" in feats.columns else raw["close"].astype(float).values
+        if horizon <= 0:
+            raise typer.BadParameter("horizon must be >= 1")
+        import numpy as _np
+        import pandas as _pd
+        logp = _pd.Series(_np.log(c + 1e-12), index=feats.index)
+        y = (logp.shift(-int(horizon)) - logp).to_numpy()
+        valid_len = len(feats) - int(horizon)
+        if valid_len <= 100:
+            return float("-inf")
+        X = feats.iloc[:valid_len, :].copy()
+        y = y[:valid_len].astype(float)
+        if eval_start is not None or eval_end is not None:
+            if not isinstance(X.index, _pd.DatetimeIndex):
+                return float("-inf")
+            idx = X.index
+            try:
+                idx_cmp = idx.tz_convert(None) if idx.tz is not None else idx
+            except Exception:
+                idx_cmp = idx.tz_localize(None) if getattr(idx, 'tz', None) is not None else idx
+            mask_val = _pd.Series(True, index=idx)
+            if eval_start is not None:
+                mask_val &= idx_cmp >= _pd.to_datetime(eval_start)
+            if eval_end is not None:
+                mask_val &= idx_cmp <= _pd.to_datetime(eval_end)
+            X_val = X.loc[mask_val].copy()
+            y_val = y[mask_val.to_numpy()]
+            X_train = X.loc[~mask_val].copy()
+            y_train = y[~mask_val.to_numpy()]
+        else:
+            cut = int(max(10, min(len(X) - 10, int(len(X) * float(train_ratio)))))
+            X_train = X.iloc[:cut, :].copy()
+            y_train = y[:cut]
+            X_val = X.iloc[cut:, :].copy()
+            y_val = y[cut:]
+        if X_train.empty or X_val.empty:
+            return float("-inf")
+
+        model = xgb.XGBRegressor(
+            objective="reg:squarederror",
+            tree_method="hist",
+            random_state=int(seed),
+            n_jobs=(int(n_jobs) if int(n_jobs) > 0 else -1),
+            learning_rate=float(cfg["learning_rate"]),
+            max_depth=int(cfg["max_depth"]),
+            min_child_weight=float(cfg["min_child_weight"]),
+            subsample=float(cfg["subsample"]),
+            colsample_bytree=float(cfg["colsample_bytree"]),
+            reg_alpha=float(cfg["reg_alpha"]),
+            reg_lambda=float(cfg["reg_lambda"]),
+            n_estimators=int(cfg["n_estimators"]),
+        )
+        try:
+            model.fit(
+                X_train.values, y_train,
+                eval_set=[(X_val.values, y_val)],
+                eval_metric="rmse",
+                verbose=False,
+                early_stopping_rounds=50,
+            )
+        except Exception as e:
+            typer.echo(f"Trial fit failed: {e}")
+            return float("-inf")
+
+        y_pred = model.predict(X_val.values)
+        ic_s = _ic(y_val, y_pred, method="spearman")
+        ic_p = _ic(y_val, y_pred, method="pearson")
+        import numpy as _np2
+        mse = float(_np2.mean((y_val - y_pred) ** 2)) if len(y_val) == len(y_pred) else float("inf")
+        acc = float(_np2.mean(_np2.sign(y_val) == _np2.sign(y_pred))) if len(y_val) == len(y_pred) else float("nan")
+        value = ic_s if str(ic_metric).lower() == "spearman" else ic_p
+        if value != value or value == float("-inf"):
+            value = float("-inf")
+
+        tag = (
+            f"lr-{cfg['learning_rate']}_md-{cfg['max_depth']}_mcw-{cfg['min_child_weight']}_"
+            f"ss-{cfg['subsample']}_cs-{cfg['colsample_bytree']}_ra-{cfg['reg_alpha']}_rl-{cfg['reg_lambda']}_"
+            f"ne-{cfg['n_estimators']}_H-{int(horizon)}"
+        )
+        model_path = str(tune_dir / f"xgb_{tag}.json")
+        try:
+            if value > float(best.get("value", float("-inf"))):
+                model.save_model(model_path)
+                feat_cols_path = str(Path(model_path).with_suffix("").as_posix()) + "_feature_columns.json"
+                with open(feat_cols_path, "w") as f:
+                    json.dump(list(X.columns), f)
+                meta = {
+                    "ic_spearman": float(ic_s),
+                    "ic_pearson": float(ic_p),
+                    "mse": float(mse),
+                    "acc_dir": float(acc),
+                    "horizon": int(horizon),
+                    "extra_timeframes": etf,
+                }
+                with open(str(Path(model_path).with_suffix("").as_posix()) + "_meta.json", "w") as f:
+                    json.dump(meta, f, indent=2)
+                best["value"] = float(value)
+                best["path"] = model_path
+        except Exception:
+            pass
+
+        row = {
+            "trial_number": trial.number,
+            "value": float(value),
+            "ic_spearman": float(ic_s),
+            "ic_pearson": float(ic_p),
+            "mse": float(mse),
+            "acc_dir": float(acc),
+            "features_used": ",".join(list(cfg.get("feature_whitelist", []))) if cfg.get("feature_whitelist") else "",
+            "feature_mode": "full" if optimize_features else str(feature_mode),
+            "extra_timeframes": ",".join(etf) if etf else ",".join(etf_list_fixed) if etf_list_fixed else "",
+            "horizon": int(horizon),
+            "seed": int(seed),
+            "learning_rate": float(cfg["learning_rate"]),
+            "max_depth": int(cfg["max_depth"]),
+            "min_child_weight": float(cfg["min_child_weight"]),
+            "subsample": float(cfg["subsample"]),
+            "colsample_bytree": float(cfg["colsample_bytree"]),
+            "reg_alpha": float(cfg["reg_alpha"]),
+            "reg_lambda": float(cfg["reg_lambda"]),
+            "n_estimators": int(cfg["n_estimators"]),
+            "eval_start": str(eval_start) if eval_start is not None else "",
+            "eval_end": str(eval_end) if eval_end is not None else "",
+            "model_path": best.get("path", ""),
+        }
+        with open(results_csv, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writerow(row)
+        return float(value)
+
+    if isinstance(smp, GridSampler):
+        grid_size = 1
+        for v in (xgb_grid or {}).values():
+            grid_size *= max(1, len(v))
+        study.optimize(objective, n_trials=grid_size)
+    else:
+        study.optimize(objective, n_trials=n_trials)
+
+    with open(tune_dir / "best_params.json", "w") as f:
+        json.dump(study.best_params, f, indent=2)
+    with open(tune_dir / "best_value.txt", "w") as f:
+        f.write(str(study.best_value))
+    typer.echo(f"Best value: {study.best_value}\nBest params: {json.dumps(study.best_params)}\nBest model: {best.get('path','')}")
+
+@app.command()
 def forecast_eval(
     model_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "forecaster.pt"), "--model-path", "--model_path"),
     pair: str = typer.Option("BTC/USDT"),

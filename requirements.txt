@@ -11,3 +11,4 @@ pyarrow>=15.0.0
 matplotlib>=3.7
 yfinance>=0.2.40
 optuna>=3.6.0
+xgboost>=2.0.0
