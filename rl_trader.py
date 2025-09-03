@@ -1661,12 +1661,10 @@ def xgb_tune(
         if X_train.empty or X_val.empty:
             return float("-inf")
 
-        # Configure tree method based on device
-        tree_method = "gpu_hist" if dev == "cuda" else "hist"
-        
+        # XGBoost 2.x: use device="cuda" with tree_method="hist" (not gpu_hist)
         model = xgb.XGBRegressor(
             objective="reg:squarederror",
-            tree_method=tree_method,
+            tree_method="hist",  # Always hist; device parameter controls GPU usage
             random_state=int(seed),
             n_jobs=(int(n_jobs) if int(n_jobs) > 0 else -1),
             device=dev,
@@ -1681,16 +1679,43 @@ def xgb_tune(
         )
         try:
             # XGBoost 2.x sklearn API compatibility
-            model.fit(
-                X_train.values, y_train,
-                eval_set=[(X_val.values, y_val)],
-                verbose=False,
-            )
+            # For GPU: convert to appropriate data structures
+            if dev == "cuda":
+                try:
+                    import cupy as cp
+                    X_train_gpu = cp.asarray(X_train.values, dtype=cp.float32)
+                    y_train_gpu = cp.asarray(y_train, dtype=cp.float32)
+                    X_val_gpu = cp.asarray(X_val.values, dtype=cp.float32)
+                    y_val_gpu = cp.asarray(y_val, dtype=cp.float32)
+                    
+                    model.fit(
+                        X_train_gpu, y_train_gpu,
+                        eval_set=[(X_val_gpu, y_val_gpu)],
+                        verbose=False,
+                    )
+                    y_pred = cp.asnumpy(model.predict(X_val_gpu))
+                    # Check GPU memory usage
+                    gpu_mem = cp.cuda.Device().mem_info
+                    used_mb = (gpu_mem[1] - gpu_mem[0]) / (1024**2)
+                    typer.echo(f"Trial {trial.number}: GPU training complete, using {used_mb:.0f}MB VRAM")
+                except ImportError:
+                    typer.echo(f"Trial {trial.number}: CuPy not available, using numpy arrays on GPU")
+                    model.fit(
+                        X_train.values.astype('float32'), y_train.astype('float32'),
+                        eval_set=[(X_val.values.astype('float32'), y_val.astype('float32'))],
+                        verbose=False,
+                    )
+                    y_pred = model.predict(X_val.values.astype('float32'))
+            else:
+                model.fit(
+                    X_train.values, y_train,
+                    eval_set=[(X_val.values, y_val)],
+                    verbose=False,
+                )
+                y_pred = model.predict(X_val.values)
         except Exception as e:
             typer.echo(f"Trial fit failed: {e}")
             return float("-inf")
-
-        y_pred = model.predict(X_val.values)
         ic_s = _ic(y_val, y_pred, method="spearman")
         ic_p = _ic(y_val, y_pred, method="pearson")
         import numpy as _np2
