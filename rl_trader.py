@@ -578,7 +578,7 @@ def backtest(
     timeframe: str = typer.Option("1h"),
     userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
     model_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "rl_ppo.zip")),
-    timerange: str = typer.Option("20220101-20240101"),
+    timerange: str = typer.Option("20250101-"),
     device: str = typer.Option("cuda", help="Device for backtest: cuda|cpu"),
     exchange: str = typer.Option("bybit", help="Exchange name for dataset and backtest config"),
     window: int = typer.Option(128, help="Window size (must match training)"),
@@ -1034,7 +1034,7 @@ def tune(
     early_stop_degrade_ratio: float = typer.Option(0.0),
     # Auto backtest
     auto_backtest: bool = typer.Option(True, help="Run freqtrade backtest per model"),
-    backtest_timerange: str = typer.Option("", help="YYYYMMDD-YYYYMMDD for freqtrade backtests; empty uses training eval slice"),
+    backtest_timerange: str = typer.Option("20250101-", help="YYYYMMDD-YYYYMMDD for freqtrade backtests; empty uses training eval slice"),
     backtest_exchange: str = typer.Option("bybit"),
     # Validation slice after training
     eval_timerange: str = typer.Option("20240101-20250101", help="Timerange for post-train validation report"),
@@ -1073,6 +1073,21 @@ def tune(
 
     etf_list = _parse_list(extra_timeframes, str) if extra_timeframes else []
 
+    # Build candidate sets for extra timeframes exploration.
+    # If extra_timeframes contains ';', treat it as semicolon-separated options of comma lists.
+    # If empty, use sensible defaults. Otherwise, use provided value as a single fixed option.
+    if extra_timeframes and ";" in extra_timeframes:
+        etf_candidates_str = [
+            ",".join([t.strip().lower() for t in opt.split(",") if t.strip()])
+            for opt in extra_timeframes.split(";") if opt.strip()
+        ]
+    elif extra_timeframes:
+        etf_candidates_str = [
+            ",".join([t.strip().lower() for t in extra_timeframes.split(",") if t.strip()])
+        ]
+    else:
+        etf_candidates_str = ["", "4h", "1d", "4h,1d", "4h,1d,1w"]
+
     # Ensure datasets exist if requested
     if autofetch:
         tfs = sorted(set([timeframe, "1h", "4h", "1d", "1w"]))
@@ -1097,8 +1112,9 @@ def tune(
 
         # Reward/env shaping
         reward_type = trial.suggest_categorical("reward_type", ["vol_scaled", "sharpe_proxy", "raw"]) if search_space != "minimal" else trial.suggest_categorical("reward_type", ["vol_scaled", "raw"]) 
-        fee_bps = trial.suggest_float("fee_bps", 1.0, 10.0) if search_space == "wide" else trial.suggest_categorical("fee_bps", [2.0, 6.0])
-        slippage_bps = trial.suggest_float("slippage_bps", 1.0, 15.0) if search_space == "wide" else trial.suggest_categorical("slippage_bps", [5.0, 10.0])
+        # Fees/slippage are fixed for realism (exchange fee ~6 bps; slippage median ~5 bps)
+        fee_bps = 6.0
+        slippage_bps = 5.0
 
         position_penalty_bps = trial.suggest_float("position_penalty_bps", 0.0, 5.0) if search_space != "minimal" else 0.0
         loss_hold_penalty_bps = trial.suggest_float("loss_hold_penalty_bps", 0.0, 5.0) if search_space == "wide" else 0.0
@@ -1120,6 +1136,9 @@ def tune(
         min_hold = trial.suggest_categorical("min_hold_bars", min_hold_candidates) if search_space != "minimal" else min_hold_bars
         cooldown = trial.suggest_categorical("cooldown_bars", cooldown_candidates) if search_space != "minimal" else cooldown_bars
 
+        # Extra timeframes exploration (string like "4h,1d" or "")
+        extra_tfs_str = trial.suggest_categorical("extra_timeframes", etf_candidates_str)
+
         return {
             "ent_coef": ent_coef,
             "learning_rate": learning_rate,
@@ -1138,6 +1157,7 @@ def tune(
             "window": win,
             "min_hold_bars": min_hold,
             "cooldown_bars": cooldown,
+            "extra_timeframes": extra_tfs_str,
         }
 
     # Grid definitions for GridSampler
@@ -1147,8 +1167,6 @@ def tune(
         "n_steps": [1024, 2048],
         "batch_size": [256, 512],
         "reward_type": ["vol_scaled", "sharpe_proxy", "raw"],
-        "fee_bps": [2.0, 6.0],
-        "slippage_bps": [5.0, 10.0],
         "position_penalty_bps": [0.0, 1.0],
         "loss_hold_penalty_bps": [0.0, 1.0],
         "cvar_alpha": [0.0, 0.05],
@@ -1159,6 +1177,7 @@ def tune(
         "window": window_candidates if windows_list else [window],
         "min_hold_bars": min_hold_candidates if min_hold_bars_list else [min_hold_bars],
         "cooldown_bars": cooldown_candidates if cooldown_bars_list else [cooldown_bars],
+        "extra_timeframes": etf_candidates_str,
     }
 
     if sampler.lower() == "tpe":
@@ -1173,11 +1192,14 @@ def tune(
     def objective(trial: "optuna.trial.Trial") -> float:
         cfg = suggest_space(trial) if not isinstance(smp, GridSampler) else {k: trial.suggest_categorical(k, v) for k, v in grid.items()}
 
+        fee_fixed = 6.0
+        slip_fixed = 5.0
+        etf_tag = (cfg.get('extra_timeframes') or 'none').replace(',', '-')
         tag = (
             f"{arch}_fm-{cfg['feature_mode']}_win-{cfg['window']}"
             f"_mh-{cfg['min_hold_bars']}_cd-{cfg['cooldown_bars']}"
             f"_rt-{cfg['reward_type']}_ec-{cfg['ent_coef']}_lr-{cfg['learning_rate']}"
-            f"_ns-{cfg['n_steps']}_bs-{cfg['batch_size']}_fee-{cfg['fee_bps']}_slip-{cfg['slippage_bps']}_seed-{seed}"
+            f"_ns-{cfg['n_steps']}_bs-{cfg['batch_size']}_fee-{fee_fixed}_slip-{slip_fixed}_etf-{etf_tag}_seed-{seed}"
         )
         model_path = str(tune_dir / f"{tag}.zip")
 
@@ -1191,8 +1213,8 @@ def tune(
             arch=arch,
             device=device,
             prefer_exchange=exchange,
-            fee_bps=float(cfg["fee_bps"]),
-            slippage_bps=float(cfg["slippage_bps"]),
+            fee_bps=fee_fixed,
+            slippage_bps=slip_fixed,
             # override with tuned idle penalty when present (kept default 0.0 for safety)
             idle_penalty_bps=float(cfg.get("idle_penalty_bps", 0.0)),
             reward_type=str(cfg["reward_type"]),
@@ -1210,7 +1232,7 @@ def tune(
             episode_max_steps=4096,
             feature_mode=str(cfg["feature_mode"]),
             basic_lookback=128 if str(cfg["feature_mode"]) == "basic" else 64,
-            extra_timeframes=etf_list or None,
+            extra_timeframes=_parse_list(str(cfg.get("extra_timeframes", "")), str) or None,
             eval_freq=eval_freq,
             n_eval_episodes=1,
             eval_max_steps=eval_max_steps,
@@ -1266,14 +1288,14 @@ def tune(
             "cvar_coef": _safe_float(cfg["cvar_coef"]),
             "max_position_bars": _safe_int(cfg["max_position_bars"]),
             "turnover_penalty_bps": _safe_float(turnover_penalty_bps),
-            "extra_timeframes": ",".join(etf_list) if etf_list else "",
+            "extra_timeframes": str(cfg.get("extra_timeframes", "")),
             "reward_type": str(cfg["reward_type"]),
             "ent_coef": _safe_float(cfg["ent_coef"]),
             "learning_rate": _safe_float(cfg["learning_rate"]),
             "n_steps": _safe_int(cfg["n_steps"]),
             "batch_size": _safe_int(cfg["batch_size"]),
-            "fee_bps": _safe_float(cfg["fee_bps"]),
-            "slippage_bps": _safe_float(cfg["slippage_bps"]),
+            "fee_bps": _safe_float(fee_fixed),
+            "slippage_bps": _safe_float(slip_fixed),
             "seed": _safe_int(seed),
             "eval_timerange": str(eval_timerange),
             "backtest_timerange": str(backtest_timerange or ""),
