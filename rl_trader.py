@@ -1180,6 +1180,8 @@ def tune(
                 "dfa_exponent_64","entropy_return_64",
                 # Risk mgmt
                 "drawdown_z_64","expected_shortfall_0_05_128",
+                # Long-horizon MAs (daily/weekly resamples available in features)
+                "MA365D","MA200D","MA50D","MA20W",
             ]
             chosen: list[str] = []
             for fname in base_feature_list:
@@ -1192,6 +1194,8 @@ def tune(
             if not chosen:
                 chosen = ["logret","rsi","atr"]
             cfg["feature_whitelist"] = chosen
+            # Ensure unified superset mode so whitelist columns exist
+            cfg["feature_mode"] = "full"
         return cfg
 
     # Grid definitions for GridSampler
