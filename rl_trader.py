@@ -1400,6 +1400,7 @@ def xgb_tune(
     max_features: int = typer.Option(0, help="Cap number of selected features (0=no cap)"),
     ic_metric: str = typer.Option("spearman", help="IC metric: spearman|pearson"),
     n_jobs: int = typer.Option(0, help="Threads for XGBoost; 0=all cores"),
+    xgb_device: str = typer.Option("cpu", help="XGBoost device: auto|cpu|cuda"),
     autofetch: bool = typer.Option(True, help="Auto-download dataset if missing"),
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_optuna")),
 ):
@@ -1483,7 +1484,7 @@ def xgb_tune(
         "trial_number","value","ic_spearman","ic_pearson","mse","acc_dir",
         "features_used","feature_mode","extra_timeframes","horizon","seed",
         "learning_rate","max_depth","min_child_weight","subsample","colsample_bytree","reg_alpha","reg_lambda","n_estimators",
-        "eval_start","eval_end","model_path"
+        "eval_start","eval_end","model_path","device"
     ]
     with open(results_csv, "w", newline="") as f:
         csv.DictWriter(f, fieldnames=fields).writeheader()
@@ -1578,6 +1579,14 @@ def xgb_tune(
             eval_start = eval_end = None
 
     def objective(trial):
+        # Resolve device selection per-trial (static across trials)
+        dev_opt = str(xgb_device).strip().lower()
+        if dev_opt == "auto":
+            dev = "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
+        elif dev_opt in ("cpu", "cuda"):
+            dev = dev_opt
+        else:
+            dev = "cpu"
         cfg = suggest_space(trial) if not isinstance(smp, GridSampler) else {k: trial.suggest_categorical(k, v) for k, v in (xgb_grid or {}).items()}
         etf = [t.strip() for t in str(cfg.get("extra_timeframes", "")).split(",") if t.strip()]
         feature_cols = None
@@ -1638,6 +1647,7 @@ def xgb_tune(
             tree_method="hist",
             random_state=int(seed),
             n_jobs=(int(n_jobs) if int(n_jobs) > 0 else -1),
+            device=dev,
             learning_rate=float(cfg["learning_rate"]),
             max_depth=int(cfg["max_depth"]),
             min_child_weight=float(cfg["min_child_weight"]),
@@ -1719,6 +1729,7 @@ def xgb_tune(
             "eval_start": str(eval_start) if eval_start is not None else "",
             "eval_end": str(eval_end) if eval_end is not None else "",
             "model_path": best.get("path", ""),
+            "device": dev,
         }
         with open(results_csv, "a", newline="") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
