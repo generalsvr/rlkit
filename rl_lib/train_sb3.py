@@ -41,6 +41,68 @@ def _tf_stride(tf: str) -> int:
     return 1
 
 
+def _select_feature_columns(
+    all_columns: List[str],
+    mode: str,
+    extra_timeframes: Optional[List[str]],
+    groups: Optional[List[str]],
+) -> List[str]:
+    """Select ordered subset of feature columns based on groups.
+
+    Always preserves base OHLCV when present. If groups is falsy, return all columns unchanged.
+    """
+    if not groups:
+        return list(all_columns)
+
+    selected: List[str] = []
+    # Always keep base OHLCV if present
+    for base_col in ["open", "high", "low", "close", "volume"]:
+        if base_col in all_columns and base_col not in selected:
+            selected.append(base_col)
+
+    groups_l = {g.strip().lower() for g in groups}
+    mode_l = str(mode or "full").lower()
+
+    def _add(cols: List[str]):
+        for c in cols:
+            if c in all_columns and c not in selected:
+                selected.append(c)
+
+    if mode_l == "basic":
+        if "trend" in groups_l:
+            _add(["close_z", "change"])
+        if "volatility" in groups_l:
+            _add(["ret_std_14"])
+        if "wicks" in groups_l:
+            _add(["d_hl"])
+        if "stats" in groups_l:
+            _add(["hurst", "tail_alpha"])
+    else:
+        if "trend" in groups_l:
+            _add(["rsi", "ema_fast_ratio", "ema_slow_ratio"])
+        if "volatility" in groups_l:
+            _add(["vol_z", "atr", "ret_std_14"])
+        if "wicks" in groups_l:
+            _add(["upper_wick", "lower_wick", "hl_range"])
+        if "stats" in groups_l:
+            _add(["hurst", "tail_alpha"])
+    if "risk_gate" in groups_l:
+        _add(["risk_gate"])
+
+    # Higher timeframe features if requested
+    if "htf" in groups_l and extra_timeframes:
+        prefixes = {str(tf).upper() + "_" for tf in extra_timeframes}
+        for c in all_columns:
+            for pref in prefixes:
+                if c.startswith(pref):
+                    if c not in selected:
+                        selected.append(c)
+                    break
+
+    # Preserve original ordering
+    return [c for c in all_columns if c in selected]
+
+
 def _find_data_file(userdir: str, pair: str, timeframe: str, prefer_exchange: Optional[str] = None) -> Optional[str]:
     # Support multiple naming variants across exchanges (e.g., Bybit futures)
     base = pair.replace("/", "_")  # BTC_USDT or BTC_USDT:USDT
@@ -554,9 +616,13 @@ class TrainParams:
     random_reset: bool = False
     episode_max_steps: int = 0
     # Feature pipeline
-    feature_mode: str = "full"  # full | basic
+    feature_mode: str = "full"  # deprecated switch; we now build superset in features.py
     basic_lookback: int = 64
     extra_timeframes: Optional[List[str]] = None
+    # If provided, only these features (plus OHLCV) are kept
+    feature_groups: Optional[List[str]] = None
+    # Explicit per-feature whitelist (overrides feature_groups if provided)
+    feature_whitelist: Optional[List[str]] = None
     # Evaluation
     eval_freq: int = 100_000  # steps; <=0 disables eval
     n_eval_episodes: int = 3
@@ -598,6 +664,24 @@ def train_ppo_from_freqtrade_data(params: TrainParams) -> str:
     cut = int(n * 0.8)
     train_df = feats.iloc[:cut].copy()
     eval_df = feats.iloc[cut - max(params.window, 1):].copy()  # include context
+
+    # Optional feature selection (whitelist takes precedence over groups)
+    if params.feature_whitelist:
+        keep = [c for c in ["open","high","low","close","volume"] if c in train_df.columns]
+        keep += [c for c in params.feature_whitelist if c in train_df.columns and c not in keep]
+        train_df = train_df.loc[:, keep].copy()
+        eval_df = eval_df.loc[:, [c for c in keep if c in eval_df.columns]].copy()
+    elif params.feature_groups:
+        sel_cols = _select_feature_columns(list(train_df.columns), params.feature_mode, params.extra_timeframes, params.feature_groups)
+        if "open" not in sel_cols and "open" in train_df.columns:
+            sel_cols = ["open"] + sel_cols
+        if "close" not in sel_cols and "close" in train_df.columns:
+            if "open" in sel_cols:
+                sel_cols = ["open", "close"] + [c for c in sel_cols if c not in ("open", "close")]
+            else:
+                sel_cols = ["close"] + sel_cols
+        train_df = train_df.loc[:, [c for c in sel_cols if c in train_df.columns]].copy()
+        eval_df = eval_df.loc[:, [c for c in sel_cols if c in eval_df.columns]].copy()
 
     tcfg = TradingConfig(
         window=params.window,
@@ -881,8 +965,26 @@ def train_ppo_multi_from_freqtrade_data(params: TrainParams, pairs: List[str]) -
         # Split
         n = len(feats)
         cut = int(n * 0.8)
-        feat_train.append(feats.iloc[:cut].copy())
-        feat_eval.append(feats.iloc[cut - max(params.window, 1):].copy())
+        df_tr = feats.iloc[:cut].copy()
+        df_ev = feats.iloc[cut - max(params.window, 1):].copy()
+        if params.feature_whitelist:
+            keep = [c for c in ["open","high","low","close","volume"] if c in df_tr.columns]
+            keep += [c for c in params.feature_whitelist if c in df_tr.columns and c not in keep]
+            df_tr = df_tr.loc[:, keep].copy()
+            df_ev = df_ev.loc[:, [c for c in keep if c in df_ev.columns]].copy()
+        elif params.feature_groups:
+            sel_cols = _select_feature_columns(list(df_tr.columns), params.feature_mode, params.extra_timeframes, params.feature_groups)
+            if "open" not in sel_cols and "open" in df_tr.columns:
+                sel_cols = ["open"] + sel_cols
+            if "close" not in sel_cols and "close" in df_tr.columns:
+                if "open" in sel_cols:
+                    sel_cols = ["open", "close"] + [c for c in sel_cols if c not in ("open", "close")]
+                else:
+                    sel_cols = ["close"] + sel_cols
+            df_tr = df_tr.loc[:, [c for c in sel_cols if c in df_tr.columns]].copy()
+            df_ev = df_ev.loc[:, [c for c in sel_cols if c in df_ev.columns]].copy()
+        feat_train.append(df_tr)
+        feat_eval.append(df_ev)
 
     # If align_mode == intersection, slice all to common overlap window
     if params.align_mode.lower() == "intersection" and len(raw_dfs) >= 2:

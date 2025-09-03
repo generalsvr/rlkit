@@ -134,14 +134,14 @@ def make_features(
             "risk_gate": risk_gate,
         }, index=base.index)
     else:
-        # Full feature set (causal). Keep MACD/EMA; remove Bollinger and funding.
+        # Full/All feature set (causal). Includes trend/momentum, volatility, volume, microstructure, stats, risk.
         logret = np.diff(np.log(c + 1e-12), prepend=np.log(c[0] + 1e-12))
         hl_range = (h - l) / (c + 1e-12)
         upper_wick = (h - np.maximum(o, c)) / (c + 1e-12)
         lower_wick = (np.minimum(o, c) - l) / (c + 1e-12)
         rsi = compute_rsi(c, period=14) / 100.0
         vol_z = (v - v.mean()) / (v.std() + 1e-8)
-
+        
         # ATR normalized by close
         tr1 = h - l
         tr2 = np.abs(h - np.roll(c, 1))
@@ -166,11 +166,171 @@ def make_features(
         alpha_gate = np.clip((tail_alpha - 1.5) / (3.5 - 1.5), 0.0, 1.0)
         risk_gate = np.clip(alpha_gate * vol_gate, 0.1, 1.0)
 
-        # EMA ratios (keep), remove MACD
+        # EMA ratios
         ema_fast = pd.Series(c).ewm(span=12, adjust=False).mean().to_numpy()
         ema_slow = pd.Series(c).ewm(span=26, adjust=False).mean().to_numpy()
         ema_fast_ratio = (ema_fast - c) / (c + 1e-12)
         ema_slow_ratio = (ema_slow - c) / (c + 1e-12)
+
+        # Trend & Momentum additions
+        sma_fast = pd.Series(c).rolling(20, min_periods=1).mean().to_numpy()
+        sma_slow = pd.Series(c).rolling(50, min_periods=1).mean().to_numpy()
+        sma_ratio = (sma_fast - sma_slow) / (sma_slow + 1e-12)
+        # EMA slope difference (angle proxy)
+        ema_fast_slope = np.diff(ema_fast, prepend=ema_fast[0]) / (c + 1e-12)
+        ema_slow_slope = np.diff(ema_slow, prepend=ema_slow[0]) / (c + 1e-12)
+        ema_cross_angle = ema_fast_slope - ema_slow_slope
+        # Linear regression slope over 90 bars (normalized by price)
+        try:
+            import numpy as _np
+            idx = _np.arange(len(c))
+            def _lr_slope(series: _np.ndarray, win: int = 90) -> _np.ndarray:
+                out = _np.zeros_like(series)
+                for i in range(len(series)):
+                    j0 = max(0, i - win + 1)
+                    x = idx[j0:i+1]
+                    y = series[j0:i+1]
+                    if x.size >= 3:
+                        x_mean = x.mean(); y_mean = y.mean()
+                        num = _np.sum((x - x_mean) * (y - y_mean))
+                        den = _np.sum((x - x_mean) ** 2) + 1e-12
+                        out[i] = num / den
+                    else:
+                        out[i] = 0.0
+                return out
+            lr_slope_90 = _lr_slope(c) / (c + 1e-12)
+        except Exception:
+            lr_slope_90 = np.zeros_like(c)
+        # MACD
+        macd_line = (ema_fast - ema_slow) / (c + 1e-12)
+        macd_signal = pd.Series(macd_line).ewm(span=9, adjust=False).mean().to_numpy()
+        # Stochastic Oscillator
+        hh = pd.Series(h).rolling(14, min_periods=1).max().to_numpy()
+        ll = pd.Series(l).rolling(14, min_periods=1).min().to_numpy()
+        stoch_k = np.clip((c - ll) / (hh - ll + 1e-12), 0.0, 1.0)
+        stoch_d = pd.Series(stoch_k).rolling(3, min_periods=1).mean().to_numpy()
+        # ROC
+        roc_10 = (c / (np.roll(c, 10) + 1e-12)) - 1.0
+
+        # Volatility & Risk additions
+        bb_mid = pd.Series(c).rolling(20, min_periods=1).mean()
+        bb_std = pd.Series(c).rolling(20, min_periods=1).std().fillna(0.0)
+        bb_width = (2.0 * bb_std).to_numpy() / (bb_mid.to_numpy() + 1e-12)
+        donch_w = (pd.Series(h).rolling(20, min_periods=1).max() - pd.Series(l).rolling(20, min_periods=1).min()).to_numpy() / (c + 1e-12)
+        true_range_pct = atr
+        # Skewness of returns (rolling 30)
+        def _skew(arr: np.ndarray) -> float:
+            m = float(np.mean(arr))
+            sd = float(np.std(arr))
+            if sd == 0.0:
+                return 0.0
+            return float(np.mean(((arr - m) / (sd + 1e-12)) ** 3))
+        vol_skewness = pd.Series(logret).rolling(30, min_periods=10).apply(_skew, raw=True).fillna(0.0).to_numpy()
+        # Volatility regime (z-score of ret_std_14 over rolling 200)
+        vol_mean = pd.Series(ret_std_14).rolling(200, min_periods=20).mean().fillna(0.0).to_numpy()
+        vol_std = pd.Series(ret_std_14).rolling(200, min_periods=20).std().fillna(1e-8).to_numpy()
+        volatility_regime = (ret_std_14 - vol_mean) / (vol_std + 1e-8)
+
+        # Volume / Participation additions
+        obv = np.cumsum(np.sign(logret) * v)
+        obv_z = (obv - np.mean(obv)) / (np.std(obv) + 1e-8)
+        volume_delta = np.sign(logret) * v
+        volume_delta = (volume_delta - pd.Series(volume_delta).rolling(50, min_periods=10).mean().fillna(0.0)) / (pd.Series(volume_delta).rolling(50, min_periods=10).std().fillna(1e-8))
+        typical_price = (h + l + c) / 3.0
+        vwap_num = pd.Series(v * typical_price).rolling(20, min_periods=1).sum()
+        vwap_den = pd.Series(v).rolling(20, min_periods=1).sum().replace(0.0, 1e-12)
+        vwap = (vwap_num / vwap_den).to_numpy()
+        vwap_ratio = (c - vwap) / (c + 1e-12)
+
+        # Price shape / Microstructure additions
+        body = np.abs(c - o)
+        rng = (h - l) + 1e-12
+        candle_body_frac = body / rng
+        upper_shadow_frac = (h - np.maximum(o, c)) / rng
+        lower_shadow_frac = (np.minimum(o, c) - l) / rng
+        # Trend persistence (signed streak length, clipped)
+        sgn = np.sign(logret)
+        streak = np.zeros_like(sgn)
+        for i in range(1, len(sgn)):
+            if sgn[i] != 0 and sgn[i] == sgn[i-1]:
+                streak[i] = streak[i-1] + sgn[i]
+            else:
+                streak[i] = sgn[i]
+        candle_trend_persistence = np.tanh(streak / 10.0)
+        # Kurtosis rolling (100)
+        try:
+            kurtosis_rolling = pd.Series(logret).rolling(100, min_periods=20).kurt().fillna(0.0).to_numpy()
+        except Exception:
+            kurtosis_rolling = np.zeros_like(logret)
+
+        # Statistical / Fractal
+        # Simple DFA exponent approximation
+        def _dfa_exponent(series: np.ndarray, window: int = 64) -> np.ndarray:
+            out = np.zeros_like(series)
+            scales = [4, 8, 16, 32]
+            for i in range(len(series)):
+                j0 = max(0, i - window + 1)
+                y = series[j0:i+1]
+                if y.size < max(scales) + 2:
+                    out[i] = 0.5
+                    continue
+                rms = []
+                for m in scales:
+                    segs = []
+                    for k in range(m, y.size + 1, m):
+                        seg = y[k-m:k]
+                        x = np.arange(m)
+                        # Detrend
+                        xm = x.mean(); ym = seg.mean()
+                        num = np.sum((x - xm) * (seg - ym))
+                        den = np.sum((x - xm) ** 2) + 1e-12
+                        a = num / den
+                        b = ym - a * xm
+                        detr = seg - (a * x + b)
+                        segs.append(np.sqrt(np.mean(detr ** 2)))
+                    if segs:
+                        rms.append(np.mean(segs))
+                if len(rms) >= 2:
+                    xs = np.log(np.array(scales[:len(rms)]) + 1e-12)
+                    ys = np.log(np.array(rms) + 1e-12)
+                    xm = xs.mean(); ym = ys.mean()
+                    num = np.sum((xs - xm) * (ys - ym))
+                    den = np.sum((xs - xm) ** 2) + 1e-12
+                    out[i] = num / den
+                else:
+                    out[i] = 0.5
+            return np.clip(out, 0.0, 2.0)
+        dfa_exponent = _dfa_exponent(logret, window=64)
+
+        # Entropy of returns (Shannon, normalized)
+        def _entropy(arr: np.ndarray, bins: int = 20) -> float:
+            if arr.size < 10:
+                return 0.0
+            hist, _ = np.histogram(arr, bins=bins)
+            p = hist.astype(float) / (np.sum(hist) + 1e-12)
+            p = p[p > 0]
+            H = -np.sum(p * np.log(p + 1e-12))
+            Hn = H / (np.log(bins) + 1e-12)
+            return float(np.clip(Hn, 0.0, 1.0))
+        entropy_return = pd.Series(logret).rolling(64, min_periods=20).apply(_entropy, raw=True).fillna(0.0).to_numpy()
+
+        # Risk & Trade Management
+        # Rolling drawdown and z-score against vol
+        cummax = np.maximum.accumulate(c)
+        drawdown = (cummax - c) / (cummax + 1e-12)
+        dd_std = pd.Series(logret).rolling(64, min_periods=20).std().replace(0.0, 1e-8).to_numpy()
+        drawdown_z = drawdown / dd_std
+        # Expected shortfall (ES) of returns at alpha over 128 window
+        def _es_alpha(arr: np.ndarray, alpha: float = 0.05) -> float:
+            neg = arr[arr < 0.0]
+            if neg.size == 0:
+                return 0.0
+            q = np.quantile(neg, alpha)
+            tail = neg[neg <= q]
+            if tail.size == 0:
+                return 0.0
+            return float(np.abs(np.mean(tail)))
+        expected_shortfall = pd.Series(logret).rolling(128, min_periods=32).apply(lambda a: _es_alpha(a, 0.05), raw=True).fillna(0.0).to_numpy()
 
         feats = pd.DataFrame({
             "open": base["open"].values,
@@ -191,6 +351,37 @@ def make_features(
             "risk_gate": risk_gate,
             "ema_fast_ratio": ema_fast_ratio,
             "ema_slow_ratio": ema_slow_ratio,
+            # New trend/momentum
+            "sma_ratio": sma_ratio,
+            "ema_cross_angle": ema_cross_angle,
+            "lr_slope_90": lr_slope_90,
+            "macd_line": macd_line,
+            "macd_signal": macd_signal,
+            "stoch_k": stoch_k,
+            "stoch_d": stoch_d,
+            "roc_10": roc_10,
+            # New vol/risk
+            "bb_width_20": bb_width,
+            "donchian_width_20": donch_w,
+            "true_range_pct": true_range_pct,
+            "vol_skewness_30": vol_skewness,
+            "volatility_regime": volatility_regime,
+            # Volume
+            "obv_z": obv_z,
+            "volume_delta_z": volume_delta.astype(float),
+            "vwap_ratio_20": vwap_ratio,
+            # Microstructure
+            "candle_body_frac": candle_body_frac,
+            "upper_shadow_frac": upper_shadow_frac,
+            "lower_shadow_frac": lower_shadow_frac,
+            "candle_trend_persistence": candle_trend_persistence,
+            "kurtosis_rolling_100": kurtosis_rolling,
+            # Stats/Fractal
+            "dfa_exponent_64": dfa_exponent,
+            "entropy_return_64": entropy_return,
+            # Risk mgmt
+            "drawdown_z_64": drawdown_z,
+            "expected_shortfall_0_05_128": expected_shortfall,
         }, index=base.index)
 
         # Multi-timeframe moving averages inspired by Pine script (daily/weekly)

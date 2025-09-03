@@ -1016,6 +1016,8 @@ def tune(
     n_trials: int = typer.Option(30, help="Number of trials (ignored for pure grid if grid > n_trials)"),
     seed: int = typer.Option(42),
     extra_timeframes: str = typer.Option("", help="Optional comma-separated HTFs for all trials"),
+    optimize_features: bool = typer.Option(True, help="Search feature subset across ALL individual features"),
+    max_features: int = typer.Option(0, help="Optional cap on number of selected features (0 = no cap)"),
     # Search ranges (overrides defaults when provided)
     windows_list: str = typer.Option("", help="Comma-separated window sizes to search; empty uses defaults"),
     min_hold_bars_list: str = typer.Option("", help="Comma-separated min-hold values to search"),
@@ -1139,7 +1141,7 @@ def tune(
         # Extra timeframes exploration (string like "4h,1d" or "")
         extra_tfs_str = trial.suggest_categorical("extra_timeframes", etf_candidates_str)
 
-        return {
+        cfg = {
             "ent_coef": ent_coef,
             "learning_rate": learning_rate,
             "n_steps": n_steps,
@@ -1159,6 +1161,38 @@ def tune(
             "cooldown_bars": cooldown,
             "extra_timeframes": extra_tfs_str,
         }
+
+        # Per-feature toggles (optional): derive full feature list from features.py documentation
+        if optimize_features:
+            # Full superset in features.py (excluding OHLCV and HTF prefixes which are included by extra_timeframes)
+            base_feature_list = [
+                # Existing
+                "logret","hl_range","upper_wick","lower_wick","rsi","vol_z","atr","ret_std_14","hurst","tail_alpha","risk_gate","ema_fast_ratio","ema_slow_ratio",
+                # New trend/momentum
+                "sma_ratio","ema_cross_angle","lr_slope_90","macd_line","macd_signal","stoch_k","stoch_d","roc_10",
+                # Vol/risk
+                "bb_width_20","donchian_width_20","true_range_pct","vol_skewness_30","volatility_regime",
+                # Volume
+                "obv_z","volume_delta_z","vwap_ratio_20",
+                # Microstructure
+                "candle_body_frac","upper_shadow_frac","lower_shadow_frac","candle_trend_persistence","kurtosis_rolling_100",
+                # Stats/Fractal
+                "dfa_exponent_64","entropy_return_64",
+                # Risk mgmt
+                "drawdown_z_64","expected_shortfall_0_05_128",
+            ]
+            chosen: list[str] = []
+            for fname in base_feature_list:
+                use = trial.suggest_categorical(f"f_{fname}", [True, False])
+                if use:
+                    chosen.append(fname)
+            if max_features and len(chosen) > max_features:
+                chosen = chosen[:max_features]
+            # Always ensure non-empty; fallback to a couple core features
+            if not chosen:
+                chosen = ["logret","rsi","atr"]
+            cfg["feature_whitelist"] = chosen
+        return cfg
 
     # Grid definitions for GridSampler
     grid = {
@@ -1233,6 +1267,8 @@ def tune(
             feature_mode=str(cfg["feature_mode"]),
             basic_lookback=128 if str(cfg["feature_mode"]) == "basic" else 64,
             extra_timeframes=_parse_list(str(cfg.get("extra_timeframes", "")), str) or None,
+            feature_groups=list(cfg.get("feature_groups", []) or []),
+            feature_whitelist=list(cfg.get("feature_whitelist", []) or []),
             eval_freq=eval_freq,
             n_eval_episodes=1,
             eval_max_steps=eval_max_steps,
