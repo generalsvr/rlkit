@@ -1666,8 +1666,9 @@ def xgb_tune(
             params_try["tree_method"] = "hist"
             model = xgb.XGBRegressor(**params_try)
         except TypeError:
-            # Fallback for pre-2.0: use gpu_hist for CUDA
+            # Fallback for pre-2.0: drop eval_metric from ctor; use gpu_hist for CUDA
             params_try = base_params.copy()
+            params_try.pop("eval_metric", None)
             params_try["tree_method"] = ("gpu_hist" if dev == "cuda" else "hist")
             model = xgb.XGBRegressor(**params_try)
         except Exception as e:
@@ -1676,25 +1677,24 @@ def xgb_tune(
 
         # Early stopping via callbacks (preferred), with fallback to legacy arg
         try:
-            cb = [xgb.callback.EarlyStopping(rounds=50, save_best=True)]
-            model.fit(
-                X_train.values, y_train,
-                eval_set=[(X_val.values, y_val)],
-                callbacks=cb,
-                verbose=False,
-            )
-        except TypeError:
-            # Older API without callbacks
+            cb = []
             try:
+                cb = [xgb.callback.EarlyStopping(rounds=50, save_best=True)]
+            except Exception:
+                cb = []
+            if cb:
                 model.fit(
                     X_train.values, y_train,
                     eval_set=[(X_val.values, y_val)],
-                    early_stopping_rounds=50,
+                    callbacks=cb,
                     verbose=False,
                 )
-            except Exception as e:
-                typer.echo(f"Trial fit failed: {e}")
-                return float("-inf")
+            else:
+                model.fit(
+                    X_train.values, y_train,
+                    eval_set=[(X_val.values, y_val)],
+                    verbose=False,
+                )
         except Exception as e:
             typer.echo(f"Trial fit failed: {e}")
             return float("-inf")
