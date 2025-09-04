@@ -207,6 +207,12 @@ python rl_trader.py forecast_train \
 python rl_trader.py forecast-train   --pair BTC/USDT --timeframe 15m   --feature-mode full --extra-timeframes 1h,4h,1D   --target-mode logret --forecast-arch decoder_only   --window 512 --horizon 4   --d-model 128 --nhead 4 --num-encoder-layers 2 --num-decoder-layers 2 --ff-dim 256   --dropout 0.3 --weight-decay 0.003 --learning-rate 1e-4 --batch-size 512 --epochs 10 --device cuda   --autofetch --exchange bybit --download-timerange 20160101-   --model-out freqtrade_userdir/models/forecaster_15m_logret_decoder.pt
 ```
 
+### XBG
+
+```bash
+python rl_trader.py xgb-tune --pair BTC/USDT --timeframe 1h --exchange bybit   --timerange 20190101- --horizon 1 --sampler tpe --n-trials 50 --seed 42 --optimize-features --max-features 24   --ic-metric spearman --n-jobs 0 --extra-timeframes "4H,1D;4H,1D,1W" --xgb-device cuda --outdir ./models/xgb_optuna
+```
+
 ### Notes
 - Strategy file: `freqtrade_userdir/strategies/RLStrategy.py`
 - RL signals: `rl_lib/signal.py` produces `enter_long/exit_long/enter_short/exit_short` for Freqtrade.

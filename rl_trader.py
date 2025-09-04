@@ -1797,6 +1797,503 @@ def xgb_tune(
     typer.echo(f"Best value: {study.best_value}\nBest params: {json.dumps(study.best_params)}\nBest model: {best.get('path','')}")
 
 @app.command()
+def xgb_impulse_tune(
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    # Data
+    timerange: str = typer.Option("20190101-", help="YYYYMMDD-YYYYMMDD slice"),
+    exchange: str = typer.Option("bybit"),
+    eval_timerange: str = typer.Option("", help="Validation slice YYYYMMDD-YYYYMMDD"),
+    train_ratio: float = typer.Option(0.8, help="Train fraction if no eval_timerange"),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("", help="'4H,1D' or multiple sets via ';'"),
+    horizon: int = typer.Option(8, help="Impulse window H (bars)"),
+    tune_horizon: bool = typer.Option(False, help="Enable Optuna to tune horizon in [horizon_min,horizon_max]"),
+    horizon_min: int = typer.Option(1),
+    horizon_max: int = typer.Option(24),
+    label_mode: str = typer.Option("vol", help="vol|abs: vol=alpha*sigma*sqrt(H) threshold; abs=|ret|>bps"),
+    alpha_up: float = typer.Option(2.0, help="Vol-scaled up threshold multiplier (σ)"),
+    alpha_dn: float = typer.Option(2.0, help="Vol-scaled down threshold multiplier (σ)"),
+    vol_lookback: int = typer.Option(256, help="Rolling std lookback for σ (bars)"),
+    thr_up_bps: float = typer.Option(30.0, help="(abs mode) Up-spike threshold in bps of max fwd logret"),
+    thr_dn_bps: float = typer.Option(30.0, help="(abs mode) Down-spike threshold in bps of min fwd logret"),
+    # Search
+    sampler: str = typer.Option("tpe", help="tpe|random|grid"),
+    n_trials: int = typer.Option(40),
+    seed: int = typer.Option(42),
+    optimize_features: bool = typer.Option(True),
+    max_features: int = typer.Option(0),
+    n_jobs: int = typer.Option(0),
+    oversample_pos: float = typer.Option(0.0, help="Duplicate positive class by this factor (0=off)"),
+    xgb_device: str = typer.Option("auto", help="auto|cpu|cuda"),
+    autofetch: bool = typer.Option(True),
+    outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_impulse")),
+):
+    """Optuna tuning for impulse classifiers (up/down spikes), optimizing AUPRC.
+
+    Trains two binary XGBoost classifiers for spike_up and spike_down events based on
+    forward max/min log returns over H bars exceeding thresholds (bps).
+    """
+    try:
+        import optuna
+        from optuna.samplers import TPESampler, RandomSampler, GridSampler
+    except Exception as e:
+        raise RuntimeError("Optuna not installed. Run: pip install -r requirements.txt") from e
+    try:
+        import numpy as np  # type: ignore
+        import pandas as pd  # type: ignore
+        import xgboost as xgb  # type: ignore
+        from sklearn.metrics import average_precision_score  # type: ignore
+    except Exception as e:
+        raise RuntimeError("Missing deps. Install xgboost, numpy, pandas, scikit-learn.") from e
+
+    # Auto data
+    if autofetch:
+        try:
+            _ = _ensure_dataset(userdir, pair, timeframe, exchange=exchange, timerange=timerange)
+        except Exception as e:
+            typer.echo(f"Auto-download failed for {pair} {timeframe}: {e}")
+    data_path = _find_data_file_internal(userdir, pair, timeframe, prefer_exchange=exchange)
+    if not data_path:
+        raise FileNotFoundError("No dataset found. Run download first.")
+    raw = _load_ohlcv_internal(data_path)
+
+    # Extra TF candidates
+    if extra_timeframes and ";" in extra_timeframes:
+        etf_candidates_str = [
+            ",".join([t.strip().lower() for t in opt.split(",") if t.strip()])
+            for opt in extra_timeframes.split(";") if opt.strip()
+        ]
+    elif extra_timeframes:
+        etf_candidates_str = [
+            ",".join([t.strip().lower() for t in extra_timeframes.split(",") if t.strip()])
+        ]
+    else:
+        etf_candidates_str = ["", "4h", "1d", "4h,1d"]
+
+    # Device resolve
+    def _resolve_device() -> str:
+        dev_opt = str(xgb_device).strip().lower()
+        if dev_opt == "auto":
+            try:
+                import torch  # type: ignore
+                return "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:
+                return "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
+        if dev_opt in ("cpu", "cuda"):
+            return dev_opt
+        return "cpu"
+
+    # Features superset (same as reg)
+    base_feature_list = [
+        "logret","hl_range","upper_wick","lower_wick","rsi","vol_z","atr","ret_std_14","hurst","tail_alpha","risk_gate","ema_fast_ratio","ema_slow_ratio",
+        "sma_ratio","ema_cross_angle","lr_slope_90","macd_line","macd_signal","stoch_k","stoch_d","roc_10",
+        "bb_width_20","donchian_width_20","true_range_pct","vol_skewness_30","volatility_regime",
+        "obv_z","volume_delta_z","vwap_ratio_20",
+        "candle_body_frac","upper_shadow_frac","lower_shadow_frac","candle_trend_persistence","kurtosis_rolling_100",
+        "dfa_exponent_64","entropy_return_64",
+        "drawdown_z_64","expected_shortfall_0_05_128",
+        "MA365D","MA200D","MA50D","MA20W",
+    ]
+
+    # Study out dir
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    tune_dir = Path(outdir) / ts
+    tune_dir.mkdir(parents=True, exist_ok=True)
+    results_csv = tune_dir / "results.csv"
+    fields = [
+        "trial","value","auprc_up","auprc_down","pos_rate_up","pos_rate_down","features_used","extra_timeframes",
+        "learning_rate","max_depth","min_child_weight","subsample","colsample_bytree","reg_alpha","reg_lambda","n_estimators",
+        "thr_up_bps","thr_dn_bps","device","model_up","model_down"
+    ]
+    with open(results_csv, "w", newline="") as f:
+        csv.DictWriter(f, fieldnames=fields).writeheader()
+
+    # Sampler
+    if sampler.lower() == "tpe":
+        smp = TPESampler(seed=seed)
+    elif sampler.lower() == "random":
+        smp = RandomSampler(seed=seed)
+    elif sampler.lower() == "grid":
+        grid = {
+            "learning_rate": [0.03, 0.05, 0.1],
+            "max_depth": [3, 5, 7],
+            "min_child_weight": [1.0, 3.0, 5.0],
+            "subsample": [0.7, 0.9, 1.0],
+            "colsample_bytree": [0.7, 0.9, 1.0],
+            "reg_alpha": [0.0, 0.001, 0.01],
+            "reg_lambda": [1.0, 3.0, 5.0],
+            "n_estimators": [400, 800, 1200],
+            "extra_timeframes": etf_candidates_str,
+        }
+        smp = GridSampler(grid)
+    else:
+        raise typer.BadParameter("sampler must be tpe|random|grid")
+
+    def suggest_space(trial):
+        cfg = {
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "max_depth": trial.suggest_int("max_depth", 2, 8),
+            "min_child_weight": trial.suggest_float("min_child_weight", 0.5, 10.0, log=True),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-5, 1.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.5, 20.0, log=True),
+            "n_estimators": trial.suggest_int("n_estimators", 400, 2000, step=100),
+            "extra_timeframes": trial.suggest_categorical("extra_timeframes", etf_candidates_str),
+        }
+        if bool(tune_horizon):
+            cfg["horizon"] = int(trial.suggest_int("horizon", int(max(1, horizon_min)), int(max(horizon_min, horizon_max))))
+        if optimize_features:
+            chosen: list[str] = []
+            for fname in base_feature_list:
+                use = trial.suggest_categorical(f"f_{fname}", [True, False])
+                if use:
+                    chosen.append(fname)
+            if max_features and len(chosen) > max_features:
+                chosen = chosen[:max_features]
+            if not chosen:
+                chosen = ["logret","rsi","atr"]
+            cfg["feature_whitelist"] = chosen
+        return cfg
+
+    study = optuna.create_study(direction="maximize", sampler=smp)
+    typer.echo(f"Starting Impulse study: {study.study_name} -> dir {tune_dir}")
+
+    # Build eval slice
+    eval_start = eval_end = None
+    if eval_timerange:
+        try:
+            s, e = eval_timerange.split('-', 1)
+            eval_start = pd.to_datetime(s) if s else None
+            eval_end = pd.to_datetime(e) if e else None
+        except Exception:
+            eval_start = eval_end = None
+
+    best_val = float('-inf')
+    best_paths = {"up": "", "down": ""}
+
+    def objective(trial):
+        dev = _resolve_device()
+        if dev == "cuda":
+            typer.echo(f"CUDA detected: using GPU for Impulse trial {trial.number}")
+
+        cfg = suggest_space(trial) if not isinstance(smp, GridSampler) else {k: trial.suggest_categorical(k, v) for k, v in smp.search_space().items()}  # type: ignore[attr-defined]
+        etf = [t.strip() for t in str(cfg.get("extra_timeframes", "")).split(",") if t.strip()]
+        feature_cols = None
+        if optimize_features:
+            keep = ["open","high","low","close","volume"] + list(cfg.get("feature_whitelist", []))
+            feature_cols = keep
+            fm = "full"
+        else:
+            fm = feature_mode
+
+        # Features
+        from rl_lib.features import make_features as _make_features
+        feats = _make_features(
+            raw,
+            feature_columns=feature_cols,
+            mode=fm,
+            basic_lookback=int(basic_lookback),
+            extra_timeframes=([s.upper() for s in etf] if etf else None),
+        )
+
+        # Labels from forward window (vol or abs)
+        c = feats["close"].astype(float).values if "close" in feats.columns else raw["close"].astype(float).values
+        logp = pd.Series(np.log(c + 1e-12), index=feats.index)
+        H = int(max(1, int(cfg.get("horizon", horizon))))
+        fwd = [logp.shift(-i) - logp for i in range(1, H + 1)]
+        fwd_mat = np.vstack([s.to_numpy() for s in fwd])  # (H, T)
+        fwd_max = np.nanmax(fwd_mat, axis=0)
+        fwd_min = np.nanmin(fwd_mat, axis=0)
+        mode_l = str(label_mode).strip().lower()
+        if mode_l == "vol":
+            # Rolling std of single-bar log returns (causal)
+            logret = np.diff(np.log(c + 1e-12), prepend=np.log(c[0] + 1e-12))
+            sigma = pd.Series(logret).rolling(int(max(10, vol_lookback)), min_periods=10).std().fillna(0.0).to_numpy()
+            # Scale threshold by sqrt(H)
+            up_thr_vec = float(alpha_up) * sigma * float(np.sqrt(H))
+            dn_thr_vec = float(alpha_dn) * sigma * float(np.sqrt(H))
+            y_up = (fwd_max >= up_thr_vec).astype(int)
+            y_dn = (fwd_min <= -dn_thr_vec).astype(int)
+        else:
+            up_thr = float(thr_up_bps) * 1e-4
+            dn_thr = float(thr_dn_bps) * 1e-4
+            y_up = (fwd_max >= up_thr).astype(int)
+            y_dn = (fwd_min <= -dn_thr).astype(int)
+        valid_len = len(feats) - H
+        if valid_len <= 200:
+            return float('-inf')
+        X = feats.iloc[:valid_len, :].copy()
+        y_up = y_up[:valid_len]
+        y_dn = y_dn[:valid_len]
+
+        # Split
+        if eval_start is not None or eval_end is not None:
+            if not isinstance(X.index, pd.DatetimeIndex):
+                return float('-inf')
+            idx = X.index
+            try:
+                idx_cmp = idx.tz_convert(None) if idx.tz is not None else idx
+            except Exception:
+                idx_cmp = idx.tz_localize(None) if getattr(idx, 'tz', None) is not None else idx
+            mask_val = pd.Series(True, index=idx)
+            if eval_start is not None:
+                mask_val &= idx_cmp >= pd.to_datetime(eval_start)
+            if eval_end is not None:
+                mask_val &= idx_cmp <= pd.to_datetime(eval_end)
+            X_val = X.loc[mask_val].copy()
+            y_up_val = y_up[mask_val.to_numpy()]
+            y_dn_val = y_dn[mask_val.to_numpy()]
+            X_tr = X.loc[~mask_val].copy()
+            y_up_tr = y_up[~mask_val.to_numpy()]
+            y_dn_tr = y_dn[~mask_val.to_numpy()]
+        else:
+            cut = int(max(50, min(len(X) - 50, int(len(X) * float(train_ratio)))))
+            X_tr = X.iloc[:cut, :].copy(); X_val = X.iloc[cut:, :].copy()
+            y_up_tr = y_up[:cut]; y_up_val = y_up[cut:]
+            y_dn_tr = y_dn[:cut]; y_dn_val = y_dn[cut:]
+        if X_tr.empty or X_val.empty:
+            return float('-inf')
+
+        # Scale pos weight to handle imbalance
+        def _spw(y: np.ndarray) -> float:
+            pos = float(np.sum(y == 1))
+            neg = float(np.sum(y == 0))
+            return float(max(1.0, (neg / max(1.0, pos))))
+
+        common_kwargs = dict(
+            objective="binary:logistic",
+            tree_method="hist",
+            device=_resolve_device(),
+            random_state=int(seed),
+            n_jobs=(int(n_jobs) if int(n_jobs) > 0 else -1),
+            learning_rate=float(cfg["learning_rate"]),
+            max_depth=int(cfg["max_depth"]),
+            min_child_weight=float(cfg["min_child_weight"]),
+            subsample=float(cfg["subsample"]),
+            colsample_bytree=float(cfg["colsample_bytree"]),
+            reg_alpha=float(cfg["reg_alpha"]),
+            reg_lambda=float(cfg["reg_lambda"]),
+            n_estimators=int(cfg["n_estimators"]),
+            eval_metric="aucpr",
+        )
+
+        # Optional naive random oversampling of positive class
+        def _oversample(Xi: np.ndarray, yi: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+            r = float(oversample_pos)
+            if r <= 0.0:
+                return Xi, yi
+            pos_idx = np.flatnonzero(yi == 1)
+            if pos_idx.size == 0:
+                return Xi, yi
+            rep = int(max(1, np.floor(r)))
+            extra = np.repeat(pos_idx, rep)
+            X_o = np.concatenate([Xi, Xi[extra]], axis=0)
+            y_o = np.concatenate([yi, yi[extra]], axis=0)
+            return X_o, y_o
+
+        X_up_tr_np, y_up_tr_np = _oversample(X_tr.values, y_up_tr)
+        X_dn_tr_np, y_dn_tr_np = _oversample(X_tr.values, y_dn_tr)
+
+        up_clf = xgb.XGBClassifier(**{**common_kwargs, **{"scale_pos_weight": _spw(y_up_tr_np)}})
+        dn_clf = xgb.XGBClassifier(**{**common_kwargs, **{"scale_pos_weight": _spw(y_dn_tr_np)}})
+        try:
+            up_clf.fit(X_up_tr_np, y_up_tr_np, eval_set=[(X_val.values, y_up_val)], verbose=False)
+            dn_clf.fit(X_dn_tr_np, y_dn_tr_np, eval_set=[(X_val.values, y_dn_val)], verbose=False)
+        except Exception as e:
+            typer.echo(f"Trial fit failed: {e}")
+            return float('-inf')
+
+        p_up = up_clf.predict_proba(X_val.values)[:, 1]
+        p_dn = dn_clf.predict_proba(X_val.values)[:, 1]
+        try:
+            auprc_up = float(average_precision_score(y_up_val, p_up))
+            auprc_dn = float(average_precision_score(y_dn_val, p_dn))
+        except Exception:
+            auprc_up = auprc_dn = float('nan')
+        val = float(np.nanmean([auprc_up, auprc_dn]))
+
+        # Persist best
+        model_up_path = str(tune_dir / f"xgb_impulse_up_trial{trial.number}.json")
+        model_dn_path = str(tune_dir / f"xgb_impulse_down_trial{trial.number}.json")
+        try:
+            if val > float(best_val):
+                up_clf.save_model(model_up_path)
+                dn_clf.save_model(model_dn_path)
+                feat_cols_path = str(Path(model_up_path).with_suffix("").as_posix()) + "_feature_columns.json"
+                with open(feat_cols_path, "w") as f:
+                    json.dump(list(X_tr.columns), f)
+        except Exception:
+            pass
+
+        # Log row
+        row = {
+            "trial": trial.number,
+            "value": float(val),
+            "auprc_up": float(auprc_up),
+            "auprc_down": float(auprc_dn),
+            "pos_rate_up": float(np.mean(y_up_val)) if len(y_up_val) else float('nan'),
+            "pos_rate_down": float(np.mean(y_dn_val)) if len(y_dn_val) else float('nan'),
+            "features_used": ",".join(list(cfg.get("feature_whitelist", []))) if cfg.get("feature_whitelist") else "",
+            "extra_timeframes": ",".join(etf) if etf else "",
+            "learning_rate": float(cfg["learning_rate"]),
+            "max_depth": int(cfg["max_depth"]),
+            "min_child_weight": float(cfg["min_child_weight"]),
+            "subsample": float(cfg["subsample"]),
+            "colsample_bytree": float(cfg["colsample_bytree"]),
+            "reg_alpha": float(cfg["reg_alpha"]),
+            "reg_lambda": float(cfg["reg_lambda"]),
+            "n_estimators": int(cfg["n_estimators"]),
+            "thr_up_bps": float(thr_up_bps),
+            "thr_dn_bps": float(thr_dn_bps),
+            "device": _resolve_device(),
+            "model_up": model_up_path,
+            "model_down": model_dn_path,
+        }
+        with open(results_csv, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=fields).writerow(row)
+        return float(val)
+
+    if isinstance(smp, GridSampler):
+        try:
+            grid_dict = smp.search_space()  # type: ignore[attr-defined]
+            grid_size = 1
+            for v in grid_dict.values():
+                grid_size *= max(1, len(v))
+            study.optimize(objective, n_trials=grid_size)
+        except Exception:
+            study.optimize(objective, n_trials=n_trials)
+    else:
+        study.optimize(objective, n_trials=n_trials)
+
+    with open(tune_dir / "best_value.txt", "w") as f:
+        f.write(str(study.best_value))
+    with open(tune_dir / "best_params.json", "w") as f:
+        json.dump(study.best_params, f, indent=2)
+    typer.echo(f"Best value: {study.best_value}\nBest params: {json.dumps(study.best_params)}")
+
+@app.command()
+def xgb_combo_infer(
+    reg_model: str = typer.Option(..., help="Path to trained regressor .json"),
+    up_model: str = typer.Option(..., help="Path to trained impulse-up classifier .json"),
+    down_model: str = typer.Option("", help="Optional impulse-down classifier .json"),
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    exchange: str = typer.Option("bybit"),
+    timerange: str = typer.Option("", help="Eval slice YYYYMMDD-YYYYMMDD"),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option(""),
+    horizon: int = typer.Option(8),
+    mu_thr: float = typer.Option(0.0005, help="Threshold on regressed mu (logret)"),
+    p_up_thr: float = typer.Option(0.6, help="Impulse-up prob threshold"),
+    base_size: float = typer.Option(0.5, help="Normal long size when mu>thr"),
+    boost_size: float = typer.Option(1.0, help="Boosted long size when impulse_up"),
+    xgb_device: str = typer.Option("auto", help="auto|cpu|cuda"),
+    out_csv: str = typer.Option("", help="Optional output CSV path"),
+):
+    """Combine regressor mu and impulse-up classifier to produce position sizing."""
+    try:
+        import numpy as np  # type: ignore
+        import pandas as pd  # type: ignore
+        import xgboost as xgb  # type: ignore
+    except Exception as e:
+        raise RuntimeError("Missing deps. Install xgboost, numpy, pandas.") from e
+
+    # Load dataset
+    data_path = _find_data_file_internal(userdir, pair, timeframe, prefer_exchange=exchange)
+    if not data_path:
+        raise FileNotFoundError("No dataset found.")
+    raw = _load_ohlcv_internal(data_path)
+
+    # Load feature columns from models (union)
+    def _load_feat_cols(model_path: str) -> list[str]:
+        p = Path(model_path)
+        cand = p.with_suffix("").as_posix() + "_feature_columns.json"
+        if os.path.exists(cand):
+            try:
+                with open(cand, "r") as f:
+                    cols = json.load(f)
+                if isinstance(cols, list):
+                    return [str(c) for c in cols]
+            except Exception:
+                return []
+        return []
+
+    reg_cols = _load_feat_cols(reg_model)
+    up_cols = _load_feat_cols(up_model)
+    dn_cols = _load_feat_cols(down_model) if down_model else []
+    union_cols = list(dict.fromkeys([*reg_cols, *up_cols, *dn_cols])) if (reg_cols or up_cols or dn_cols) else None
+
+    # Build features once with union
+    from rl_lib.features import make_features as _make_features
+    etf_list = [s.strip() for s in extra_timeframes.split(",") if s.strip()] if extra_timeframes else None
+    feats_all = _make_features(raw, feature_columns=union_cols, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=etf_list)
+
+    # Align to valid length for horizon
+    H = int(max(1, horizon))
+    valid_len = len(feats_all) - H
+    feats = feats_all.iloc[:valid_len, :].copy()
+    idx = feats.index
+
+    # Prepare separate views for each model (reorder columns)
+    def _view(df: pd.DataFrame, cols: list[str] | None) -> pd.DataFrame:
+        if not cols:
+            return df
+        out = df.copy()
+        for c in cols:
+            if c not in out.columns:
+                out[c] = 0.0
+        return out.reindex(columns=cols)
+
+    X_reg = _view(feats, reg_cols) if reg_cols else feats
+    X_up = _view(feats, up_cols) if up_cols else feats
+    X_dn = _view(feats, dn_cols) if dn_cols else feats
+
+    # Load models
+    dev_opt = str(xgb_device).strip().lower()
+    dev = ("cuda" if dev_opt == "auto" else dev_opt) if dev_opt in ("cpu", "cuda", "auto") else "cpu"
+    reg = xgb.XGBRegressor(device=dev)
+    reg.load_model(reg_model)
+    upc = xgb.XGBClassifier(device=dev)
+    upc.load_model(up_model)
+    dnc = None
+    if down_model:
+        dnc = xgb.XGBClassifier(device=dev)
+        dnc.load_model(down_model)
+
+    # Predict
+    mu = reg.predict(X_reg.values)
+    p_up = upc.predict_proba(X_up.values)[:, 1]
+    p_dn = dnc.predict_proba(X_dn.values)[:, 1] if dnc is not None else np.zeros_like(p_up)
+
+    # Combine
+    size = np.zeros_like(mu, dtype=float)
+    size[p_up >= float(p_up_thr)] = float(boost_size)
+    mask_norm = (size == 0.0) & (mu >= float(mu_thr))
+    size[mask_norm] = float(base_size)
+
+    out = feats.copy()
+    out["mu_pred"] = mu
+    out["impulse_up_prob"] = p_up
+    out["impulse_down_prob"] = p_dn
+    out["long_size"] = size
+
+    # Optional save
+    if out_csv:
+        Path(os.path.dirname(out_csv) or ".").mkdir(parents=True, exist_ok=True)
+        out.to_csv(out_csv, index=True)
+        typer.echo(f"Saved combined inference to: {out_csv}")
+    else:
+        # Print brief summary
+        q = np.quantile(mu, [0.9, 0.95, 0.99]) if len(mu) > 100 else [float('nan')]*3
+        typer.echo(f"rows={len(out)} mu_thr={mu_thr} p_up_thr={p_up_thr} top_mu={q}")
+
+@app.command()
 def forecast_eval(
     model_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "forecaster.pt"), "--model-path", "--model_path"),
     pair: str = typer.Option("BTC/USDT"),
