@@ -2294,6 +2294,145 @@ def xgb_combo_infer(
         typer.echo(f"rows={len(out)} mu_thr={mu_thr} p_up_thr={p_up_thr} top_mu={q}")
 
 @app.command()
+def xgb_eval(
+    model_path: str = typer.Option(..., help="Path to trained regressor .json"),
+    pairs: str = typer.Option("BTC/USDT", help="Comma-separated pairs, e.g., 'BTC/USDT,ETH/USDT'"),
+    timeframes: str = typer.Option("1h", help="Comma-separated TFs, e.g., '1h,4h,1d'"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    exchange: str = typer.Option("bybit"),
+    timerange: str = typer.Option("", help="Eval slice YYYYMMDD-YYYYMMDD"),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("", help="Optional HTFs like '4H,1D' to recompute"),
+    horizon: int = typer.Option(1, help="Forward return horizon used during training"),
+    ic_metric: str = typer.Option("spearman", help="spearman|pearson"),
+    xgb_device: str = typer.Option("auto", help="auto|cpu|cuda"),
+    out_csv: str = typer.Option("", help="Optional results CSV path"),
+):
+    """Evaluate a trained XGB regressor across multiple pairs and timeframes.
+
+    Computes IC (Spearman/Pearson), MSE, direction accuracy for each (pair, timeframe).
+    Uses saved feature_columns.json from model to build matching feature layouts.
+    """
+    try:
+        import numpy as np  # type: ignore
+        import pandas as pd  # type: ignore
+        import xgboost as xgb  # type: ignore
+    except Exception as e:
+        raise RuntimeError("Missing deps. Install xgboost, numpy, pandas.") from e
+
+    pairs_l = [p.strip() for p in pairs.split(',') if p.strip()]
+    tfs_l = [t.strip() for t in timeframes.split(',') if t.strip()]
+    etf_list = [s.strip() for s in extra_timeframes.split(',') if s.strip()] if extra_timeframes else None
+
+    # Load model and its feature columns
+    def _load_feat_cols(mp: str) -> list[str] | None:
+        path = Path(mp)
+        cand = path.with_suffix("").as_posix() + "_feature_columns.json"
+        if os.path.exists(cand):
+            try:
+                with open(cand, "r") as f:
+                    cols = json.load(f)
+                if isinstance(cols, list):
+                    return [str(c) for c in cols]
+            except Exception:
+                return None
+        return None
+
+    model_cols = _load_feat_cols(model_path)
+    dev_opt = str(xgb_device).strip().lower()
+    dev = ("cuda" if dev_opt == "auto" else dev_opt) if dev_opt in ("cpu", "cuda", "auto") else "cpu"
+    reg = xgb.XGBRegressor(device=dev)
+    reg.load_model(model_path)
+
+    # IC function
+    def _ic(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+        s1 = pd.Series(y_true)
+        s2 = pd.Series(y_pred)
+        meth = "spearman" if str(ic_metric).lower() == "spearman" else "pearson"
+        v = float(s1.corr(s2, method=meth))
+        return v if v == v else float("nan")
+
+    # Compute
+    rows = []
+    for pr in pairs_l:
+        for tf in tfs_l:
+            try:
+                data_path = _find_data_file_internal(userdir, pr, tf, prefer_exchange=exchange)
+                if not data_path:
+                    typer.echo(f"Skip: no data for {pr} {tf}")
+                    continue
+                raw = _load_ohlcv_internal(data_path)
+                # Slice
+                if timerange:
+                    try:
+                        s, e = timerange.split('-', 1)
+                        start = pd.to_datetime(s) if s else None
+                        end = pd.to_datetime(e) if e else None
+                        if isinstance(raw.index, pd.DatetimeIndex):
+                            idx = raw.index
+                            try:
+                                idx_cmp = idx.tz_convert(None) if idx.tz is not None else idx
+                            except Exception:
+                                idx_cmp = idx.tz_localize(None) if getattr(idx, 'tz', None) is not None else idx
+                            mask = pd.Series(True, index=idx)
+                            if start is not None:
+                                mask &= idx_cmp >= pd.to_datetime(start)
+                            if end is not None:
+                                mask &= idx_cmp <= pd.to_datetime(end)
+                            raw = raw.loc[mask]
+                    except Exception:
+                        pass
+
+                # Features using model columns for exact layout
+                from rl_lib.features import make_features as _make_features
+                feats = _make_features(raw, feature_columns=model_cols, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=etf_list)
+
+                # Build target and align
+                H = int(max(1, horizon))
+                c = feats["close"].astype(float).values if "close" in feats.columns else raw["close"].astype(float).values
+                logp = pd.Series(np.log(c + 1e-12), index=feats.index)
+                y = (logp.shift(-H) - logp).to_numpy()
+                valid_len = len(feats) - H
+                if valid_len <= 50:
+                    typer.echo(f"Skip: insufficient length for {pr} {tf}")
+                    continue
+                X = feats.iloc[:valid_len, :].copy().values
+                y = y[:valid_len]
+
+                # Predict and score
+                y_pred = reg.predict(X)
+                ic = _ic(y, y_pred)
+                mse = float(np.mean((y - y_pred) ** 2))
+                acc = float(np.mean(np.sign(y) == np.sign(y_pred)))
+
+                rows.append({
+                    "pair": pr,
+                    "timeframe": tf,
+                    "rows": int(valid_len),
+                    "ic": float(ic),
+                    "mse": float(mse),
+                    "acc_dir": float(acc),
+                })
+            except Exception as e:
+                typer.echo(f"Eval failed for {pr} {tf}: {e}")
+                continue
+
+    # Output
+    if out_csv:
+        Path(os.path.dirname(out_csv) or ".").mkdir(parents=True, exist_ok=True)
+        import csv as _csv
+        with open(out_csv, "w", newline="") as f:
+            writer = _csv.DictWriter(f, fieldnames=["pair","timeframe","rows","ic","mse","acc_dir"])
+            writer.writeheader()
+            for r in rows:
+                writer.writerow(r)
+        typer.echo(f"Saved xgb_eval results to: {out_csv}")
+    # Print results concise
+    for r in rows:
+        typer.echo(f"{r['pair']} {r['timeframe']} rows={r['rows']} IC={r['ic']:.5f} MSE={r['mse']:.6f} ACC={r['acc_dir']:.3f}")
+
+@app.command()
 def forecast_eval(
     model_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "forecaster.pt"), "--model-path", "--model_path"),
     pair: str = typer.Option("BTC/USDT"),
