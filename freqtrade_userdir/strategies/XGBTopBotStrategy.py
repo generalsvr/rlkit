@@ -48,6 +48,12 @@ class XGBTopBotStrategy(IStrategy):
         self.p_margin = float(os.environ.get("XGB_P_MARGIN", "0.0"))
         self.min_hold_bars = int(os.environ.get("XGB_MIN_HOLD", "8"))
         self.cooldown_bars = int(os.environ.get("XGB_COOLDOWN", "0"))
+        # Optional gating flags
+        self.use_reg_gate = os.environ.get("XGB_USE_REG_GATE", "0").lower() in ("1","true","yes")
+        self.regressor_path = os.environ.get("XGB_REG_PATH", "")
+        self.use_rlte_gate = os.environ.get("XGB_USE_RLTE_GATE", "0").lower() in ("1","true","yes")
+        self.disable_longs = os.environ.get("XGB_DISABLE_LONGS", "0").lower() in ("1","true","yes")
+        self.disable_shorts = os.environ.get("XGB_DISABLE_SHORTS", "0").lower() in ("1","true","yes")
         # Feature config
         self.feature_mode = os.environ.get("XGB_FEAT_MODE", "full")
         self.extra_timeframes = [s.strip() for s in os.environ.get("XGB_EXTRA_TFS", "4h,1d").split(',') if s.strip()]
@@ -55,8 +61,10 @@ class XGBTopBotStrategy(IStrategy):
         # Lazy model loading
         self._bot = None
         self._top = None
+        self._reg = None
         self._bot_cols: Optional[list[str]] = None
         self._top_cols: Optional[list[str]] = None
+        self._reg_cols: Optional[list[str]] = None
 
     def _load_xgb(self):
         import json
@@ -85,6 +93,21 @@ class XGBTopBotStrategy(IStrategy):
                     self._top_cols = json.loads(Path(fc).read_text())
                 except Exception:
                     self._top_cols = None
+
+        # Optional regressor for directional gate
+        if self.use_reg_gate and self.regressor_path and self._reg is None:
+            try:
+                reg = xgb.XGBRegressor(device=dev)
+                reg.load_model(self.regressor_path)
+                self._reg = reg
+                fc = Path(self.regressor_path).with_suffix("").as_posix() + "_feature_columns.json"
+                if os.path.exists(fc):
+                    try:
+                        self._reg_cols = json.loads(Path(fc).read_text())
+                    except Exception:
+                        self._reg_cols = None
+            except Exception:
+                self._reg = None
 
     def _view(self, df: pd.DataFrame, cols: Optional[list[str]]) -> Optional[np.ndarray]:
         if cols is None:
@@ -115,6 +138,7 @@ class XGBTopBotStrategy(IStrategy):
         # Predict probabilities
         p_bot = None
         p_top = None
+        mu = None
         if self._bot is not None and self._bot_cols is not None:
             Xb = self._view(feats, self._bot_cols)
             try:
@@ -127,6 +151,16 @@ class XGBTopBotStrategy(IStrategy):
                 p_top = self._top.predict_proba(Xt)[:, 1]
             except Exception:
                 p_top = None
+        if self.use_reg_gate and self._reg is not None:
+            # Use union feature layout if regressor columns unknown
+            if self._reg_cols is not None:
+                Xr = self._view(feats, self._reg_cols)
+            else:
+                Xr = feats.values
+            try:
+                mu = self._reg.predict(Xr)
+            except Exception:
+                mu = None
 
         n = len(feats)
         enter_long = np.zeros(n, dtype=int)
@@ -143,6 +177,26 @@ class XGBTopBotStrategy(IStrategy):
         if p_bot is not None and p_top is not None and float(self.p_margin) > 0.0:
             buy_ok &= (p_bot - p_top) >= float(self.p_margin)
             sell_ok &= (p_top - p_bot) >= float(self.p_margin)
+
+        # Optional regressor direction gate
+        if mu is not None:
+            reg_gate_up = mu > 0.0
+            reg_gate_dn = mu < 0.0
+            buy_ok &= reg_gate_up
+            sell_ok &= reg_gate_dn
+
+        # Optional RLTE pocket gating (only act when price inside respective pocket)
+        if self.use_rlte_gate:
+            if "rlte_price_inside_buy" in feats.columns:
+                buy_ok &= feats["rlte_price_inside_buy"].astype(float).values > 0.0
+            if "rlte_price_inside_sell" in feats.columns:
+                sell_ok &= feats["rlte_price_inside_sell"].astype(float).values > 0.0
+
+        # Optional direction disable
+        if self.disable_longs:
+            buy_ok &= False
+        if self.disable_shorts:
+            sell_ok &= False
 
         # Convert to entries/exits with min-hold and cooldown
         last_change = -10**9
@@ -193,6 +247,8 @@ class XGBTopBotStrategy(IStrategy):
             df["p_bottom"] = p_bot
         if p_top is not None:
             df["p_top"] = p_top
+        if mu is not None:
+            df["mu_pred"] = mu
         return df
 
     def populate_entry_trend(self, df: DataFrame, metadata: dict) -> DataFrame:
