@@ -2354,6 +2354,11 @@ def xgb_eval(
     down_model: str = typer.Option("", help="Optional impulse-down classifier model .json for plotting"),
     p_up_thr: float = typer.Option(0.6, help="Threshold for plotting impulse-up signals"),
     p_dn_thr: float = typer.Option(0.6, help="Threshold for plotting impulse-down signals"),
+    impulse_horizon: int | None = typer.Option(None, help="Bars ahead used to evaluate impulse hits; defaults to --horizon"),
+    p_margin: float = typer.Option(0.0, help="Require p_up - p_dn >= margin (and vice versa)"),
+    min_gap: int = typer.Option(0, help="Minimum bars between plotted signals per direction"),
+    top_k: int = typer.Option(0, help="Plot only top-K signals per direction within tail window (0=all)"),
+    marker_size: int = typer.Option(36, help="Marker size for impulse markers"),
     # Plotting
     make_plots: bool = typer.Option(False, help="Save validation charts"),
     plot_outdir: str = typer.Option("", help="Directory for plots; defaults under model folder"),
@@ -2497,6 +2502,12 @@ def xgb_eval(
                 X_dn = _view(X_df, dn_cols) if (dnc is not None and dn_cols is not None) else None
                 y = y[:valid_len]
 
+                # Impulse evaluation horizon (can differ from regressor horizon)
+                H_imp = int(impulse_horizon) if (impulse_horizon is not None) else H
+                y_imp = (logp.shift(-H_imp) - logp).to_numpy()
+                valid_len_imp = len(feats) - H_imp
+                limit_common = int(min(valid_len, valid_len_imp))
+
                 # Compute impulse probabilities (full) if models provided
                 p_up = None
                 p_dn = None
@@ -2548,11 +2559,16 @@ def xgb_eval(
                     p_up_mean = _safe_mean(p_up)
                     p_up_q95 = _safe_q(p_up, 0.95)
                     p_up_max = float(np.max(p_up)) if p_up.size > 0 else float("nan")
-                    up_mask_full = p_up >= float(p_up_thr)
+                    p_up_c = p_up[:limit_common]
+                    p_dn_c = p_dn[:limit_common] if p_dn is not None else None
+                    y_imp_c = y_imp[:limit_common]
+                    up_mask_full = p_up_c >= float(p_up_thr)
+                    if p_dn_c is not None and float(p_margin) > 0.0:
+                        up_mask_full &= (p_up_c - p_dn_c) >= float(p_margin)
                     sig_up_cnt = int(np.sum(up_mask_full))
-                    sig_up_rate = float(np.mean(up_mask_full)) if p_up.size > 0 else float("nan")
+                    sig_up_rate = float(np.mean(up_mask_full)) if p_up_c.size > 0 else float("nan")
                     if np.any(up_mask_full):
-                        y_up = y[up_mask_full]
+                        y_up = y_imp_c[up_mask_full]
                         sig_up_hit_rate = float(np.mean(y_up > 0.0))
                         sig_up_avg_ret_bps = float(np.mean(y_up) * 1e4)
 
@@ -2560,11 +2576,16 @@ def xgb_eval(
                     p_dn_mean = _safe_mean(p_dn)
                     p_dn_q95 = _safe_q(p_dn, 0.95)
                     p_dn_max = float(np.max(p_dn)) if p_dn.size > 0 else float("nan")
-                    dn_mask_full = p_dn >= float(p_dn_thr)
+                    p_dn_c = p_dn[:limit_common]
+                    p_up_c2 = p_up[:limit_common] if p_up is not None else None
+                    y_imp_c2 = y_imp[:limit_common]
+                    dn_mask_full = p_dn_c >= float(p_dn_thr)
+                    if p_up_c2 is not None and float(p_margin) > 0.0:
+                        dn_mask_full &= (p_dn_c - p_up_c2) >= float(p_margin)
                     sig_dn_cnt = int(np.sum(dn_mask_full))
-                    sig_dn_rate = float(np.mean(dn_mask_full)) if p_dn.size > 0 else float("nan")
+                    sig_dn_rate = float(np.mean(dn_mask_full)) if p_dn_c.size > 0 else float("nan")
                     if np.any(dn_mask_full):
-                        y_dn = y[dn_mask_full]
+                        y_dn = y_imp_c2[dn_mask_full]
                         sig_dn_hit_rate = float(np.mean(y_dn < 0.0))
                         sig_dn_avg_ret_bps = float(np.mean(y_dn) * 1e4)
 
@@ -2617,6 +2638,16 @@ def xgb_eval(
                         p_up_tail = p_up[-m:] if p_up is not None else None
                         p_dn_tail = p_dn[-m:] if p_dn is not None else None
 
+                        # Forward returns for impulse horizon aligned to tail window
+                        start_p = max(0, valid_len - m)
+                        tail_len = m
+                        # y_imp available up to index valid_len_imp - 1
+                        avail_tail_len = max(0, min(tail_len, valid_len_imp - start_p))
+                        y_imp_tail = None
+                        if avail_tail_len > 0:
+                            y_imp_tail = np.full(tail_len, np.nan, dtype=float)
+                            y_imp_tail[:avail_tail_len] = y_imp[start_p:start_p + avail_tail_len]
+
                         fig, ax1 = plt.subplots(figsize=(15, 7))
                         ax1.plot(idx_tail, price_tail, color="#2c3e50", linewidth=1.0, label="Close")
                         ax1.set_xlabel("Time")
@@ -2639,18 +2670,68 @@ def xgb_eval(
                         ax3.spines.right.set_position(("axes", 1.08))
                         ax3.set_ylabel("Probability")
                         ax3.set_ylim(0.0, 1.0)
+                        def _enforce_min_gap(mask: np.ndarray, gap: int) -> np.ndarray:
+                            if mask is None:
+                                return mask
+                            if gap <= 0:
+                                return mask
+                            out = np.zeros_like(mask, dtype=bool)
+                            last_idx = -10**9
+                            idxs = np.where(mask)[0]
+                            for i in idxs:
+                                if i - last_idx > gap:
+                                    out[i] = True
+                                    last_idx = i
+                            return out
+
                         if p_up_tail is not None:
                             ax3.plot(idx_tail, p_up_tail, color="#2ecc71", alpha=0.8, label="p_up")
                             ax3.axhline(y=float(p_up_thr), color="#27ae60", ls="--", lw=0.8, alpha=0.6, label="up_thr")
                             up_mask = p_up_tail >= float(p_up_thr)
+                            if p_dn_tail is not None and float(p_margin) > 0.0:
+                                up_mask &= (p_up_tail - p_dn_tail) >= float(p_margin)
+                            # top-K selection
+                            if int(top_k) > 0:
+                                idxs = np.where(up_mask)[0]
+                                if idxs.size > int(top_k):
+                                    scores = p_up_tail[idxs]
+                                    keep_rel = idxs[np.argsort(scores)][-int(top_k):]
+                                    new_mask = np.zeros_like(up_mask, dtype=bool)
+                                    new_mask[keep_rel] = True
+                                    up_mask = new_mask
+                            # min-gap enforcement
+                            up_mask = _enforce_min_gap(up_mask, int(min_gap))
                             if np.any(up_mask):
-                                ax1.scatter(idx_tail[up_mask], price_tail[up_mask], marker="^", color="#27ae60", s=36, label="impulse_up")
+                                # Color by hit/miss using impulse horizon if available
+                                colors = np.array(["#27ae60"] * len(up_mask), dtype=object)
+                                if y_imp_tail is not None:
+                                    hits = (y_imp_tail > 0.0)
+                                    # miss -> gray
+                                    miss_mask = up_mask & (~np.isnan(y_imp_tail)) & (~hits)
+                                    colors[miss_mask] = "#95a5a6"
+                                ax1.scatter(idx_tail[up_mask], price_tail[up_mask], marker="^", color=colors[up_mask], s=int(marker_size), label="impulse_up")
                         if p_dn_tail is not None:
                             ax3.plot(idx_tail, p_dn_tail, color="#e74c3c", alpha=0.8, label="p_dn")
                             ax3.axhline(y=float(p_dn_thr), color="#c0392b", ls="--", lw=0.8, alpha=0.6, label="dn_thr")
                             dn_mask = p_dn_tail >= float(p_dn_thr)
+                            if p_up_tail is not None and float(p_margin) > 0.0:
+                                dn_mask &= (p_dn_tail - p_up_tail) >= float(p_margin)
+                            if int(top_k) > 0:
+                                idxs = np.where(dn_mask)[0]
+                                if idxs.size > int(top_k):
+                                    scores = p_dn_tail[idxs]
+                                    keep_rel = idxs[np.argsort(scores)][-int(top_k):]
+                                    new_mask = np.zeros_like(dn_mask, dtype=bool)
+                                    new_mask[keep_rel] = True
+                                    dn_mask = new_mask
+                            dn_mask = _enforce_min_gap(dn_mask, int(min_gap))
                             if np.any(dn_mask):
-                                ax1.scatter(idx_tail[dn_mask], price_tail[dn_mask], marker="v", color="#c0392b", s=36, label="impulse_dn")
+                                colors = np.array(["#c0392b"] * len(dn_mask), dtype=object)
+                                if y_imp_tail is not None:
+                                    hits = (y_imp_tail < 0.0)
+                                    miss_mask = dn_mask & (~np.isnan(y_imp_tail)) & (~hits)
+                                    colors[miss_mask] = "#95a5a6"
+                                ax1.scatter(idx_tail[dn_mask], price_tail[dn_mask], marker="v", color=colors[dn_mask], s=int(marker_size), label="impulse_dn")
                         # Legends
                         lines1, labels1 = ax1.get_legend_handles_labels()
                         lines2, labels2 = ax2.get_legend_handles_labels()
