@@ -2409,9 +2409,18 @@ def xgb_eval(
     if up_model:
         upc = xgb.XGBClassifier(device=dev)
         upc.load_model(up_model)
+        # Guard: require feature columns to avoid shape mismatch
+        if up_cols is None:
+            exp = Path(up_model).with_suffix("").as_posix() + "_feature_columns.json"
+            typer.echo(f"WARNING: Missing feature columns for up_model. Expected: {exp}. Overlay disabled.")
+            upc = None
     if down_model:
         dnc = xgb.XGBClassifier(device=dev)
         dnc.load_model(down_model)
+        if dn_cols is None:
+            exp = Path(down_model).with_suffix("").as_posix() + "_feature_columns.json"
+            typer.echo(f"WARNING: Missing feature columns for down_model. Expected: {exp}. Overlay disabled.")
+            dnc = None
 
     # IC function
     def _ic(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -2466,18 +2475,18 @@ def xgb_eval(
                     typer.echo(f"Skip: insufficient length for {pr} {tf}")
                     continue
                 X_df = feats.iloc[:valid_len, :].copy()
-                # Views per model
-                def _view(df: pd.DataFrame, cols: list[str] | None) -> np.ndarray:
-                    if not cols:
-                        return df.values
+                # Views per model (exact order & width). If model columns unavailable, disable overlay.
+                def _view(df: pd.DataFrame, cols: list[str]) -> np.ndarray:
                     out = df.copy()
-                    for c in cols:
-                        if c not in out.columns:
-                            out[c] = 0.0
+                    miss = [c for c in cols if c not in out.columns]
+                    for c in miss:
+                        out[c] = 0.0
                     return out.reindex(columns=cols).values
+                if model_cols is None:
+                    raise RuntimeError("Regressor feature_columns.json is required for evaluation plots.")
                 X_reg = _view(X_df, model_cols)
-                X_up = _view(X_df, up_cols) if upc is not None else None
-                X_dn = _view(X_df, dn_cols) if dnc is not None else None
+                X_up = _view(X_df, up_cols) if (upc is not None and up_cols is not None) else None
+                X_dn = _view(X_df, dn_cols) if (dnc is not None and dn_cols is not None) else None
                 y = y[:valid_len]
 
                 # Predict and score
