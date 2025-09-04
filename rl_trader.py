@@ -626,6 +626,118 @@ def backtest(
 
 
 @app.command()
+def xgb_backtest(
+    reg_model: str = typer.Option(..., help="Path to trained regressor .json"),
+    up_model: str = typer.Option(..., help="Path to trained bottom (up) classifier .json"),
+    down_model: str = typer.Option(..., help="Path to trained top (down) classifier .json"),
+    pairs: str = typer.Option("BTC/USDT,ETH/USDT,SOL/USDT,XRP/USDT", help="Comma-separated pairs"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    exchange: str = typer.Option("bybit"),
+    timerange: str = typer.Option("20250101-"),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("4h,1d"),
+    p_up_thr: float = typer.Option(0.6),
+    p_dn_thr: float = typer.Option(0.6),
+    p_margin: float = typer.Option(0.0),
+    min_hold_bars: int = typer.Option(8),
+    cooldown_bars: int = typer.Option(0),
+    impulse_horizon: int = typer.Option(8),
+    xgb_device: str = typer.Option("auto", help="auto|cpu|cuda"),
+):
+    """Run Freqtrade backtest using XGBImpulseStrategy over multiple pairs."""
+    # Ensure datasets exist
+    pair_list = [p.strip() for p in pairs.split(",") if p.strip()]
+    for pr in pair_list:
+        try:
+            _ = _ensure_dataset(userdir, pr, timeframe, exchange=exchange, timerange=timerange)
+        except Exception as e:
+            typer.echo(f"Auto-download failed for {pr} {timeframe}: {e}")
+
+    # Prepare config specific for XGB backtest
+    cfg_path = Path(userdir) / "config.xgb.json"
+    if not cfg_path.exists():
+        cfg = {
+            "timeframe": timeframe,
+            "user_data_dir": str(userdir),
+            "strategy": "XGBImpulseStrategy",
+            "exchange": {
+                "name": exchange,
+                "key": "",
+                "secret": "",
+                "pair_whitelist": pair_list,
+            },
+            "stake_currency": "USDT",
+            "stake_amount": "unlimited",
+            "dry_run": True,
+            "max_open_trades": 1,
+            "trading_mode": "futures",
+            "margin_mode": "isolated",
+            "dataformat_ohlcv": "parquet",
+        }
+        os.makedirs(userdir, exist_ok=True)
+        with open(cfg_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+    else:
+        # Update pair whitelist if needed
+        try:
+            cfg = json.loads(Path(cfg_path).read_text())
+            if isinstance(cfg, dict):
+                ex = cfg.get("exchange", {})
+                ex["pair_whitelist"] = pair_list
+                cfg["exchange"] = ex
+                cfg["timeframe"] = timeframe
+                with open(cfg_path, "w") as f:
+                    json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
+
+    # Environment variables consumed by strategy
+    env = os.environ.copy()
+    env["XGB_REG_PATH"] = reg_model
+    env["XGB_UP_PATH"] = up_model
+    env["XGB_DN_PATH"] = down_model
+    env["XGB_P_UP_THR"] = str(p_up_thr)
+    env["XGB_P_DN_THR"] = str(p_dn_thr)
+    env["XGB_P_MARGIN"] = str(p_margin)
+    env["XGB_MIN_HOLD"] = str(min_hold_bars)
+    env["XGB_COOLDOWN"] = str(cooldown_bars)
+    env["XGB_IMPULSE_H"] = str(impulse_horizon)
+    env["XGB_FEAT_MODE"] = feature_mode
+    env["XGB_EXTRA_TFS"] = extra_timeframes
+    env["XGB_DEVICE"] = xgb_device
+
+    # Run freqtrade backtesting once across all pairs
+    cmd = [
+        "freqtrade", "backtesting",
+        "--userdir", userdir,
+        "--config", str(cfg_path),
+        "--strategy", "XGBImpulseStrategy",
+        "--timeframe", timeframe,
+        "--timerange", timerange,
+    ]
+    # Explicitly pass pairs (also present in config) for clarity
+    for pr in pair_list:
+        cmd.extend(["--pairs", pr])
+    typer.echo(f"Running: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True, env=env)
+
+    # Locate latest backtest artifacts and print brief summary
+    res = _find_latest_backtest_artifacts(Path(userdir) / "backtest_results")
+    if res.get("zip"):
+        try:
+            metrics = _extract_metrics_from_backtest_zip(res["zip"] or "")
+            if metrics:
+                typer.echo(f"Backtest summary: {json.dumps(metrics)}")
+            else:
+                typer.echo("Backtest completed. See backtest_results directory.")
+        except Exception:
+            typer.echo("Backtest completed. See backtest_results directory.")
+    else:
+        typer.echo("Backtest completed. Results zip not found.")
+
+@app.command()
 def sweep(
     pair: str = typer.Option("BTC/USDT:USDT"),
     timeframe: str = typer.Option("1h"),
