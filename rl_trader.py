@@ -2648,28 +2648,7 @@ def xgb_eval(
                             y_imp_tail = np.full(tail_len, np.nan, dtype=float)
                             y_imp_tail[:avail_tail_len] = y_imp[start_p:start_p + avail_tail_len]
 
-                        fig, ax1 = plt.subplots(figsize=(15, 7))
-                        ax1.plot(idx_tail, price_tail, color="#2c3e50", linewidth=1.0, label="Close")
-                        ax1.set_xlabel("Time")
-                        ax1.set_ylabel("Price")
-                        if isinstance(idx_tail, pd.DatetimeIndex):
-                            locator = mdates.AutoDateLocator()
-                            formatter = mdates.ConciseDateFormatter(locator)
-                            ax1.xaxis.set_major_locator(locator)
-                            ax1.xaxis.set_major_formatter(formatter)
-                        ax2 = ax1.twinx()
-                        # Scale returns to bps for readability on returns axis
-                        y_pred_bps = np.asarray(y_pred_tail, dtype=float) * 1e4
-                        y_true_bps = np.asarray(y_tail, dtype=float) * 1e4
-                        ax2.plot(idx_tail, y_pred_bps, color="#1f77b4", alpha=0.9, label="mu_pred (bps)")
-                        ax2.plot(idx_tail, y_true_bps, color="#ff7f0e", alpha=0.7, label=f"fwd_ret_H{horizon} (bps)")
-                        ax2.set_ylabel("Returns")
-
-                        # Dedicated probability axis for p_up/p_dn
-                        ax3 = ax1.twinx()
-                        ax3.spines.right.set_position(("axes", 1.08))
-                        ax3.set_ylabel("Probability")
-                        ax3.set_ylim(0.0, 1.0)
+                        # Helper to enforce minimum bar gap between markers
                         def _enforce_min_gap(mask: np.ndarray, gap: int) -> np.ndarray:
                             if mask is None:
                                 return mask
@@ -2683,14 +2662,15 @@ def xgb_eval(
                                     out[i] = True
                                     last_idx = i
                             return out
-
+                        # Build masks and colors once
+                        up_mask = None
+                        dn_mask = None
+                        up_colors = None
+                        dn_colors = None
                         if p_up_tail is not None:
-                            ax3.plot(idx_tail, p_up_tail, color="#2ecc71", alpha=0.8, label="p_up")
-                            ax3.axhline(y=float(p_up_thr), color="#27ae60", ls="--", lw=0.8, alpha=0.6, label="up_thr")
                             up_mask = p_up_tail >= float(p_up_thr)
                             if p_dn_tail is not None and float(p_margin) > 0.0:
                                 up_mask &= (p_up_tail - p_dn_tail) >= float(p_margin)
-                            # top-K selection
                             if int(top_k) > 0:
                                 idxs = np.where(up_mask)[0]
                                 if idxs.size > int(top_k):
@@ -2699,20 +2679,14 @@ def xgb_eval(
                                     new_mask = np.zeros_like(up_mask, dtype=bool)
                                     new_mask[keep_rel] = True
                                     up_mask = new_mask
-                            # min-gap enforcement
                             up_mask = _enforce_min_gap(up_mask, int(min_gap))
                             if np.any(up_mask):
-                                # Color by hit/miss using impulse horizon if available
-                                colors = np.array(["#27ae60"] * len(up_mask), dtype=object)
+                                up_colors = np.array(["#27ae60"] * len(up_mask), dtype=object)
                                 if y_imp_tail is not None:
                                     hits = (y_imp_tail > 0.0)
-                                    # miss -> gray
                                     miss_mask = up_mask & (~np.isnan(y_imp_tail)) & (~hits)
-                                    colors[miss_mask] = "#95a5a6"
-                                ax1.scatter(idx_tail[up_mask], price_tail[up_mask], marker="^", color=colors[up_mask], s=int(marker_size), label="impulse_up")
+                                    up_colors[miss_mask] = "#95a5a6"
                         if p_dn_tail is not None:
-                            ax3.plot(idx_tail, p_dn_tail, color="#e74c3c", alpha=0.8, label="p_dn")
-                            ax3.axhline(y=float(p_dn_thr), color="#c0392b", ls="--", lw=0.8, alpha=0.6, label="dn_thr")
                             dn_mask = p_dn_tail >= float(p_dn_thr)
                             if p_up_tail is not None and float(p_margin) > 0.0:
                                 dn_mask &= (p_dn_tail - p_up_tail) >= float(p_margin)
@@ -2726,23 +2700,81 @@ def xgb_eval(
                                     dn_mask = new_mask
                             dn_mask = _enforce_min_gap(dn_mask, int(min_gap))
                             if np.any(dn_mask):
-                                colors = np.array(["#c0392b"] * len(dn_mask), dtype=object)
+                                dn_colors = np.array(["#c0392b"] * len(dn_mask), dtype=object)
                                 if y_imp_tail is not None:
                                     hits = (y_imp_tail < 0.0)
                                     miss_mask = dn_mask & (~np.isnan(y_imp_tail)) & (~hits)
-                                    colors[miss_mask] = "#95a5a6"
-                                ax1.scatter(idx_tail[dn_mask], price_tail[dn_mask], marker="v", color=colors[dn_mask], s=int(marker_size), label="impulse_dn")
-                        # Legends
-                        lines1, labels1 = ax1.get_legend_handles_labels()
-                        lines2, labels2 = ax2.get_legend_handles_labels()
-                        lines3, labels3 = ax3.get_legend_handles_labels()
-                        ax1.legend(lines1 + lines2 + lines3, labels1 + labels2 + labels3, loc="upper left")
-                        fig.tight_layout()
+                                    dn_colors[miss_mask] = "#95a5a6"
+
+                        # Figure 1: Price + markers
+                        fig_price, axp = plt.subplots(figsize=(15, 7))
+                        axp.plot(idx_tail, price_tail, color="#2c3e50", linewidth=1.0, label="Close")
+                        axp.set_xlabel("Time")
+                        axp.set_ylabel("Price")
+                        if isinstance(idx_tail, pd.DatetimeIndex):
+                            locator = mdates.AutoDateLocator()
+                            formatter = mdates.ConciseDateFormatter(locator)
+                            axp.xaxis.set_major_locator(locator)
+                            axp.xaxis.set_major_formatter(formatter)
+                        if up_mask is not None and np.any(up_mask):
+                            axp.scatter(idx_tail[up_mask], price_tail[up_mask], marker="^", color=up_colors[up_mask], s=int(marker_size), label="impulse_up")
+                        if dn_mask is not None and np.any(dn_mask):
+                            axp.scatter(idx_tail[dn_mask], price_tail[dn_mask], marker="v", color=dn_colors[dn_mask], s=int(marker_size), label="impulse_dn")
+                        axp.legend(loc="upper left")
+                        fig_price.tight_layout()
+
+                        # Figure 2: Probabilities
+                        if (p_up_tail is not None) or (p_dn_tail is not None):
+                            fig_prob, axpr = plt.subplots(figsize=(15, 4))
+                            axpr.set_title("Impulse Probabilities")
+                            if isinstance(idx_tail, pd.DatetimeIndex):
+                                locator = mdates.AutoDateLocator()
+                                formatter = mdates.ConciseDateFormatter(locator)
+                                axpr.xaxis.set_major_locator(locator)
+                                axpr.xaxis.set_major_formatter(formatter)
+                            axpr.set_ylim(0.0, 1.0)
+                            if p_up_tail is not None:
+                                axpr.plot(idx_tail, p_up_tail, color="#2ecc71", alpha=0.9, label="p_up")
+                                axpr.axhline(y=float(p_up_thr), color="#27ae60", ls="--", lw=0.8, alpha=0.6, label="up_thr")
+                            if p_dn_tail is not None:
+                                axpr.plot(idx_tail, p_dn_tail, color="#e74c3c", alpha=0.9, label="p_dn")
+                                axpr.axhline(y=float(p_dn_thr), color="#c0392b", ls="--", lw=0.8, alpha=0.6, label="dn_thr")
+                            axpr.legend(loc="upper left")
+                            fig_prob.tight_layout()
+                        else:
+                            fig_prob = None
+
+                        # Figure 3: Returns (bps)
+                        fig_ret, axr = plt.subplots(figsize=(15, 4))
+                        if isinstance(idx_tail, pd.DatetimeIndex):
+                            locator = mdates.AutoDateLocator()
+                            formatter = mdates.ConciseDateFormatter(locator)
+                            axr.xaxis.set_major_locator(locator)
+                            axr.xaxis.set_major_formatter(formatter)
+                        y_pred_bps = np.asarray(y_pred_tail, dtype=float) * 1e4
+                        y_true_bps = np.asarray(y_tail, dtype=float) * 1e4
+                        axr.plot(idx_tail, y_pred_bps, color="#1f77b4", alpha=0.9, label="mu_pred (bps)")
+                        axr.plot(idx_tail, y_true_bps, color="#ff7f0e", alpha=0.7, label=f"fwd_ret_H{horizon} (bps)")
+                        axr.set_ylabel("bps")
+                        axr.legend(loc="upper left")
+                        fig_ret.tight_layout()
+
+                        # Save all
                         ts_tag = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-                        fname = f"{pr.replace('/','_')}_{tf}_H{int(horizon)}_{ts_tag}.png".replace(":","-")
-                        fig.savefig(os.path.join(outdir, fname), dpi=150)
-                        plt.close(fig)
-                        typer.echo(f"Saved plot: {os.path.join(outdir, fname)}")
+                        base = f"{pr.replace('/','_')}_{tf}_H{int(horizon)}_{ts_tag}".replace(":","-")
+                        f_price = os.path.join(outdir, base + "_price.png")
+                        fig_price.savefig(f_price, dpi=150)
+                        plt.close(fig_price)
+                        typer.echo(f"Saved plot: {f_price}")
+                        if fig_prob is not None:
+                            f_prob = os.path.join(outdir, base + "_probs.png")
+                            fig_prob.savefig(f_prob, dpi=150)
+                            plt.close(fig_prob)
+                            typer.echo(f"Saved plot: {f_prob}")
+                        f_ret = os.path.join(outdir, base + "_returns.png")
+                        fig_ret.savefig(f_ret, dpi=150)
+                        plt.close(fig_ret)
+                        typer.echo(f"Saved plot: {f_ret}")
                     except Exception as _pe:
                         typer.echo(f"Plot failed for {pr} {tf}: {_pe}")
             except Exception as e:
