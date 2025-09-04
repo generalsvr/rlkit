@@ -1976,6 +1976,7 @@ def xgb_impulse_tune(
     best_paths = {"up": "", "down": ""}
 
     def objective(trial):
+        nonlocal best_val, best_paths
         dev = _resolve_device()
         if dev == "cuda":
             typer.echo(f"CUDA detected: using GPU for Impulse trial {trial.number}")
@@ -2156,9 +2157,16 @@ def xgb_impulse_tune(
             if val > float(best_val):
                 up_clf.save_model(model_up_path)
                 dn_clf.save_model(model_dn_path)
-                feat_cols_path = str(Path(model_up_path).with_suffix("").as_posix()) + "_feature_columns.json"
-                with open(feat_cols_path, "w") as f:
+                # Save feature schemas for BOTH models
+                feat_cols_up_path = str(Path(model_up_path).with_suffix("").as_posix()) + "_feature_columns.json"
+                with open(feat_cols_up_path, "w") as f:
                     json.dump(list(X_tr.columns), f)
+                feat_cols_dn_path = str(Path(model_dn_path).with_suffix("").as_posix()) + "_feature_columns.json"
+                with open(feat_cols_dn_path, "w") as f:
+                    json.dump(list(X_tr.columns), f)
+                best_val = float(val)
+                best_paths["up"] = model_up_path
+                best_paths["down"] = model_dn_path
         except Exception:
             pass
 
@@ -2544,8 +2552,11 @@ def xgb_eval(
                             ax1.xaxis.set_major_locator(locator)
                             ax1.xaxis.set_major_formatter(formatter)
                         ax2 = ax1.twinx()
-                        ax2.plot(idx_tail, y_pred_tail, color="#1f77b4", alpha=0.9, label="mu_pred")
-                        ax2.plot(idx_tail, y_tail, color="#ff7f0e", alpha=0.7, label=f"fwd_ret_H{horizon}")
+                        # Scale returns to bps for readability
+                        y_pred_bps = np.asarray(y_pred_tail, dtype=float) * 1e4
+                        y_true_bps = np.asarray(y_tail, dtype=float) * 1e4
+                        ax2.plot(idx_tail, y_pred_bps, color="#1f77b4", alpha=0.9, label="mu_pred (bps)")
+                        ax2.plot(idx_tail, y_true_bps, color="#ff7f0e", alpha=0.7, label=f"fwd_ret_H{horizon} (bps)")
                         ax2.set_ylabel("Returns")
                         # Impulse overlay
                         if p_up_tail is not None:
