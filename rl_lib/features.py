@@ -384,6 +384,60 @@ def make_features(
             "expected_shortfall_0_05_128": expected_shortfall,
         }, index=base.index)
 
+        # RLTE pockets (Linear Regression 90 over price with BB(30, 0.9))
+        try:
+            idx = np.arange(len(c), dtype=float)
+            L_reg = 90
+            # Rolling sums for slope/intercept in O(T)
+            s_idx = pd.Series(idx)
+            s_c = pd.Series(c)
+            roll = L_reg
+            minp = 10
+            sum_x = s_idx.rolling(roll, min_periods=minp).sum()
+            sum_y = s_c.rolling(roll, min_periods=minp).sum()
+            sum_xx = pd.Series(idx * idx).rolling(roll, min_periods=minp).sum()
+            sum_xy = pd.Series(idx * c).rolling(roll, min_periods=minp).sum()
+            n = s_idx.rolling(roll, min_periods=minp).count()
+            denom = (n * sum_xx - sum_x * sum_x).replace(0.0, np.nan)
+            slope = (n * sum_xy - sum_x * sum_y) / denom
+            intercept = (sum_y - slope * sum_x) / n
+            reg90 = (slope * s_idx + intercept).to_numpy()
+            # Fill early NaNs conservatively
+            reg90 = np.nan_to_num(reg90, nan=c.astype(float))
+
+            # Bollinger(30, 0.9)
+            bb_len = 30
+            bb_mult = 0.9
+            bb_mid_rlte = pd.Series(c).rolling(bb_len, min_periods=1).mean()
+            bb_std_rlte = pd.Series(c).rolling(bb_len, min_periods=1).std().fillna(0.0)
+            bb_upper_rlte = (bb_mid_rlte + bb_mult * bb_std_rlte).to_numpy()
+            bb_lower_rlte = (bb_mid_rlte - bb_mult * bb_std_rlte).to_numpy()
+
+            in_buy = (reg90 < bb_lower_rlte).astype(float)
+            in_sell = (reg90 > bb_upper_rlte).astype(float)
+            buy_gap = np.maximum(0.0, bb_lower_rlte - reg90) / (c + 1e-12)
+            sell_gap = np.maximum(0.0, reg90 - bb_upper_rlte) / (c + 1e-12)
+            price_inside_buy = ((in_buy > 0) & (c >= reg90) & (c <= bb_lower_rlte)).astype(float)
+            price_inside_sell = ((in_sell > 0) & (c >= bb_upper_rlte) & (c <= reg90)).astype(float)
+            reg90_ratio = (reg90 - c) / (c + 1e-12)
+
+            feats["rlte_reg90_ratio"] = reg90_ratio
+            feats["rlte_in_buy_pocket"] = in_buy.astype(float)
+            feats["rlte_in_sell_pocket"] = in_sell.astype(float)
+            feats["rlte_buy_pocket_gap"] = buy_gap.astype(float)
+            feats["rlte_sell_pocket_gap"] = sell_gap.astype(float)
+            feats["rlte_price_inside_buy"] = price_inside_buy.astype(float)
+            feats["rlte_price_inside_sell"] = price_inside_sell.astype(float)
+        except Exception:
+            # If RLTE computation fails, add zeros to preserve schema
+            feats["rlte_reg90_ratio"] = 0.0
+            feats["rlte_in_buy_pocket"] = 0.0
+            feats["rlte_in_sell_pocket"] = 0.0
+            feats["rlte_buy_pocket_gap"] = 0.0
+            feats["rlte_sell_pocket_gap"] = 0.0
+            feats["rlte_price_inside_buy"] = 0.0
+            feats["rlte_price_inside_sell"] = 0.0
+
         # Multi-timeframe moving averages inspired by Pine script (daily/weekly)
         # Compute on resampled closes and forward-fill to align with base index
         if isinstance(base.index, pd.DatetimeIndex):

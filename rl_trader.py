@@ -1498,6 +1498,8 @@ def xgb_tune(
         "candle_body_frac","upper_shadow_frac","lower_shadow_frac","candle_trend_persistence","kurtosis_rolling_100",
         "dfa_exponent_64","entropy_return_64",
         "drawdown_z_64","expected_shortfall_0_05_128",
+        # RLTE pocket features
+        "rlte_reg90_ratio","rlte_in_buy_pocket","rlte_in_sell_pocket","rlte_buy_pocket_gap","rlte_sell_pocket_gap","rlte_price_inside_buy","rlte_price_inside_sell",
         "MA365D","MA200D","MA50D","MA20W",
     ]
 
@@ -1895,6 +1897,8 @@ def xgb_impulse_tune(
         "candle_body_frac","upper_shadow_frac","lower_shadow_frac","candle_trend_persistence","kurtosis_rolling_100",
         "dfa_exponent_64","entropy_return_64",
         "drawdown_z_64","expected_shortfall_0_05_128",
+        # RLTE pocket features
+        "rlte_reg90_ratio","rlte_in_buy_pocket","rlte_in_sell_pocket","rlte_buy_pocket_gap","rlte_sell_pocket_gap","rlte_price_inside_buy","rlte_price_inside_sell",
         "MA365D","MA200D","MA50D","MA20W",
     ]
 
@@ -2198,6 +2202,348 @@ def xgb_impulse_tune(
             csv.DictWriter(f, fieldnames=fields).writerow(row)
         return float(val)
 
+    if isinstance(smp, GridSampler):
+        try:
+            grid_dict = smp.search_space()  # type: ignore[attr-defined]
+            grid_size = 1
+            for v in grid_dict.values():
+                grid_size *= max(1, len(v))
+            study.optimize(objective, n_trials=grid_size)
+        except Exception:
+            study.optimize(objective, n_trials=n_trials)
+    else:
+        study.optimize(objective, n_trials=n_trials)
+
+    with open(tune_dir / "best_value.txt", "w") as f:
+        f.write(str(study.best_value))
+    with open(tune_dir / "best_params.json", "w") as f:
+        json.dump(study.best_params, f, indent=2)
+    typer.echo(f"Best value: {study.best_value}\nBest params: {json.dumps(study.best_params)}")
+
+@app.command()
+def xgb_topbot_tune(
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    exchange: str = typer.Option("bybit"),
+    timerange: str = typer.Option("20190101-"),
+    eval_timerange: str = typer.Option("", help="Validation slice YYYYMMDD-YYYYMMDD"),
+    train_ratio: float = typer.Option(0.8),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("", help="Optional HTFs e.g. '4H,1D' or multiple sets with ';'"),
+    left_bars: int = typer.Option(3, help="Pivot left window L (>=1)"),
+    right_bars: int = typer.Option(3, help="Pivot right window R (>=1)"),
+    min_gap_bars: int = typer.Option(4, help="Min bars between successive pivots"),
+    sampler: str = typer.Option("tpe", help="tpe|random|grid"),
+    n_trials: int = typer.Option(40),
+    seed: int = typer.Option(42),
+    optimize_features: bool = typer.Option(True),
+    max_features: int = typer.Option(0),
+    n_jobs: int = typer.Option(0),
+    xgb_device: str = typer.Option("auto", help="auto|cpu|cuda"),
+    oversample_pos: float = typer.Option(0.0, help="Duplicate positives by this factor"),
+    autofetch: bool = typer.Option(True),
+    outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_topbot")),
+):
+    """Tune XGB classifiers for local bottoms (buy) and tops (sell) via pivot labels."""
+    try:
+        import optuna
+        from optuna.samplers import TPESampler, RandomSampler, GridSampler
+        import numpy as _np
+        import pandas as _pd
+        import xgboost as xgb
+        from sklearn.metrics import average_precision_score
+    except Exception as e:
+        raise RuntimeError("Missing deps. Install requirements.") from e
+
+    # Ensure data
+    if autofetch:
+        try:
+            _ = _ensure_dataset(userdir, pair, timeframe, exchange=exchange, timerange=timerange)
+        except Exception as e:
+            typer.echo(f"Auto-download failed: {e}")
+    data_path = _find_data_file_internal(userdir, pair, timeframe, prefer_exchange=exchange)
+    if not data_path:
+        raise FileNotFoundError("No dataset found.")
+    raw = _load_ohlcv_internal(data_path)
+
+    # Extra TF candidates
+    if extra_timeframes and ";" in extra_timeframes:
+        etf_candidates_str = [
+            ",".join([t.strip().lower() for t in opt.split(",") if t.strip()])
+            for opt in extra_timeframes.split(";") if opt.strip()
+        ]
+    elif extra_timeframes:
+        etf_candidates_str = [
+            ",".join([t.strip().lower() for t in extra_timeframes.split(",") if t.strip()])
+        ]
+    else:
+        etf_candidates_str = ["", "4h", "1d", "4h,1d"]
+
+    def _resolve_device() -> str:
+        dev_opt = str(xgb_device).strip().lower()
+        if dev_opt == "auto":
+            try:
+                import torch  # type: ignore
+                return "cuda" if torch.cuda.is_available() else "cpu"
+            except Exception:
+                return "cuda" if os.environ.get("CUDA_VISIBLE_DEVICES") else "cpu"
+        if dev_opt in ("cpu", "cuda"):
+            return dev_opt
+        return "cpu"
+
+    base_feature_list = [
+        "logret","hl_range","upper_wick","lower_wick","rsi","vol_z","atr","ret_std_14","hurst","tail_alpha","risk_gate","ema_fast_ratio","ema_slow_ratio",
+        "sma_ratio","ema_cross_angle","lr_slope_90","macd_line","macd_signal","stoch_k","stoch_d","roc_10",
+        "bb_width_20","donchian_width_20","true_range_pct","vol_skewness_30","volatility_regime",
+        "obv_z","volume_delta_z","vwap_ratio_20",
+        "candle_body_frac","upper_shadow_frac","lower_shadow_frac","candle_trend_persistence","kurtosis_rolling_100",
+        "dfa_exponent_64","entropy_return_64",
+        "drawdown_z_64","expected_shortfall_0_05_128",
+        "rlte_reg90_ratio","rlte_in_buy_pocket","rlte_in_sell_pocket","rlte_buy_pocket_gap","rlte_sell_pocket_gap","rlte_price_inside_buy","rlte_price_inside_sell",
+        "MA365D","MA200D","MA50D","MA20W",
+    ]
+
+    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    tune_dir = Path(outdir) / ts
+    tune_dir.mkdir(parents=True, exist_ok=True)
+    results_csv = tune_dir / "results.csv"
+    with open(results_csv, "w", newline="") as f:
+        csv.DictWriter(f, fieldnames=[
+            "trial","value","auprc_bottom","auprc_top","pos_rate_bottom","pos_rate_top",
+            "features_used","extra_timeframes","L","R","device","model_bottom","model_top"
+        ]).writeheader()
+
+    if sampler.lower() == "tpe":
+        smp = TPESampler(seed=seed)
+    elif sampler.lower() == "random":
+        smp = RandomSampler(seed=seed)
+    elif sampler.lower() == "grid":
+        grid = {
+            "learning_rate": [0.03, 0.05, 0.1],
+            "max_depth": [3, 5, 7],
+            "min_child_weight": [1.0, 3.0, 5.0],
+            "subsample": [0.7, 0.9, 1.0],
+            "colsample_bytree": [0.7, 0.9, 1.0],
+            "reg_alpha": [0.0, 0.001, 0.01],
+            "reg_lambda": [1.0, 3.0, 5.0],
+            "n_estimators": [400, 800, 1200],
+            "extra_timeframes": etf_candidates_str,
+        }
+        smp = GridSampler(grid)
+    else:
+        raise typer.BadParameter("sampler must be tpe|random|grid")
+
+    def suggest_space(trial):
+        cfg = {
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.3, log=True),
+            "max_depth": trial.suggest_int("max_depth", 2, 8),
+            "min_child_weight": trial.suggest_float("min_child_weight", 0.5, 10.0, log=True),
+            "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+            "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+            "reg_alpha": trial.suggest_float("reg_alpha", 1e-5, 1.0, log=True),
+            "reg_lambda": trial.suggest_float("reg_lambda", 0.5, 20.0, log=True),
+            "n_estimators": trial.suggest_int("n_estimators", 400, 2000, step=100),
+            "extra_timeframes": trial.suggest_categorical("extra_timeframes", etf_candidates_str),
+        }
+        if optimize_features:
+            chosen: list[str] = []
+            for fname in base_feature_list:
+                if trial.suggest_categorical(f"f_{fname}", [True, False]):
+                    chosen.append(fname)
+            if max_features and len(chosen) > max_features:
+                chosen = chosen[:max_features]
+            if not chosen:
+                chosen = ["logret","rsi","atr","rlte_reg90_ratio"]
+            cfg["feature_whitelist"] = chosen
+        return cfg
+
+    # Eval slice
+    eval_start = eval_end = None
+    if eval_timerange:
+        try:
+            s, e = eval_timerange.split('-', 1)
+            eval_start = _pd.to_datetime(s) if s else None
+            eval_end = _pd.to_datetime(e) if e else None
+        except Exception:
+            eval_start = eval_end = None
+
+    best_val = float('-inf')
+    best_paths = {"bottom": "", "top": ""}
+
+    def objective(trial):
+        nonlocal best_val, best_paths
+        dev = _resolve_device()
+        if dev == "cuda":
+            typer.echo(f"CUDA: TopBot trial {trial.number}")
+        cfg = suggest_space(trial) if not isinstance(smp, GridSampler) else {k: trial.suggest_categorical(k, v) for k, v in smp.search_space().items()}  # type: ignore[attr-defined]
+        etf = [t.strip() for t in str(cfg.get("extra_timeframes", "")).split(",") if t.strip()]
+
+        # Features
+        from rl_lib.features import make_features as _make_features
+        feats = _make_features(
+            raw,
+            feature_columns=( ["open","high","low","close","volume"] + list(cfg.get("feature_whitelist", [])) ) if optimize_features else None,
+            mode=("full" if optimize_features else feature_mode),
+            basic_lookback=int(basic_lookback),
+            extra_timeframes=([s.upper() for s in etf] if etf else None),
+        )
+
+        # Labels: local pivots; enforce min gap; align causally by trimming last R bars
+        L = int(max(1, left_bars)); R = int(max(1, right_bars))
+        hi = feats["high"].astype(float).values if "high" in feats.columns else raw["high"].astype(float).values
+        lo = feats["low"].astype(float).values if "low" in feats.columns else raw["low"].astype(float).values
+        T = len(feats)
+        y_bot = _np.zeros(T, dtype=int)
+        y_top = _np.zeros(T, dtype=int)
+        for t in range(L, T - R):
+            if _np.all(lo[t] <= lo[t - L:t + R + 1]):
+                y_bot[t] = 1
+            if _np.all(hi[t] >= hi[t - L:t + R + 1]):
+                y_top[t] = 1
+        def _gap_enforce(arr: _np.ndarray, k: int) -> _np.ndarray:
+            out = _np.zeros_like(arr)
+            last = -10**9
+            idxs = _np.where(arr == 1)[0]
+            for i in idxs:
+                if i - last > k:
+                    out[i] = 1
+                    last = i
+            return out
+        if int(min_gap_bars) > 0:
+            y_bot = _gap_enforce(y_bot, int(min_gap_bars))
+            y_top = _gap_enforce(y_top, int(min_gap_bars))
+        valid_len = T - R
+        if valid_len <= 200:
+            return float('-inf')
+        X = feats.iloc[:valid_len, :].copy()
+        y_bot = y_bot[:valid_len]
+        y_top = y_top[:valid_len]
+
+        # Split
+        if eval_start is not None or eval_end is not None:
+            if not isinstance(X.index, _pd.DatetimeIndex):
+                return float('-inf')
+            idx = X.index
+            try:
+                idx_cmp = idx.tz_convert(None) if idx.tz is not None else idx
+            except Exception:
+                idx_cmp = idx.tz_localize(None) if getattr(idx, 'tz', None) is not None else idx
+            mask_val = _pd.Series(True, index=idx)
+            if eval_start is not None:
+                mask_val &= idx_cmp >= _pd.to_datetime(eval_start)
+            if eval_end is not None:
+                mask_val &= idx_cmp <= _pd.to_datetime(eval_end)
+            X_val = X.loc[mask_val].copy()
+            yb_val = y_bot[mask_val.to_numpy()]
+            yt_val = y_top[mask_val.to_numpy()]
+            X_tr = X.loc[~mask_val].copy()
+            yb_tr = y_bot[~mask_val.to_numpy()]
+            yt_tr = y_top[~mask_val.to_numpy()]
+        else:
+            cut = int(max(50, min(len(X) - 50, int(len(X) * float(train_ratio)))))
+            X_tr = X.iloc[:cut, :].copy(); X_val = X.iloc[cut:, :].copy()
+            yb_tr = y_bot[:cut]; yb_val = y_bot[cut:]
+            yt_tr = y_top[:cut]; yt_val = y_top[cut:]
+        if X_tr.empty or X_val.empty:
+            return float('-inf')
+
+        # Oversample
+        def _oversample(Xi: _np.ndarray, yi: _np.ndarray) -> tuple[_np.ndarray, _np.ndarray]:
+            r = float(oversample_pos)
+            if r <= 0.0:
+                return Xi, yi
+            pos_idx = _np.flatnonzero(yi == 1)
+            if pos_idx.size == 0:
+                return Xi, yi
+            rep = int(max(1, _np.floor(r)))
+            extra = _np.repeat(pos_idx, rep)
+            return _np.concatenate([Xi, Xi[extra]], axis=0), _np.concatenate([yi, yi[extra]], axis=0)
+
+        Xb_tr_np, yb_tr_np = _oversample(X_tr.values, yb_tr)
+        Xt_tr_np, yt_tr_np = _oversample(X_tr.values, yt_tr)
+
+        dev_for_trial = _resolve_device()
+        def _spw(y: _np.ndarray) -> float:
+            pos = float(_np.sum(y == 1)); neg = float(_np.sum(y == 0))
+            return float(max(1.0, (neg / max(1.0, pos))))
+        common_kwargs = dict(
+            objective="binary:logistic",
+            tree_method="hist",
+            device=dev_for_trial,
+            random_state=int(seed),
+            n_jobs=(int(n_jobs) if int(n_jobs) > 0 else -1),
+            learning_rate=float(cfg["learning_rate"]),
+            max_depth=int(cfg["max_depth"]),
+            min_child_weight=float(cfg["min_child_weight"]),
+            subsample=float(cfg["subsample"]),
+            colsample_bytree=float(cfg["colsample_bytree"]),
+            reg_alpha=float(cfg["reg_alpha"]),
+            reg_lambda=float(cfg["reg_lambda"]),
+            n_estimators=int(cfg["n_estimators"]),
+            eval_metric="aucpr",
+        )
+        bot_clf = xgb.XGBClassifier(**{**common_kwargs, **{"scale_pos_weight": _spw(yb_tr_np)}})
+        top_clf = xgb.XGBClassifier(**{**common_kwargs, **{"scale_pos_weight": _spw(yt_tr_np)}})
+        try:
+            bot_clf.fit(Xb_tr_np, yb_tr_np, eval_set=[(X_val.values, yb_val)], verbose=False)
+            top_clf.fit(Xt_tr_np, yt_tr_np, eval_set=[(X_val.values, yt_val)], verbose=False)
+            p_bot = bot_clf.predict_proba(X_val.values)[:, 1]
+            p_top = top_clf.predict_proba(X_val.values)[:, 1]
+        except Exception as e:
+            typer.echo(f"Trial fit failed: {e}")
+            return float('-inf')
+
+        try:
+            auprc_bot = float(average_precision_score(yb_val, p_bot))
+            auprc_top = float(average_precision_score(yt_val, p_top))
+        except Exception:
+            auprc_bot = auprc_top = float('nan')
+        val = float(_np.nanmean([auprc_bot, auprc_top]))
+
+        # Persist best
+        model_bot_path = str(tune_dir / f"xgb_topbot_bottom_trial{trial.number}.json")
+        model_top_path = str(tune_dir / f"xgb_topbot_top_trial{trial.number}.json")
+        try:
+            if val > float(best_val):
+                bot_clf.save_model(model_bot_path)
+                top_clf.save_model(model_top_path)
+                # Save feature schemas
+                feat_cols_path_bot = str(Path(model_bot_path).with_suffix("").as_posix()) + "_feature_columns.json"
+                with open(feat_cols_path_bot, "w") as f:
+                    json.dump(list(X_tr.columns), f)
+                feat_cols_path_top = str(Path(model_top_path).with_suffix("").as_posix()) + "_feature_columns.json"
+                with open(feat_cols_path_top, "w") as f:
+                    json.dump(list(X_tr.columns), f)
+                best_val = float(val)
+                best_paths["bottom"] = model_bot_path
+                best_paths["top"] = model_top_path
+        except Exception:
+            pass
+
+        with open(results_csv, "a", newline="") as f:
+            csv.DictWriter(f, fieldnames=[
+                "trial","value","auprc_bottom","auprc_top","pos_rate_bottom","pos_rate_top",
+                "features_used","extra_timeframes","L","R","device","model_bottom","model_top"
+            ]).writerow({
+                "trial": trial.number,
+                "value": float(val),
+                "auprc_bottom": float(auprc_bot),
+                "auprc_top": float(auprc_top),
+                "pos_rate_bottom": float(_np.mean(yb_val)) if yb_val.size else float('nan'),
+                "pos_rate_top": float(_np.mean(yt_val)) if yt_val.size else float('nan'),
+                "features_used": ",".join(list(cfg.get("feature_whitelist", []))) if cfg.get("feature_whitelist") else "",
+                "extra_timeframes": ",".join(etf) if etf else "",
+                "L": int(L),
+                "R": int(R),
+                "device": dev,
+                "model_bottom": model_bot_path,
+                "model_top": model_top_path,
+            })
+        return float(val)
+
+    study = optuna.create_study(direction="maximize", sampler=smp)
     if isinstance(smp, GridSampler):
         try:
             grid_dict = smp.search_space()  # type: ignore[attr-defined]
