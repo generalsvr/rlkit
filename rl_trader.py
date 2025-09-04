@@ -2706,20 +2706,49 @@ def xgb_eval(
                                     miss_mask = dn_mask & (~np.isnan(y_imp_tail)) & (~hits)
                                     dn_colors[miss_mask] = "#95a5a6"
 
-                        # Figure 1: Price + markers
+                        # Figure 1: Price (candlesticks) + markers
                         fig_price, axp = plt.subplots(figsize=(15, 7))
-                        axp.plot(idx_tail, price_tail, color="#2c3e50", linewidth=1.0, label="Close")
-                        axp.set_xlabel("Time")
-                        axp.set_ylabel("Price")
+                        # Prepare OHLC tails aligned to idx_tail
+                        o_full = (feats["open"].astype(float).values if "open" in feats.columns else raw.iloc[:, 0].astype(float).values)[:valid_len]
+                        h_full = (feats["high"].astype(float).values if "high" in feats.columns else raw.iloc[:, 1].astype(float).values)[:valid_len]
+                        l_full = (feats["low"].astype(float).values if "low" in feats.columns else raw.iloc[:, 2].astype(float).values)[:valid_len]
+                        c_full = (feats["close"].astype(float).values if "close" in feats.columns else raw.iloc[:, 3].astype(float).values)[:valid_len]
+                        o_tail = o_full[-m:]
+                        h_tail = h_full[-m:]
+                        l_tail = l_full[-m:]
+                        c_tail = c_full[-m:]
+
+                        # Draw candlesticks without external deps
+                        from matplotlib.patches import Rectangle
                         if isinstance(idx_tail, pd.DatetimeIndex):
+                            xvals = mdates.date2num(idx_tail.to_pydatetime())
                             locator = mdates.AutoDateLocator()
                             formatter = mdates.ConciseDateFormatter(locator)
                             axp.xaxis.set_major_locator(locator)
                             axp.xaxis.set_major_formatter(formatter)
+                        else:
+                            xvals = np.arange(len(idx_tail))
+                        if len(xvals) >= 2:
+                            barw = float(np.median(np.diff(xvals))) * 0.8
+                        else:
+                            barw = 0.6
+                        for i in range(len(xvals)):
+                            x = xvals[i]
+                            o_i = float(o_tail[i]); h_i = float(h_tail[i]); l_i = float(l_tail[i]); c_i = float(c_tail[i])
+                            color = "#27ae60" if c_i >= o_i else "#c0392b"
+                            # Wick
+                            axp.vlines(x, l_i, h_i, color=color, linewidth=0.8, alpha=0.9)
+                            # Body
+                            y0 = min(o_i, c_i)
+                            height = max(abs(c_i - o_i), 1e-12)
+                            rect = Rectangle((x - barw / 2.0, y0), barw, height, facecolor=color, edgecolor=color, linewidth=0.8, alpha=0.7)
+                            axp.add_patch(rect)
+                        axp.set_xlabel("Time")
+                        axp.set_ylabel("Price")
                         if up_mask is not None and np.any(up_mask):
-                            axp.scatter(idx_tail[up_mask], price_tail[up_mask], marker="^", color=up_colors[up_mask], s=int(marker_size), label="impulse_up")
+                            axp.scatter(idx_tail[up_mask], c_tail[up_mask], marker="^", color=up_colors[up_mask], s=int(marker_size), label="impulse_up")
                         if dn_mask is not None and np.any(dn_mask):
-                            axp.scatter(idx_tail[dn_mask], price_tail[dn_mask], marker="v", color=dn_colors[dn_mask], s=int(marker_size), label="impulse_dn")
+                            axp.scatter(idx_tail[dn_mask], c_tail[dn_mask], marker="v", color=dn_colors[dn_mask], s=int(marker_size), label="impulse_dn")
                         axp.legend(loc="upper left")
                         fig_price.tight_layout()
 
