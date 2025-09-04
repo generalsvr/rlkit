@@ -81,6 +81,40 @@ def compute_tail_alpha_proxy(
     return alpha
 
 
+def compute_adx(
+    high: np.ndarray,
+    low: np.ndarray,
+    close: np.ndarray,
+    period: int = 14,
+) -> np.ndarray:
+    """Wilder's ADX approximation using EWM for smoothing."""
+    h = pd.Series(high)
+    l = pd.Series(low)
+    c = pd.Series(close)
+    up = h.diff()
+    dn = -l.diff()
+    plus_dm = np.where((up > dn) & (up > 0), up, 0.0)
+    minus_dm = np.where((dn > up) & (dn > 0), dn, 0.0)
+    tr1 = (h - l).to_numpy()
+    tr2 = (h - c.shift(1)).abs().to_numpy()
+    tr3 = (l - c.shift(1)).abs().to_numpy()
+    tr = np.maximum.reduce([
+        np.nan_to_num(tr1, nan=0.0),
+        np.nan_to_num(tr2, nan=0.0),
+        np.nan_to_num(tr3, nan=0.0),
+    ])
+    # Wilder smoothing via EWM alpha = 1/period
+    tr_s = pd.Series(tr).ewm(alpha=1 / max(1, period), adjust=False).mean().to_numpy()
+    plus_dm_s = pd.Series(plus_dm).ewm(alpha=1 / max(1, period), adjust=False).mean().to_numpy()
+    minus_dm_s = pd.Series(minus_dm).ewm(alpha=1 / max(1, period), adjust=False).mean().to_numpy()
+    plus_di = 100.0 * (plus_dm_s / (tr_s + 1e-12))
+    minus_di = 100.0 * (minus_dm_s / (tr_s + 1e-12))
+    dx = 100.0 * (np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-12))
+    adx = pd.Series(dx).ewm(alpha=1 / max(1, period), adjust=False).mean().fillna(0.0).to_numpy()
+    # Normalize to [0,1] for ML friendliness
+    return np.clip(adx / 100.0, 0.0, 1.0)
+
+
 def make_features(
     df: pd.DataFrame,
     feature_columns: Optional[List[str]] | None = None,
@@ -384,6 +418,13 @@ def make_features(
             "expected_shortfall_0_05_128": expected_shortfall,
         }, index=base.index)
 
+        # ADX (14) normalized
+        try:
+            adx_14 = compute_adx(h, l, c, period=14)
+        except Exception:
+            adx_14 = np.zeros(len(c), dtype=float)
+        feats["adx_14"] = adx_14
+
         # RLTE pockets (Linear Regression 90 over price with BB(30, 0.9))
         try:
             idx = np.arange(len(c), dtype=float)
@@ -421,6 +462,7 @@ def make_features(
             price_inside_sell = ((in_sell > 0) & (c >= bb_upper_rlte) & (c <= reg90)).astype(float)
             reg90_ratio = (reg90 - c) / (c + 1e-12)
 
+            feats["rlte_reg90"] = reg90.astype(float)
             feats["rlte_reg90_ratio"] = reg90_ratio
             feats["rlte_in_buy_pocket"] = in_buy.astype(float)
             feats["rlte_in_sell_pocket"] = in_sell.astype(float)
@@ -430,6 +472,7 @@ def make_features(
             feats["rlte_price_inside_sell"] = price_inside_sell.astype(float)
         except Exception:
             # If RLTE computation fails, add zeros to preserve schema
+            feats["rlte_reg90"] = 0.0
             feats["rlte_reg90_ratio"] = 0.0
             feats["rlte_in_buy_pocket"] = 0.0
             feats["rlte_in_sell_pocket"] = 0.0
@@ -531,6 +574,58 @@ def make_features(
                             f"{tf}_ema_fast_ratio": ema_fast_ratio_tf,
                             f"{tf}_ema_slow_ratio": ema_slow_ratio_tf,
                         }, index=res.index)
+
+                        # HTF RLTE pockets on rc (Linear Regression 90 + BB(30,0.9))
+                        try:
+                            idx_tf = np.arange(len(rc), dtype=float)
+                            L_reg = 90
+                            s_idx_tf = pd.Series(idx_tf, index=res.index)
+                            s_c_tf = pd.Series(rc, index=res.index)
+                            minp = 10
+                            sum_x = s_idx_tf.rolling(L_reg, min_periods=minp).sum()
+                            sum_y = s_c_tf.rolling(L_reg, min_periods=minp).sum()
+                            sum_xx = pd.Series(idx_tf * idx_tf, index=res.index).rolling(L_reg, min_periods=minp).sum()
+                            sum_xy = pd.Series(idx_tf * rc, index=res.index).rolling(L_reg, min_periods=minp).sum()
+                            n_tf = s_idx_tf.rolling(L_reg, min_periods=minp).count()
+                            denom = (n_tf * sum_xx - sum_x * sum_x).replace(0.0, np.nan)
+                            slope_tf = (n_tf * sum_xy - sum_x * sum_y) / denom
+                            intercept_tf = (sum_y - slope_tf * sum_x) / n_tf
+                            reg90_tf = (slope_tf * s_idx_tf + intercept_tf).to_numpy()
+                            reg90_tf = np.nan_to_num(reg90_tf, nan=rc.astype(float))
+
+                            bb_len = 30
+                            bb_mult = 0.9
+                            bb_mid_tf = pd.Series(rc, index=res.index).rolling(bb_len, min_periods=1).mean()
+                            bb_std_tf = pd.Series(rc, index=res.index).rolling(bb_len, min_periods=1).std().fillna(0.0)
+                            bb_upper_tf = (bb_mid_tf + bb_mult * bb_std_tf).to_numpy()
+                            bb_lower_tf = (bb_mid_tf - bb_mult * bb_std_tf).to_numpy()
+
+                            in_buy_tf = (reg90_tf < bb_lower_tf).astype(float)
+                            in_sell_tf = (reg90_tf > bb_upper_tf).astype(float)
+                            buy_gap_tf = np.maximum(0.0, bb_lower_tf - reg90_tf) / (rc + 1e-12)
+                            sell_gap_tf = np.maximum(0.0, reg90_tf - bb_upper_tf) / (rc + 1e-12)
+                            price_inside_buy_tf = ((in_buy_tf > 0) & (rc >= reg90_tf) & (rc <= bb_lower_tf)).astype(float)
+                            price_inside_sell_tf = ((in_sell_tf > 0) & (rc >= bb_upper_tf) & (rc <= reg90_tf)).astype(float)
+                            reg90_ratio_tf = (reg90_tf - rc) / (rc + 1e-12)
+
+                            feats_tf[f"{tf}_rlte_reg90"] = reg90_tf.astype(float)
+                            feats_tf[f"{tf}_rlte_reg90_ratio"] = reg90_ratio_tf
+                            feats_tf[f"{tf}_rlte_in_buy_pocket"] = in_buy_tf.astype(float)
+                            feats_tf[f"{tf}_rlte_in_sell_pocket"] = in_sell_tf.astype(float)
+                            feats_tf[f"{tf}_rlte_buy_pocket_gap"] = buy_gap_tf.astype(float)
+                            feats_tf[f"{tf}_rlte_sell_pocket_gap"] = sell_gap_tf.astype(float)
+                            feats_tf[f"{tf}_rlte_price_inside_buy"] = price_inside_buy_tf.astype(float)
+                            feats_tf[f"{tf}_rlte_price_inside_sell"] = price_inside_sell_tf.astype(float)
+                        except Exception:
+                            # If RLTE fails, proceed without
+                            pass
+
+                        # HTF ADX(14) normalized
+                        try:
+                            adx_tf = compute_adx(rh, rl, rc, period=14)
+                        except Exception:
+                            adx_tf = np.zeros(len(rc), dtype=float)
+                        feats_tf[f"{tf}_adx_14"] = adx_tf
                     # Align to base index causally
                     feats_tf_aligned = feats_tf.reindex(base.index).ffill().fillna(0.0)
                     feats = feats.join(feats_tf_aligned, how="left")

@@ -2301,7 +2301,9 @@ def xgb_topbot_tune(
         "candle_body_frac","upper_shadow_frac","lower_shadow_frac","candle_trend_persistence","kurtosis_rolling_100",
         "dfa_exponent_64","entropy_return_64",
         "drawdown_z_64","expected_shortfall_0_05_128",
-        "rlte_reg90_ratio","rlte_in_buy_pocket","rlte_in_sell_pocket","rlte_buy_pocket_gap","rlte_sell_pocket_gap","rlte_price_inside_buy","rlte_price_inside_sell",
+        # Base RLTE and ADX
+        "rlte_reg90","rlte_reg90_ratio","rlte_in_buy_pocket","rlte_in_sell_pocket","rlte_buy_pocket_gap","rlte_sell_pocket_gap","rlte_price_inside_buy","rlte_price_inside_sell",
+        "adx_14",
         "MA365D","MA200D","MA50D","MA20W",
     ]
 
