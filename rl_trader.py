@@ -2466,6 +2466,304 @@ def xgb_eval(
         typer.echo(f"{r['pair']} {r['timeframe']} rows={r['rows']} IC={r['ic']:.5f} MSE={r['mse']:.6f} ACC={r['acc_dir']:.3f}")
 
 @app.command()
+def xgb_plot(
+    model_path: str = typer.Option(..., help="Path to trained regressor .json"),
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    exchange: str = typer.Option("bybit"),
+    timerange: str = typer.Option("", help="YYYYMMDD-YYYYMMDD"),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("", help="Optional HTFs like '4H,1D'"),
+    horizon: int = typer.Option(1),
+    xgb_device: str = typer.Option("auto", help="auto|cpu|cuda"),
+    outdir: str = typer.Option("", help="Output dir for plots; default under model folder"),
+    zoom_bars: int = typer.Option(400),
+):
+    """Create validation plots for XGB regressor: price, y_true vs y_pred."""
+    try:
+        import numpy as np  # type: ignore
+        import pandas as pd  # type: ignore
+        import xgboost as xgb  # type: ignore
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt  # type: ignore
+        import matplotlib.dates as mdates  # type: ignore
+    except Exception as e:
+        raise RuntimeError("Missing plotting deps. Install matplotlib, numpy, pandas, xgboost.") from e
+
+    # Load feature columns
+    def _load_feat_cols(mp: str) -> list[str] | None:
+        p = Path(mp)
+        cand = p.with_suffix("").as_posix() + "_feature_columns.json"
+        if os.path.exists(cand):
+            try:
+                with open(cand, "r") as f:
+                    cols = json.load(f)
+                if isinstance(cols, list):
+                    return [str(c) for c in cols]
+            except Exception:
+                return None
+        return None
+
+    model_cols = _load_feat_cols(model_path)
+    etf_list = [s.strip() for s in extra_timeframes.split(',') if s.strip()] if extra_timeframes else None
+    data_path = _find_data_file_internal(userdir, pair, timeframe, prefer_exchange=exchange)
+    if not data_path:
+        raise FileNotFoundError("No dataset found.")
+    raw = _load_ohlcv_internal(data_path)
+    # Slice
+    if timerange:
+        try:
+            s, e = timerange.split('-', 1)
+            start = pd.to_datetime(s) if s else None
+            end = pd.to_datetime(e) if e else None
+            if isinstance(raw.index, pd.DatetimeIndex):
+                idx = raw.index
+                try:
+                    idx_cmp = idx.tz_convert(None) if idx.tz is not None else idx
+                except Exception:
+                    idx_cmp = idx.tz_localize(None) if getattr(idx, 'tz', None) is not None else idx
+                mask = pd.Series(True, index=idx)
+                if start is not None:
+                    mask &= idx_cmp >= pd.to_datetime(start)
+                if end is not None:
+                    mask &= idx_cmp <= pd.to_datetime(end)
+                raw = raw.loc[mask]
+        except Exception:
+            pass
+
+    # Features
+    from rl_lib.features import make_features as _make_features
+    feats = _make_features(raw, feature_columns=model_cols, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=etf_list)
+    # Target and align
+    H = int(max(1, horizon))
+    c = feats["close"].astype(float).values if "close" in feats.columns else raw["close"].astype(float).values
+    logp = pd.Series(np.log(c + 1e-12), index=feats.index)
+    y = (logp.shift(-H) - logp).to_numpy()
+    valid_len = len(feats) - H
+    if valid_len <= 100:
+        raise RuntimeError("Insufficient rows for plotting.")
+    X = feats.iloc[:valid_len, :].copy()
+    y = y[:valid_len]
+    idx = X.index
+
+    # Predict
+    dev_opt = str(xgb_device).strip().lower()
+    dev = ("cuda" if dev_opt == "auto" else dev_opt) if dev_opt in ("cpu", "cuda", "auto") else "cpu"
+    reg = xgb.XGBRegressor(device=dev)
+    reg.load_model(model_path)
+    y_pred = reg.predict(X.values)
+
+    # Metrics
+    meth = "spearman"
+    try:
+        ic = float(pd.Series(y).corr(pd.Series(y_pred), method=meth))
+    except Exception:
+        ic = float('nan')
+
+    # Output dir
+    if not outdir:
+        outdir = str(Path(model_path).parent / "validate_plots")
+    os.makedirs(outdir, exist_ok=True)
+    ts_tag = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    base = f"{pair.replace('/', '_')}_{timeframe}_H{H}_{ts_tag}".replace(":", "-")
+
+    def _plot(df_idx, close_series, y_true, y_hat, save_path, title_suffix=""):
+        fig, axes = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
+        ax0, ax1 = axes
+        # Price
+        ax0.plot(df_idx, close_series, color="#2c3e50", linewidth=1.0, label="Close")
+        ax0.set_title(f"{pair} {timeframe} Price {title_suffix}")
+        ax0.grid(True, alpha=0.25)
+        # True vs Pred
+        ax1.plot(df_idx, y_true, color="#95a5a6", linewidth=1.0, label="y_true")
+        ax1.plot(df_idx, y_hat, color="#2980b9", linewidth=1.0, label="y_pred")
+        ax1.set_title(f"H={H}  IC({meth})={ic:.4f}")
+        ax1.grid(True, alpha=0.25)
+        ax1.legend(loc="upper right")
+        if isinstance(df_idx, pd.DatetimeIndex):
+            locator = mdates.AutoDateLocator(); formatter = mdates.ConciseDateFormatter(locator)
+            ax1.xaxis.set_major_locator(locator); ax1.xaxis.set_major_formatter(formatter)
+        fig.tight_layout(); fig.savefig(save_path, dpi=150); plt.close(fig)
+
+    # Full plot
+    close_series = X["close"].astype(float).values if "close" in X.columns else c[:valid_len]
+    _plot(idx, close_series, y, y_pred, os.path.join(outdir, f"{base}_overview.png"), title_suffix="(Overview)")
+    # Zoom
+    if zoom_bars > 50 and len(X) > zoom_bars:
+        sl = slice(-zoom_bars, None)
+        _plot(idx[sl], close_series[sl], y[sl], y_pred[sl], os.path.join(outdir, f"{base}_zoom.png"), title_suffix="(Zoom)")
+
+@app.command()
+def xgb_impulse_plot(
+    up_model: str = typer.Option(..., help="Path to trained impulse-up classifier .json"),
+    down_model: str = typer.Option("", help="Optional impulse-down classifier .json"),
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    exchange: str = typer.Option("bybit"),
+    timerange: str = typer.Option("", help="YYYYMMDD-YYYYMMDD"),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option(""),
+    horizon: int = typer.Option(8),
+    label_mode: str = typer.Option("vol", help="vol|abs"),
+    alpha_up: float = typer.Option(2.0),
+    alpha_dn: float = typer.Option(2.0),
+    vol_lookback: int = typer.Option(256),
+    thr_up_bps: float = typer.Option(30.0),
+    thr_dn_bps: float = typer.Option(30.0),
+    p_up_thr: float = typer.Option(0.6),
+    p_dn_thr: float = typer.Option(0.6),
+    xgb_device: str = typer.Option("auto", help="auto|cpu|cuda"),
+    outdir: str = typer.Option("", help="Output dir for plots; default under model folder"),
+    zoom_bars: int = typer.Option(400),
+):
+    """Plot impulse classifier predictions and realized events on price chart."""
+    try:
+        import numpy as np  # type: ignore
+        import pandas as pd  # type: ignore
+        import xgboost as xgb  # type: ignore
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt  # type: ignore
+        import matplotlib.dates as mdates  # type: ignore
+    except Exception as e:
+        raise RuntimeError("Missing plotting deps. Install matplotlib, numpy, pandas, xgboost.") from e
+
+    # Load feature columns (from up model)
+    def _load_feat_cols(mp: str) -> list[str] | None:
+        p = Path(mp)
+        cand = p.with_suffix("").as_posix() + "_feature_columns.json"
+        if os.path.exists(cand):
+            try:
+                with open(cand, "r") as f:
+                    cols = json.load(f)
+                if isinstance(cols, list):
+                    return [str(c) for c in cols]
+            except Exception:
+                return None
+        return None
+
+    cols_up = _load_feat_cols(up_model)
+    cols_dn = _load_feat_cols(down_model) if down_model else None
+    union_cols = list(dict.fromkeys([*(cols_up or []), *(cols_dn or [])])) or None
+
+    etf_list = [s.strip() for s in extra_timeframes.split(',') if s.strip()] if extra_timeframes else None
+    data_path = _find_data_file_internal(userdir, pair, timeframe, prefer_exchange=exchange)
+    if not data_path:
+        raise FileNotFoundError("No dataset found.")
+    raw = _load_ohlcv_internal(data_path)
+    # Slice
+    if timerange:
+        try:
+            s, e = timerange.split('-', 1)
+            start = pd.to_datetime(s) if s else None
+            end = pd.to_datetime(e) if e else None
+            if isinstance(raw.index, pd.DatetimeIndex):
+                idx = raw.index
+                try:
+                    idx_cmp = idx.tz_convert(None) if idx.tz is not None else idx
+                except Exception:
+                    idx_cmp = idx.tz_localize(None) if getattr(idx, 'tz', None) is not None else idx
+                mask = pd.Series(True, index=idx)
+                if start is not None:
+                    mask &= idx_cmp >= pd.to_datetime(start)
+                if end is not None:
+                    mask &= idx_cmp <= pd.to_datetime(end)
+                raw = raw.loc[mask]
+        except Exception:
+            pass
+
+    from rl_lib.features import make_features as _make_features
+    feats_all = _make_features(raw, feature_columns=union_cols, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=etf_list)
+
+    H = int(max(1, horizon))
+    valid_len = len(feats_all) - H
+    if valid_len <= 100:
+        raise RuntimeError("Insufficient rows for plotting.")
+    feats = feats_all.iloc[:valid_len, :].copy()
+    idx = feats.index
+    close_series = feats["close"].astype(float).values if "close" in feats.columns else raw["close"].astype(float).values[:valid_len]
+
+    # Realized labels
+    c = feats_all["close"].astype(float).values if "close" in feats_all.columns else raw["close"].astype(float).values
+    logp = pd.Series(np.log(c + 1e-12), index=feats_all.index)
+    fwd = [logp.shift(-i) - logp for i in range(1, H + 1)]
+    fwd_mat = np.vstack([s.to_numpy() for s in fwd])
+    fwd_max = np.nanmax(fwd_mat, axis=0)[:valid_len]
+    fwd_min = np.nanmin(fwd_mat, axis=0)[:valid_len]
+    mode_l = str(label_mode).strip().lower()
+    if mode_l == "vol":
+        logret = np.diff(np.log(c + 1e-12), prepend=np.log(c[0] + 1e-12))
+        sigma = pd.Series(logret).rolling(int(max(10, vol_lookback)), min_periods=10).std().fillna(0.0).to_numpy()[:valid_len]
+        up_thr_vec = float(alpha_up) * sigma * float(np.sqrt(H))
+        dn_thr_vec = float(alpha_dn) * sigma * float(np.sqrt(H))
+        y_up = (fwd_max >= up_thr_vec).astype(int)
+        y_dn = (fwd_min <= -dn_thr_vec).astype(int)
+    else:
+        up_thr = float(thr_up_bps) * 1e-4
+        dn_thr = float(thr_dn_bps) * 1e-4
+        y_up = (fwd_max >= up_thr).astype(int)
+        y_dn = (fwd_min <= -dn_thr).astype(int)
+
+    # Predict probs
+    dev_opt = str(xgb_device).strip().lower()
+    dev = ("cuda" if dev_opt == "auto" else dev_opt) if dev_opt in ("cpu", "cuda", "auto") else "cpu"
+    upc = xgb.XGBClassifier(device=dev); upc.load_model(up_model)
+    p_up = upc.predict_proba((feats if not cols_up else feats.reindex(columns=cols_up, fill_value=0.0)).values)[:, 1]
+    if down_model:
+        dnc = xgb.XGBClassifier(device=dev); dnc.load_model(down_model)
+        p_dn = dnc.predict_proba((feats if not cols_dn else feats.reindex(columns=cols_dn, fill_value=0.0)).values)[:, 1]
+    else:
+        p_dn = np.zeros_like(p_up)
+
+    # Output dir
+    if not outdir:
+        outdir = str(Path(up_model).parent / "validate_plots")
+    os.makedirs(outdir, exist_ok=True)
+    ts_tag = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    base = f"{pair.replace('/', '_')}_{timeframe}_H{H}_{ts_tag}".replace(":", "-")
+
+    def _plot(df_idx, price, p_up_s, p_dn_s, y_up_s, y_dn_s, save_path, title_suffix=""):
+        fig, axes = plt.subplots(2, 1, figsize=(15, 8), sharex=True)
+        ax0, ax1 = axes
+        # Price with predicted events
+        ax0.plot(df_idx, price, color="#2c3e50", linewidth=1.0, label="Close")
+        # Predicted triggers
+        up_idx = np.flatnonzero(p_up_s >= float(p_up_thr))
+        dn_idx = np.flatnonzero(p_dn_s >= float(p_dn_thr))
+        ax0.scatter(df_idx[up_idx], price[up_idx], marker='^', color="#27ae60", s=36, label="pred_up")
+        ax0.scatter(df_idx[dn_idx], price[dn_idx], marker='v', color="#c0392b", s=36, label="pred_down")
+        # Realized events (hollow markers)
+        tru_up = np.flatnonzero(y_up_s == 1)
+        tru_dn = np.flatnonzero(y_dn_s == 1)
+        ax0.scatter(df_idx[tru_up], price[tru_up], facecolors='none', edgecolors="#2ecc71", marker='^', s=64, label="real_up")
+        ax0.scatter(df_idx[tru_dn], price[tru_dn], facecolors='none', edgecolors="#e74c3c", marker='v', s=64, label="real_down")
+        ax0.set_title(f"{pair} {timeframe} Impulse Predictions {title_suffix}")
+        ax0.grid(True, alpha=0.25); ax0.legend(loc="upper left")
+        # Probabilities panel
+        ax1.plot(df_idx, p_up_s, color="#27ae60", linewidth=1.0, label="p_up")
+        ax1.plot(df_idx, p_dn_s, color="#c0392b", linewidth=1.0, label="p_down")
+        ax1.axhline(float(p_up_thr), color="#27ae60", linestyle='--', linewidth=0.8)
+        ax1.axhline(float(p_dn_thr), color="#c0392b", linestyle='--', linewidth=0.8)
+        ax1.set_ylim(0.0, 1.0)
+        ax1.grid(True, alpha=0.25); ax1.legend(loc="upper left")
+        if isinstance(df_idx, pd.DatetimeIndex):
+            locator = mdates.AutoDateLocator(); formatter = mdates.ConciseDateFormatter(locator)
+            ax1.xaxis.set_major_locator(locator); ax1.xaxis.set_major_formatter(formatter)
+        fig.tight_layout(); fig.savefig(save_path, dpi=150); plt.close(fig)
+
+    # Full
+    _plot(idx, close_series, p_up, p_dn, y_up, y_dn, os.path.join(outdir, f"{base}_impulse_overview.png"), "(Overview)")
+    # Zoom
+    if zoom_bars > 50 and len(feats) > zoom_bars:
+        sl = slice(-zoom_bars, None)
+        _plot(idx[sl], close_series[sl], p_up[sl], p_dn[sl], y_up[sl], y_dn[sl], os.path.join(outdir, f"{base}_impulse_zoom.png"), "(Zoom)")
+
+@app.command()
 def forecast_eval(
     model_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "forecaster.pt"), "--model-path", "--model_path"),
     pair: str = typer.Option("BTC/USDT"),
