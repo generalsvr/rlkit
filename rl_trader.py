@@ -2497,11 +2497,76 @@ def xgb_eval(
                 X_dn = _view(X_df, dn_cols) if (dnc is not None and dn_cols is not None) else None
                 y = y[:valid_len]
 
+                # Compute impulse probabilities (full) if models provided
+                p_up = None
+                p_dn = None
+                if upc is not None and X_up is not None:
+                    try:
+                        p_up = upc.predict_proba(X_up)[:, 1]
+                    except Exception:
+                        p_up = None
+                if dnc is not None and X_dn is not None:
+                    try:
+                        p_dn = dnc.predict_proba(X_dn)[:, 1]
+                    except Exception:
+                        p_dn = None
+
                 # Predict and score
                 y_pred = reg.predict(X_reg)
                 ic = _ic(y, y_pred)
                 mse = float(np.mean((y - y_pred) ** 2))
                 acc = float(np.mean(np.sign(y) == np.sign(y_pred)))
+
+                # Overlay metrics (thresholded signal stats)
+                def _safe_mean(arr: np.ndarray) -> float:
+                    return float(np.mean(arr)) if arr is not None else float("nan")
+
+                def _safe_q(arr: np.ndarray, q: float) -> float:
+                    try:
+                        return float(np.quantile(arr, q))
+                    except Exception:
+                        return float("nan")
+
+                p_up_mean = float("nan")
+                p_dn_mean = float("nan")
+                p_up_q95 = float("nan")
+                p_dn_q95 = float("nan")
+                p_up_max = float("nan")
+                p_dn_max = float("nan")
+                sig_up_cnt = 0
+                sig_dn_cnt = 0
+                sig_up_rate = float("nan")
+                sig_dn_rate = float("nan")
+                sig_up_hit_rate = float("nan")
+                sig_dn_hit_rate = float("nan")
+                sig_up_avg_ret_bps = float("nan")
+                sig_dn_avg_ret_bps = float("nan")
+
+                up_mask_full = None
+                dn_mask_full = None
+                if p_up is not None:
+                    p_up_mean = _safe_mean(p_up)
+                    p_up_q95 = _safe_q(p_up, 0.95)
+                    p_up_max = float(np.max(p_up)) if p_up.size > 0 else float("nan")
+                    up_mask_full = p_up >= float(p_up_thr)
+                    sig_up_cnt = int(np.sum(up_mask_full))
+                    sig_up_rate = float(np.mean(up_mask_full)) if p_up.size > 0 else float("nan")
+                    if np.any(up_mask_full):
+                        y_up = y[up_mask_full]
+                        sig_up_hit_rate = float(np.mean(y_up > 0.0))
+                        sig_up_avg_ret_bps = float(np.mean(y_up) * 1e4)
+
+                if p_dn is not None:
+                    p_dn_mean = _safe_mean(p_dn)
+                    p_dn_q95 = _safe_q(p_dn, 0.95)
+                    p_dn_max = float(np.max(p_dn)) if p_dn.size > 0 else float("nan")
+                    dn_mask_full = p_dn >= float(p_dn_thr)
+                    sig_dn_cnt = int(np.sum(dn_mask_full))
+                    sig_dn_rate = float(np.mean(dn_mask_full)) if p_dn.size > 0 else float("nan")
+                    if np.any(dn_mask_full):
+                        y_dn = y[dn_mask_full]
+                        sig_dn_hit_rate = float(np.mean(y_dn < 0.0))
+                        sig_dn_avg_ret_bps = float(np.mean(y_dn) * 1e4)
 
                 rows.append({
                     "pair": pr,
@@ -2510,6 +2575,22 @@ def xgb_eval(
                     "ic": float(ic),
                     "mse": float(mse),
                     "acc_dir": float(acc),
+                    # Probability summary (may be NaN if no impulse model provided)
+                    "p_up_mean": float(p_up_mean),
+                    "p_dn_mean": float(p_dn_mean),
+                    "p_up_q95": float(p_up_q95),
+                    "p_dn_q95": float(p_dn_q95),
+                    "p_up_max": float(p_up_max),
+                    "p_dn_max": float(p_dn_max),
+                    # Signal stats at thresholds
+                    "sig_up_cnt": int(sig_up_cnt),
+                    "sig_dn_cnt": int(sig_dn_cnt),
+                    "sig_up_rate": float(sig_up_rate),
+                    "sig_dn_rate": float(sig_dn_rate),
+                    "sig_up_hit_rate": float(sig_up_hit_rate),
+                    "sig_dn_hit_rate": float(sig_dn_hit_rate),
+                    "sig_up_avg_ret_bps": float(sig_up_avg_ret_bps),
+                    "sig_dn_avg_ret_bps": float(sig_dn_avg_ret_bps),
                 })
 
                 # Optional plotting
@@ -2532,15 +2613,9 @@ def xgb_eval(
                         price_tail = price[-m:]
                         y_tail = y[-m:]
                         y_pred_tail = y_pred[-m:]
-                        # Impulse probs if models provided
-                        p_up_tail = None
-                        p_dn_tail = None
-                        if upc is not None and X_up is not None:
-                            p_up = upc.predict_proba(X_up)[:, 1]
-                            p_up_tail = p_up[-m:]
-                        if dnc is not None and X_dn is not None:
-                            p_dn = dnc.predict_proba(X_dn)[:, 1]
-                            p_dn_tail = p_dn[-m:]
+                        # Impulse probs (tail)
+                        p_up_tail = p_up[-m:] if p_up is not None else None
+                        p_dn_tail = p_dn[-m:] if p_dn is not None else None
 
                         fig, ax1 = plt.subplots(figsize=(15, 7))
                         ax1.plot(idx_tail, price_tail, color="#2c3e50", linewidth=1.0, label="Close")
@@ -2552,28 +2627,35 @@ def xgb_eval(
                             ax1.xaxis.set_major_locator(locator)
                             ax1.xaxis.set_major_formatter(formatter)
                         ax2 = ax1.twinx()
-                        # Scale returns to bps for readability
+                        # Scale returns to bps for readability on returns axis
                         y_pred_bps = np.asarray(y_pred_tail, dtype=float) * 1e4
                         y_true_bps = np.asarray(y_tail, dtype=float) * 1e4
                         ax2.plot(idx_tail, y_pred_bps, color="#1f77b4", alpha=0.9, label="mu_pred (bps)")
                         ax2.plot(idx_tail, y_true_bps, color="#ff7f0e", alpha=0.7, label=f"fwd_ret_H{horizon} (bps)")
                         ax2.set_ylabel("Returns")
-                        # Impulse overlay
+
+                        # Dedicated probability axis for p_up/p_dn
+                        ax3 = ax1.twinx()
+                        ax3.spines.right.set_position(("axes", 1.08))
+                        ax3.set_ylabel("Probability")
+                        ax3.set_ylim(0.0, 1.0)
                         if p_up_tail is not None:
-                            ax2.plot(idx_tail, p_up_tail, color="#2ecc71", alpha=0.6, label="p_up")
-                            # markers
+                            ax3.plot(idx_tail, p_up_tail, color="#2ecc71", alpha=0.8, label="p_up")
+                            ax3.axhline(y=float(p_up_thr), color="#27ae60", ls="--", lw=0.8, alpha=0.6, label="up_thr")
                             up_mask = p_up_tail >= float(p_up_thr)
                             if np.any(up_mask):
                                 ax1.scatter(idx_tail[up_mask], price_tail[up_mask], marker="^", color="#27ae60", s=36, label="impulse_up")
                         if p_dn_tail is not None:
-                            ax2.plot(idx_tail, p_dn_tail, color="#e74c3c", alpha=0.6, label="p_dn")
+                            ax3.plot(idx_tail, p_dn_tail, color="#e74c3c", alpha=0.8, label="p_dn")
+                            ax3.axhline(y=float(p_dn_thr), color="#c0392b", ls="--", lw=0.8, alpha=0.6, label="dn_thr")
                             dn_mask = p_dn_tail >= float(p_dn_thr)
                             if np.any(dn_mask):
                                 ax1.scatter(idx_tail[dn_mask], price_tail[dn_mask], marker="v", color="#c0392b", s=36, label="impulse_dn")
                         # Legends
                         lines1, labels1 = ax1.get_legend_handles_labels()
                         lines2, labels2 = ax2.get_legend_handles_labels()
-                        ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left")
+                        lines3, labels3 = ax3.get_legend_handles_labels()
+                        ax1.legend(lines1 + lines2 + lines3, labels1 + labels2 + labels3, loc="upper left")
                         fig.tight_layout()
                         ts_tag = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
                         fname = f"{pr.replace('/','_')}_{tf}_H{int(horizon)}_{ts_tag}.png".replace(":","-")
@@ -2591,14 +2673,37 @@ def xgb_eval(
         Path(os.path.dirname(out_csv) or ".").mkdir(parents=True, exist_ok=True)
         import csv as _csv
         with open(out_csv, "w", newline="") as f:
-            writer = _csv.DictWriter(f, fieldnames=["pair","timeframe","rows","ic","mse","acc_dir"])
+            writer = _csv.DictWriter(
+                f,
+                fieldnames=[
+                    "pair","timeframe","rows","ic","mse","acc_dir",
+                    "p_up_mean","p_dn_mean","p_up_q95","p_dn_q95","p_up_max","p_dn_max",
+                    "sig_up_cnt","sig_dn_cnt","sig_up_rate","sig_dn_rate",
+                    "sig_up_hit_rate","sig_dn_hit_rate","sig_up_avg_ret_bps","sig_dn_avg_ret_bps",
+                ],
+            )
             writer.writeheader()
             for r in rows:
                 writer.writerow(r)
         typer.echo(f"Saved xgb_eval results to: {out_csv}")
     # Print results concise
     for r in rows:
-        typer.echo(f"{r['pair']} {r['timeframe']} rows={r['rows']} IC={r['ic']:.5f} MSE={r['mse']:.6f} ACC={r['acc_dir']:.3f}")
+        base = f"{r['pair']} {r['timeframe']} rows={r['rows']} IC={r['ic']:.5f} MSE={r['mse']:.6f} ACC={r['acc_dir']:.3f}"
+        if 'sig_up_cnt' in r:
+            def _fmt(x):
+                try:
+                    return f"{float(x):.3f}"
+                except Exception:
+                    return "nan"
+            extra = (
+                f" UPcnt={r.get('sig_up_cnt', 0)} DNcnt={r.get('sig_dn_cnt', 0)}"
+                f" UPr={_fmt(r.get('sig_up_rate'))} DNr={_fmt(r.get('sig_dn_rate'))}"
+                f" UPhit={_fmt(r.get('sig_up_hit_rate'))} DNhit={_fmt(r.get('sig_dn_hit_rate'))}"
+                f" UPq95={_fmt(r.get('p_up_q95'))} DNq95={_fmt(r.get('p_dn_q95'))}"
+            )
+            typer.echo(base + extra)
+        else:
+            typer.echo(base)
 
 @app.command()
 def forecast_eval(
