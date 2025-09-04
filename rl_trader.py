@@ -2004,18 +2004,25 @@ def xgb_impulse_tune(
         c = feats["close"].astype(float).values if "close" in feats.columns else raw["close"].astype(float).values
         logp = pd.Series(np.log(c + 1e-12), index=feats.index)
         H = int(max(1, int(cfg.get("horizon", horizon))))
+        T = len(feats)
+        valid_len = T - H
+        if valid_len <= 200:
+            return float('-inf')
+        # Forward returns matrix; restrict to valid range to avoid all-NaN tails
         fwd = [logp.shift(-i) - logp for i in range(1, H + 1)]
         fwd_mat = np.vstack([s.to_numpy() for s in fwd])  # (H, T)
-        fwd_max = np.nanmax(fwd_mat, axis=0)
-        fwd_min = np.nanmin(fwd_mat, axis=0)
+        fwd_valid = fwd_mat[:, :valid_len]
+        fwd_max = np.nanmax(fwd_valid, axis=0)
+        fwd_min = np.nanmin(fwd_valid, axis=0)
         mode_l = str(label_mode).strip().lower()
         if mode_l == "vol":
             # Rolling std of single-bar log returns (causal)
             logret = np.diff(np.log(c + 1e-12), prepend=np.log(c[0] + 1e-12))
             sigma = pd.Series(logret).rolling(int(max(10, vol_lookback)), min_periods=10).std().fillna(0.0).to_numpy()
-            # Scale threshold by sqrt(H)
-            up_thr_vec = float(alpha_up) * sigma * float(np.sqrt(H))
-            dn_thr_vec = float(alpha_dn) * sigma * float(np.sqrt(H))
+            # Scale threshold by sqrt(H) and align to valid window
+            scale = float(np.sqrt(H))
+            up_thr_vec = float(alpha_up) * sigma[:valid_len] * scale
+            dn_thr_vec = float(alpha_dn) * sigma[:valid_len] * scale
             y_up = (fwd_max >= up_thr_vec).astype(int)
             y_dn = (fwd_min <= -dn_thr_vec).astype(int)
         else:
@@ -2023,9 +2030,6 @@ def xgb_impulse_tune(
             dn_thr = float(thr_dn_bps) * 1e-4
             y_up = (fwd_max >= up_thr).astype(int)
             y_dn = (fwd_min <= -dn_thr).astype(int)
-        valid_len = len(feats) - H
-        if valid_len <= 200:
-            return float('-inf')
         X = feats.iloc[:valid_len, :].copy()
         y_up = y_up[:valid_len]
         y_dn = y_dn[:valid_len]
@@ -2058,6 +2062,18 @@ def xgb_impulse_tune(
         if X_tr.empty or X_val.empty:
             return float('-inf')
 
+        # Decide device for this trial based on CuPy availability
+        dev_for_trial = dev
+        use_gpu = (dev == "cuda")
+        gpu_ok = False
+        if use_gpu:
+            try:
+                import cupy as cp  # type: ignore
+                gpu_ok = True
+            except Exception:
+                typer.echo(f"Trial {trial.number}: CuPy not available - falling back to CPU to avoid device mismatch warnings.")
+                dev_for_trial = "cpu"
+
         # Scale pos weight to handle imbalance
         def _spw(y: np.ndarray) -> float:
             pos = float(np.sum(y == 1))
@@ -2067,7 +2083,7 @@ def xgb_impulse_tune(
         common_kwargs = dict(
             objective="binary:logistic",
             tree_method="hist",
-            device=_resolve_device(),
+            device=dev_for_trial,
             random_state=int(seed),
             n_jobs=(int(n_jobs) if int(n_jobs) > 0 else -1),
             learning_rate=float(cfg["learning_rate"]),
@@ -2101,14 +2117,31 @@ def xgb_impulse_tune(
         up_clf = xgb.XGBClassifier(**{**common_kwargs, **{"scale_pos_weight": _spw(y_up_tr_np)}})
         dn_clf = xgb.XGBClassifier(**{**common_kwargs, **{"scale_pos_weight": _spw(y_dn_tr_np)}})
         try:
-            up_clf.fit(X_up_tr_np, y_up_tr_np, eval_set=[(X_val.values, y_up_val)], verbose=False)
-            dn_clf.fit(X_dn_tr_np, y_dn_tr_np, eval_set=[(X_val.values, y_dn_val)], verbose=False)
+            if gpu_ok:
+                # Train and predict with CuPy arrays on GPU
+                X_up_tr_gpu = cp.asarray(X_up_tr_np, dtype=cp.float32)
+                y_up_tr_gpu = cp.asarray(y_up_tr_np, dtype=cp.float32)
+                X_dn_tr_gpu = cp.asarray(X_dn_tr_np, dtype=cp.float32)
+                y_dn_tr_gpu = cp.asarray(y_dn_tr_np, dtype=cp.float32)
+                X_val_gpu = cp.asarray(X_val.values, dtype=cp.float32)
+                y_up_val_gpu = cp.asarray(y_up_val, dtype=cp.float32)
+                y_dn_val_gpu = cp.asarray(y_dn_val, dtype=cp.float32)
+
+                up_clf.fit(X_up_tr_gpu, y_up_tr_gpu, eval_set=[(X_val_gpu, y_up_val_gpu)], verbose=False)
+                dn_clf.fit(X_dn_tr_gpu, y_dn_tr_gpu, eval_set=[(X_val_gpu, y_dn_val_gpu)], verbose=False)
+
+                p_up = cp.asnumpy(up_clf.predict_proba(X_val_gpu)[:, 1])
+                p_dn = cp.asnumpy(dn_clf.predict_proba(X_val_gpu)[:, 1])
+            else:
+                # CPU path
+                up_clf.fit(X_up_tr_np, y_up_tr_np, eval_set=[(X_val.values, y_up_val)], verbose=False)
+                dn_clf.fit(X_dn_tr_np, y_dn_tr_np, eval_set=[(X_val.values, y_dn_val)], verbose=False)
+
+                p_up = up_clf.predict_proba(X_val.values)[:, 1]
+                p_dn = dn_clf.predict_proba(X_val.values)[:, 1]
         except Exception as e:
             typer.echo(f"Trial fit failed: {e}")
             return float('-inf')
-
-        p_up = up_clf.predict_proba(X_val.values)[:, 1]
-        p_dn = dn_clf.predict_proba(X_val.values)[:, 1]
         try:
             auprc_up = float(average_precision_score(y_up_val, p_up))
             auprc_dn = float(average_precision_score(y_dn_val, p_dn))
