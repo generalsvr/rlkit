@@ -263,6 +263,10 @@ def topbot_train(
     # Coerce Typer OptionInfo to concrete values when invoked programmatically
     feature_mode = _coerce_opt(feature_mode, "full")
     basic_lookback = int(_coerce_opt(basic_lookback, 64))
+    left_bars = int(_coerce_opt(left_bars, 3))
+    right_bars = int(_coerce_opt(right_bars, 3))
+    min_gap_bars = int(_coerce_opt(min_gap_bars, 4))
+    device = str(_coerce_opt(device, "auto"))
     feats = make_features(raw, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=(etf or None))
     feats = feats.reset_index(drop=True)
     c = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
@@ -349,7 +353,16 @@ def topbot_train(
     _save_feature_columns(bot_path, list(feats.columns))
     _save_feature_columns(top_path, list(feats.columns))
 
-    typer.echo(json.dumps({"bottom": {"path": bot_path, **m1}, "top": {"path": top_path, **m2}}, indent=2))
+    # Compute validation metrics for report (robust across tuning paths)
+    try:
+        from sklearn.metrics import average_precision_score as _aps
+        p_b = bot_model.predict_proba(X_val)[:, 1]
+        p_t = top_model.predict_proba(X_val)[:, 1]
+        m_bot = {"auprc": float(_aps(yb_val, p_b))}
+        m_top = {"auprc": float(_aps(yt_val, p_t))}
+    except Exception:
+        m_bot = {}; m_top = {}
+    typer.echo(json.dumps({"bottom": {"path": bot_path, **m_bot}, "top": {"path": top_path, **m_top}}, indent=2))
 
 
 @app.command()
@@ -395,6 +408,8 @@ def logret_train(
     etf = [s.strip() for s in extra_timeframes.split(",") if s.strip()]
     feature_mode = _coerce_opt(feature_mode, "full")
     basic_lookback = int(_coerce_opt(basic_lookback, 64))
+    horizon = int(_coerce_opt(horizon, 1))
+    strong_mult = float(_coerce_opt(strong_mult, 1.5))
     feats = make_features(raw, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=(etf or None))
     feats = feats.reset_index(drop=True)
     close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
@@ -544,6 +559,15 @@ def meta_train(
     etf = [s.strip() for s in extra_timeframes.split(",") if s.strip()]
     feature_mode = _coerce_opt(feature_mode, "full")
     basic_lookback = int(_coerce_opt(basic_lookback, 64))
+    p_buy_thr = float(_coerce_opt(p_buy_thr, 0.6))
+    p_sell_thr = float(_coerce_opt(p_sell_thr, 0.6))
+    pt_mult = float(_coerce_opt(pt_mult, 2.0))
+    sl_mult = float(_coerce_opt(sl_mult, 1.0))
+    max_holding = int(_coerce_opt(max_holding, 24))
+    epochs = int(_coerce_opt(epochs, 80))
+    lr = float(_coerce_opt(lr, 1e-3))
+    batch_size = int(_coerce_opt(batch_size, 512))
+    device = str(_coerce_opt(device, "auto"))
     feats = make_features(raw, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=(etf or None))
     feats = feats.reset_index(drop=True)
     T = len(feats)
