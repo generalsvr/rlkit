@@ -207,31 +207,202 @@ python rl_trader.py forecast_train \
 python rl_trader.py forecast-train   --pair BTC/USDT --timeframe 15m   --feature-mode full --extra-timeframes 1h,4h,1D   --target-mode logret --forecast-arch decoder_only   --window 512 --horizon 4   --d-model 128 --nhead 4 --num-encoder-layers 2 --num-decoder-layers 2 --ff-dim 256   --dropout 0.3 --weight-decay 0.003 --learning-rate 1e-4 --batch-size 512 --epochs 10 --device cuda   --autofetch --exchange bybit --download-timerange 20160101-   --model-out freqtrade_userdir/models/forecaster_15m_logret_decoder.pt
 ```
 
-### XBG
+### XGB Stack Training & Evaluation
 
+#### Overview
+Train XGBoost models for market prediction with hierarchical stacking:
+- **L0 Layer**: TopBot (pivot detection), Logret (return forecasting), Impulse (momentum)
+- **L1 Layer**: Meta MLP (combines L0 predictions for final decisions)
+
+#### 1) Train All Models (End-to-End)
 ```bash
-python rl_trader.py xgb-tune --pair BTC/USDT --timeframe 1h --exchange bybit   --timerange 20190101- --horizon 1 --sampler tpe --n-trials 50 --seed 42 --optimize-features --max-features 24   --ic-metric spearman --n-jobs 0 --extra-timeframes "4H,1D;4H,1D,1W" --xgb-device cuda --outdir ./models/xgb_optuna
+python xgb_trainer.py train-all \
+  --pair BTC/USDT --timeframe 1h \
+  --userdir freqtrade_userdir --timerange 20190101- \
+  --prefer-exchange bybit \
+  --outdir ./models/xgb_stack \
+  --optuna-trials 40 \
+  --cv-splits 5 --cv-scheme expanding --cv-val-size 2000 --perm-test 500 \
+  --auto-backtest True --backtest-timerange 20240101-
 ```
 
+#### 2) Individual Model Training
+
+**TopBot (Pivot Detection)**:
+```bash
+python xgb_trainer.py topbot-train \
+  --pair BTC/USDT --timeframe 1h \
+  --userdir freqtrade_userdir --timerange 20190101- \
+  --prefer-exchange bybit \
+  --outdir ./models/xgb_stack \
+  --n-trials 40 \
+  --cv-splits 5 --perm-test 500
+```
+
+**Logret (Return Forecasting)**:
+```bash
+python xgb_trainer.py logret-train \
+  --pair BTC/USDT --timeframe 1h \
+  --userdir freqtrade_userdir --timerange 20190101- \
+  --prefer-exchange bybit \
+  --outdir ./models/xgb_stack \
+  --n-trials 40 \
+  --cv-splits 5 --perm-test 500
+```
+
+**Impulse (Momentum Detection)**:
+```bash
+python xgb_trainer.py impulse-train \
+  --pair BTC/USDT --timeframe 1h \
+  --userdir freqtrade_userdir --timerange 20190101- \
+  --prefer-exchange bybit \
+  --outdir ./models/xgb_stack \
+  --n-trials 40 \
+  --cv-splits 5 --perm-test 500
+```
+
+**Meta MLP (Stacking Manager)**:
+```bash
+python xgb_trainer.py meta-train \
+  --pair BTC/USDT --timeframe 1h \
+  --userdir freqtrade_userdir --timerange 20190101- \
+  --prefer-exchange bybit \
+  --bot-path ./models/xgb_stack/best_topbot_bottom.json \
+  --top-path ./models/xgb_stack/best_topbot_top.json \
+  --logret-path ./models/xgb_stack/best_logret.json \
+  --outdir ./models/xgb_stack
+```
+
+#### 3) Model Evaluation & Visualization
+
+**TopBot Evaluation**:
+```bash
+python xgb_trainer.py topbot-eval \
+  --pair BTC/USDT --timeframe 1h \
+  --userdir freqtrade_userdir --timerange 20240101- \
+  --prefer-exchange bybit \
+  --bot-path ./models/xgb_stack/best_topbot_bottom.json \
+  --top-path ./models/xgb_stack/best_topbot_top.json \
+  --outdir ./plot/xgb_eval
+```
+
+**Logret Evaluation** (with enhanced visuals):
+```bash
+python xgb_trainer.py logret-eval \
+  --pair BTC/USDT --timeframe 1h \
+  --userdir freqtrade_userdir --timerange 20240101- \
+  --prefer-exchange bybit \
+  --logret-path ./models/xgb_stack/best_logret.json \
+  --outdir ./plot/xgb_eval
+```
+
+**Impulse Evaluation**:
+```bash
+python xgb_trainer.py impulse-eval \
+  --pair BTC/USDT --timeframe 1h \
+  --userdir freqtrade_userdir --timerange 20240101- \
+  --prefer-exchange bybit \
+  --up-path ./models/xgb_stack/best_impulse_up.json \
+  --dn-path ./models/xgb_stack/best_impulse_down.json \
+  --outdir ./plot/xgb_eval
+```
+
+**Meta Model Evaluation** (TopBot + Logret only):
+```bash
+python xgb_trainer.py meta-eval \
+  --pair BTC/USDT --timeframe 1h \
+  --userdir freqtrade_userdir --timerange 20240101- \
+  --prefer-exchange bybit \
+  --bot-path ./models/xgb_stack/best_topbot_bottom.json \
+  --top-path ./models/xgb_stack/best_topbot_top.json \
+  --logret-path ./models/xgb_stack/best_logret.json \
+  --meta-json-path ./models/xgb_stack/best_meta.json \
+  --outdir ./plot/xgb_eval
+```
+
+#### 4) Backtesting with Meta Model
+
+**Basic Backtest**:
+```bash
+XGB_BOTTOM_PATH=./models/xgb_stack/best_topbot_bottom.json \
+XGB_TOP_PATH=./models/xgb_stack/best_topbot_top.json \
+XGB_LOGRET_PATH=./models/xgb_stack/best_logret.json \
+XGB_META_PATH=./models/xgb_stack/best_meta.json \
+XGB_EXTRA_TFS=4h,1d,1w META_THR=0.5 XGB_P_BUY_THR=0.6 XGB_P_SELL_THR=0.6 \
+freqtrade backtesting \
+  --userdir freqtrade_userdir \
+  --config freqtrade_userdir/config.json \
+  --strategy XGBStackedStrategy \
+  --timeframe 1h \
+  --pairs BTC/USDT:USDT \
+  --timerange 20250101-
+```
+
+**Optimized Backtest** (CV-tuned thresholds):
+```bash
+XGB_BOTTOM_PATH=./models/xgb_stack/best_topbot_bottom.json \
+XGB_TOP_PATH=./models/xgb_stack/best_topbot_top.json \
+XGB_LOGRET_PATH=./models/xgb_stack/best_logret.json \
+XGB_META_PATH=./models/xgb_stack/best_meta.json \
+XGB_EXTRA_TFS=4h,1d,1w \
+META_THR=0.65 \
+XGB_P_BUY_THR=0.7 \
+XGB_P_SELL_THR=0.7 \
+XGB_MIN_HOLD=0 \
+XGB_COOLDOWN=3 \
+freqtrade backtesting \
+  --userdir freqtrade_userdir \
+  --config freqtrade_userdir/config.json \
+  --strategy XGBStackedStrategy \
+  --timeframe 1h \
+  --pairs BTC/USDT:USDT \
+  --timerange 20250101-
+```
+
+**Compare L0 vs Meta** (disable meta gating):
+```bash
+XGB_BOTTOM_PATH=./models/xgb_stack/best_topbot_bottom.json \
+XGB_TOP_PATH=./models/xgb_stack/best_topbot_top.json \
+XGB_LOGRET_PATH=./models/xgb_stack/best_logret.json \
+XGB_EXTRA_TFS=4h,1d,1w \
+META_THR=0.0 \
+XGB_P_BUY_THR=0.6 \
+XGB_P_SELL_THR=0.6 \
+freqtrade backtesting \
+  --userdir freqtrade_userdir \
+  --config freqtrade_userdir/config.json \
+  --strategy XGBStackedStrategy \
+  --timeframe 1h \
+  --pairs BTC/USDT \
+  --timerange 20240101-
+```
+
+#### XGB Model Outputs
+- **Models**: `best_topbot_bottom.json`, `best_topbot_top.json`, `best_logret.json`, `best_impulse_up.json`, `best_impulse_down.json`, `best_meta.json`
+- **Charts**: Timestamped folders in `./plot/xgb_eval/` with probability plots, feature importance, and price overlays
+- **Validation**: CV metrics, permutation tests, and sign accuracy for meta model
+
+#### XGB Parameters
+- `--cv-splits N`: Time-aware cross-validation with N folds
+- `--perm-test N`: Permutation test with N shuffles
+- `--n-trials N`: Optuna hyperparameter optimization trials
+- `--outdir PATH`: Output directory for models/charts
+
 ### Notes
-- Strategy file: `freqtrade_userdir/strategies/RLStrategy.py`
-- RL signals: `rl_lib/signal.py` produces `enter_long/exit_long/enter_short/exit_short` for Freqtrade.
-- Normalization: `VecNormalize` stats saved to `models/vecnormalize.pkl` are reused during inference.
-- Features:
-  - basic: `close_z`, `change`, `d_hl`
-  - full: `logret`, `hl_range`, `upper_wick`, `lower_wick`, `rsi`, `vol_z`, `atr`, `ret_std_14` (MACD/Bollinger removed)
-- Costs and realism: fees/slippage in bps are charged, flips double-charged; optional min-hold and cooldown.
-- Eval: PnL (final equity) printed every `--eval-freq` steps; cap eval rollout length with `--eval-max-steps`.
+- **Strategy files**: `freqtrade_userdir/strategies/RLStrategy.py`, `XGBStackedStrategy.py`
+- **RL signals**: `rl_lib/signal.py` produces `enter_long/exit_long/enter_short/exit_short` for Freqtrade
+- **XGB signals**: `XGBStackedStrategy.py` uses meta-gated XGBoost predictions
+- **Normalization**: `VecNormalize` stats saved to `models/vecnormalize.pkl` are reused during inference
+- **Features**:
+  - `basic`: `close_z`, `change`, `d_hl`
+  - `full`: `logret`, `hl_range`, `upper_wick`, `lower_wick`, `rsi`, `vol_z`, `atr`, `ret_std_14` (MACD/Bollinger removed)
+- **Costs and realism**: fees/slippage in bps are charged, flips double-charged; optional min-hold and cooldown
+- **Eval**: PnL (final equity) printed every `--eval-freq` steps; cap eval rollout length with `--eval-max-steps`
 
 ### Troubleshooting
-- "No data found": rerun download with `--erase` or ensure parquet path matches exchange folder.
-- "No pair in whitelist": use correct pair symbol (`BTC/USDT:USDT` for Bybit futures).
-- CPU runs: set `--device cpu`.
-
- 
-
-
-python xgb_trainer.py logret-eval --pair ETH/USDT --timeframe 1h --userdir freqtrade_userdir --timerange 20250505-20250515 --prefer-exchange bybit --logret-path ./models/xgb_stack/best_logret.json --outdir ./plot/xgb_eval
-
-python xgb_trainer.py topbot-eval --pair BTC/USDT --timeframe 1h --userdir freqtrade_userdir --timerange 20250505- --prefer-exchange bybit --bot-path ./models/xgb_stack/best_topbot_bottom.json --top-path ./models/xgb_stack/best_topbot_top.json --outdir ./plot/xgb_eval
+- **"No data found"**: rerun download with `--erase` or ensure parquet path matches exchange folder
+- **"No pair in whitelist"**: use correct pair symbol (`BTC/USDT:USDT` for Bybit futures)
+- **"Meta model load error"**: delete old `best_meta.json` and retrain meta model
+- **CPU runs**: set `--device cpu`
+- **XGB charts not generating**: ensure matplotlib is installed (`pip install matplotlib`)
 

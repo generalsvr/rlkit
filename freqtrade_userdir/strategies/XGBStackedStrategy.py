@@ -52,6 +52,12 @@ class XGBStackedStrategy(IStrategy):
         self.feature_mode = os.environ.get("XGB_FEAT_MODE", "full")
         self.extra_timeframes = [s.strip() for s in os.environ.get("XGB_EXTRA_TFS", "4h,1d").split(',') if s.strip()]
         self.device = os.environ.get("XGB_DEVICE", "auto")
+        # Mode: which model to backtest: stacked|topbot|logret|impulse
+        self.mode = os.environ.get("XGB_MODE", "stacked").strip().lower()
+        # Additional thresholds for specific modes
+        self.logret_dir_thr = float(os.environ.get("LOGRET_DIR_THR", "0.0"))
+        self.p_up_thr = float(os.environ.get("XGB_P_UP_THR", os.environ.get("XGB_P_BUY_THR", str(self.p_buy_thr))))
+        self.p_dn_thr = float(os.environ.get("XGB_P_DN_THR", os.environ.get("XGB_P_SELL_THR", str(self.p_sell_thr))))
 
         # Lazy loaded models
         self._bot = None
@@ -262,12 +268,35 @@ class XGBStackedStrategy(IStrategy):
             except Exception:
                 meta_p = None
 
-        # Gating
-        buy_sig = (p_bottom >= float(self.p_buy_thr))
-        sell_sig = (p_top >= float(self.p_sell_thr))
-        if meta_p is not None:
-            buy_sig &= (meta_p >= float(self.meta_thr)).astype(bool)
-            sell_sig &= (meta_p >= float(self.meta_thr)).astype(bool)
+        # Build trading signals according to selected mode
+        mode = self.mode
+        buy_sig = np.zeros(T, dtype=bool)
+        sell_sig = np.zeros(T, dtype=bool)
+        if mode in ("stacked", "stack", "meta"):
+            buy_sig = (p_bottom >= float(self.p_buy_thr))
+            sell_sig = (p_top >= float(self.p_sell_thr))
+            if meta_p is not None:
+                thr = float(self.meta_thr)
+                buy_sig &= (meta_p >= thr).astype(bool)
+                sell_sig &= (meta_p >= thr).astype(bool)
+        elif mode == "topbot":
+            buy_sig = (p_bottom >= float(self.p_buy_thr))
+            sell_sig = (p_top >= float(self.p_sell_thr))
+        elif mode == "logret":
+            thr = float(self.logret_dir_thr)
+            buy_sig = (reg_dir >= thr)
+            sell_sig = (reg_dir <= -thr)
+        elif mode == "impulse":
+            buy_sig = (p_up >= float(self.p_up_thr))
+            sell_sig = (p_dn >= float(self.p_dn_thr))
+        else:
+            # Fallback to stacked
+            buy_sig = (p_bottom >= float(self.p_buy_thr))
+            sell_sig = (p_top >= float(self.p_sell_thr))
+            if meta_p is not None:
+                thr = float(self.meta_thr)
+                buy_sig &= (meta_p >= thr).astype(bool)
+                sell_sig &= (meta_p >= thr).astype(bool)
 
         enter_long = np.zeros(T, dtype=int)
         exit_long = np.zeros(T, dtype=int)
