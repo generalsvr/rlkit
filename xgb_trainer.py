@@ -94,6 +94,109 @@ def _resolve_device(dev: str) -> str:
     return "cpu"
 
 
+# -----------------------------
+# Plotting helpers
+# -----------------------------
+
+def _ts_outdir(base: str, prefix: str = "eval") -> str:
+    import datetime as _dt
+    ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    root = os.path.join(base, f"{prefix}_{ts}")
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
+def _safe_savefig(fig, out_path: str):
+    try:
+        import matplotlib.pyplot as _plt
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=140)
+        _plt.close(fig)
+    except Exception:
+        try:
+            import matplotlib.pyplot as _plt
+            _plt.close(fig)
+        except Exception:
+            pass
+
+
+def _plot_price_with_events(index, close: np.ndarray, events: Dict[str, np.ndarray], title: str, out_path: str):
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(14, 6))
+    ax.plot(index, close, color="#1f77b4", linewidth=1.2, label="Close")
+    colors = {
+        "bottom": "#2ca02c",
+        "top": "#d62728",
+        "up_sig": "#17becf",
+        "dn_sig": "#9467bd",
+    }
+    for name, mask in events.items():
+        if mask is None:
+            continue
+        try:
+            xs = index[mask.astype(bool)]
+            ys = close[mask.astype(bool)]
+            ax.scatter(xs, ys, s=18, label=name, alpha=0.85, zorder=5, color=colors.get(name, None))
+        except Exception:
+            pass
+    ax.set_title(title)
+    ax.grid(alpha=0.25)
+    ax.legend(loc="best")
+    _safe_savefig(fig, out_path)
+
+
+def _plot_prob_series(index, series: Dict[str, np.ndarray], thresholds: Optional[Dict[str, float]], title: str, out_path: str):
+    import matplotlib.pyplot as plt
+    fig, ax = plt.subplots(figsize=(14, 5))
+    for name, arr in series.items():
+        ax.plot(index, arr, linewidth=1.0, label=name)
+    if thresholds:
+        for name, thr in thresholds.items():
+            ax.axhline(float(thr), linestyle="--", linewidth=0.8, alpha=0.6, label=f"{name}_thr={thr}")
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_title(title)
+    ax.grid(alpha=0.25)
+    ax.legend(loc="best", ncol=4)
+    _safe_savefig(fig, out_path)
+
+
+def _plot_feature_importance(model: Any, feature_names: List[str], out_path: str, title: str, top_k: int = 30):
+    import matplotlib.pyplot as plt
+    # Try booster-based importance for robustness
+    names = list(feature_names)
+    imp_map: Dict[str, float] = {}
+    try:
+        booster = model.get_booster()  # type: ignore[attr-defined]
+        raw = booster.get_score(importance_type="gain")
+        # raw keys like 'f0','f1', map to names if available
+        for k, v in raw.items():
+            try:
+                idx = int(k[1:]) if k.startswith("f") else int(k)
+                nm = names[idx] if 0 <= idx < len(names) else k
+            except Exception:
+                nm = k
+            imp_map[nm] = float(v)
+    except Exception:
+        try:
+            vals = getattr(model, "feature_importances_", None)
+            if vals is not None:
+                for i, v in enumerate(list(vals)):
+                    nm = names[i] if i < len(names) else f"f{i}"
+                    imp_map[nm] = float(v)
+        except Exception:
+            imp_map = {}
+    if not imp_map:
+        return
+    items = sorted(imp_map.items(), key=lambda x: x[1], reverse=True)[:max(1, int(top_k))]
+    labels = [k for k, _ in items][::-1]
+    values = [v for _, v in items][::-1]
+    fig, ax = plt.subplots(figsize=(10, max(4, int(len(items) * 0.3))))
+    ax.barh(labels, values, color="#1f77b4", alpha=0.85)
+    ax.set_title(title)
+    ax.grid(axis="x", alpha=0.3)
+    _safe_savefig(fig, out_path)
+
+
 def _train_xgb_classifier(
     X_tr: np.ndarray,
     y_tr: np.ndarray,
@@ -981,6 +1084,166 @@ def meta_train(
     typer.echo(json.dumps(res, indent=2))
 
 
+# -----------------------------
+# Evaluation commands
+# -----------------------------
+
+
+@app.command("topbot-eval")
+def topbot_eval(
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    timerange: str = typer.Option("20240101-"),
+    prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
+    bot_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_topbot_bottom.json")),
+    top_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_topbot_top.json")),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("4H,1D,1W"),
+    outdir: str = typer.Option(str(Path(__file__).resolve().parent / "plot" / "xgb_eval")),
+    device: str = typer.Option("auto"),
+):
+    # Load data
+    path = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange) or _find_data_file(userdir, pair, timeframe, prefer_exchange)
+    if not path:
+        raise FileNotFoundError("Dataset not found for evaluation.")
+    raw = _load_ohlcv(path)
+    raw = _slice_timerange_df(raw, timerange)
+    etf = [s.strip() for s in extra_timeframes.split(",") if s.strip()]
+    feats = make_features(raw, mode=_coerce_opt(feature_mode, "full"), basic_lookback=int(_coerce_opt(basic_lookback, 64)), extra_timeframes=(etf or None))
+    feats = feats.reset_index(drop=True)
+    idx = feats.index
+    close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
+    # Load models and predict
+    bot_clf, bot_cols = _load_xgb(str(_coerce_opt(bot_path, bot_path)), device=device)
+    top_clf, top_cols = _load_xgb(str(_coerce_opt(top_path, top_path)), device=device)
+    p_bot = _predict_with_cols(bot_clf, feats, bot_cols)
+    p_top = _predict_with_cols(top_clf, feats, top_cols)
+    T = len(feats)
+    p_bottom = p_bot[:, 1] if (p_bot is not None and p_bot.ndim == 2 and p_bot.shape[1] >= 2) else np.zeros(T)
+    p_topp = p_top[:, 1] if (p_top is not None and p_top.ndim == 2 and p_top.shape[1] >= 2) else np.zeros(T)
+
+    # Visuals
+    root = _ts_outdir(outdir, prefix="topbot")
+    # Probabilities
+    _plot_prob_series(idx, {"p_bottom": p_bottom, "p_top": p_topp}, thresholds=None, title=f"Top/Bottom Probabilities {pair} {timeframe}", out_path=os.path.join(root, "topbot_probs.png"))
+    # Events at p>=0.6 as default view
+    ev = {
+        "bottom": (p_bottom >= 0.6).astype(int),
+        "top": (p_topp >= 0.6).astype(int),
+    }
+    _plot_price_with_events(idx, close, ev, title=f"Price with Top/Bottom signals {pair} {timeframe}", out_path=os.path.join(root, "topbot_events.png"))
+    # Feature importance
+    _plot_feature_importance(bot_clf, bot_cols or list(feats.columns), out_path=os.path.join(root, "fi_bottom.png"), title="Feature importance - Bottom")
+    _plot_feature_importance(top_clf, top_cols or list(feats.columns), out_path=os.path.join(root, "fi_top.png"), title="Feature importance - Top")
+    typer.echo(json.dumps({"outdir": root, "samples": int(T)}, indent=2))
+
+
+@app.command("logret-eval")
+def logret_eval(
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    timerange: str = typer.Option("20240101-"),
+    prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
+    logret_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_logret.json")),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("4H,1D,1W"),
+    outdir: str = typer.Option(str(Path(__file__).resolve().parent / "plot" / "xgb_eval")),
+    device: str = typer.Option("auto"),
+):
+    path = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange) or _find_data_file(userdir, pair, timeframe, prefer_exchange)
+    if not path:
+        raise FileNotFoundError("Dataset not found for evaluation.")
+    raw = _load_ohlcv(path)
+    raw = _slice_timerange_df(raw, timerange)
+    etf = [s.strip() for s in extra_timeframes.split(",") if s.strip()]
+    feats = make_features(raw, mode=_coerce_opt(feature_mode, "full"), basic_lookback=int(_coerce_opt(basic_lookback, 64)), extra_timeframes=(etf or None))
+    feats = feats.reset_index(drop=True)
+    idx = feats.index
+    close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
+
+    logret_clf, logret_cols = _load_xgb(str(_coerce_opt(logret_path, logret_path)), device=device)
+    pr = _predict_with_cols(logret_clf, feats, logret_cols)
+    T = len(feats)
+    if pr is None or pr.ndim != 2 or pr.shape[1] != 5:
+        pr = np.zeros((T, 5), dtype=float)
+    class_vals = np.array([-2, -1, 0, 1, 2], dtype=float)
+    reg_dir = pr @ class_vals
+
+    root = _ts_outdir(outdir, prefix="logret")
+    _plot_prob_series(idx, {
+        "p_-2": pr[:, 0],
+        "p_-1": pr[:, 1],
+        "p_0": pr[:, 2],
+        "p_1": pr[:, 3],
+        "p_2": pr[:, 4],
+    }, thresholds=None, title=f"Logret class probabilities {pair} {timeframe}", out_path=os.path.join(root, "logret_probs.png"))
+    # Direction proxy overlay
+    try:
+        import matplotlib.pyplot as plt
+        fig, ax1 = plt.subplots(figsize=(14, 5))
+        ax1.plot(idx, close, color="#1f77b4", linewidth=1.0)
+        ax1.set_title(f"Price with reg_direction (proxy) {pair} {timeframe}")
+        ax2 = ax1.twinx()
+        ax2.plot(idx, reg_dir, color="#ff7f0e", linewidth=0.9, alpha=0.8)
+        ax2.axhline(0.0, color="#888", linestyle="--", linewidth=0.8)
+        ax1.grid(alpha=0.25)
+        _safe_savefig(fig, os.path.join(root, "logret_regdir.png"))
+    except Exception:
+        pass
+    _plot_feature_importance(logret_clf, logret_cols or list(feats.columns), out_path=os.path.join(root, "fi_logret.png"), title="Feature importance - Logret")
+    typer.echo(json.dumps({"outdir": root, "samples": int(T)}, indent=2))
+
+
+@app.command("impulse-eval")
+def impulse_eval(
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    timerange: str = typer.Option("20240101-"),
+    prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
+    up_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_impulse_up.json")),
+    dn_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_impulse_down.json")),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("4H,1D,1W"),
+    outdir: str = typer.Option(str(Path(__file__).resolve().parent / "plot" / "xgb_eval")),
+    device: str = typer.Option("auto"),
+):
+    path = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange) or _find_data_file(userdir, pair, timeframe, prefer_exchange)
+    if not path:
+        raise FileNotFoundError("Dataset not found for evaluation.")
+    raw = _load_ohlcv(path)
+    raw = _slice_timerange_df(raw, timerange)
+    etf = [s.strip() for s in extra_timeframes.split(",") if s.strip()]
+    feats = make_features(raw, mode=_coerce_opt(feature_mode, "full"), basic_lookback=int(_coerce_opt(basic_lookback, 64)), extra_timeframes=(etf or None))
+    feats = feats.reset_index(drop=True)
+    idx = feats.index
+    close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
+
+    up_clf, up_cols = _load_xgb(str(_coerce_opt(up_path, up_path)), device=device)
+    dn_clf, dn_cols = _load_xgb(str(_coerce_opt(dn_path, dn_path)), device=device)
+    p_up = _predict_with_cols(up_clf, feats, up_cols)
+    p_dn = _predict_with_cols(dn_clf, feats, dn_cols)
+    T = len(feats)
+    p_up1 = p_up[:, 1] if (p_up is not None and p_up.ndim == 2 and p_up.shape[1] >= 2) else np.zeros(T)
+    p_dn1 = p_dn[:, 1] if (p_dn is not None and p_dn.ndim == 2 and p_dn.shape[1] >= 2) else np.zeros(T)
+
+    root = _ts_outdir(outdir, prefix="impulse")
+    _plot_prob_series(idx, {"p_up": p_up1, "p_dn": p_dn1}, thresholds=None, title=f"Impulse probabilities {pair} {timeframe}", out_path=os.path.join(root, "impulse_probs.png"))
+    ev = {
+        "up_sig": (p_up1 >= 0.6).astype(int),
+        "dn_sig": (p_dn1 >= 0.6).astype(int),
+    }
+    _plot_price_with_events(idx, close, ev, title=f"Price with impulse signals {pair} {timeframe}", out_path=os.path.join(root, "impulse_events.png"))
+    _plot_feature_importance(up_clf, up_cols or list(feats.columns), out_path=os.path.join(root, "fi_impulse_up.png"), title="Feature importance - Impulse Up")
+    _plot_feature_importance(dn_clf, dn_cols or list(feats.columns), out_path=os.path.join(root, "fi_impulse_dn.png"), title="Feature importance - Impulse Down")
+    typer.echo(json.dumps({"outdir": root, "samples": int(T)}, indent=2))
+
+
 @app.command()
 def train_all(
     pair: str = typer.Option("BTC/USDT"),
@@ -1049,6 +1312,68 @@ def train_all(
         outdir=outdir,
         autodownload=False,
     )
+    # Generate evaluation charts bundle
+    try:
+        bundle_root = _ts_outdir(str(Path(__file__).resolve().parent / "plot" / "xgb_eval"), prefix="bundle")
+        # Run evals and then move their outputs under bundle_root
+        import shutil
+        # TopBot
+        _tb_before = _ts_outdir(str(Path(__file__).resolve().parent / "plot" / "xgb_eval"), prefix="tmp_topbot")
+        # re-evaluate into tmp dir by temporarily overriding outdir
+        topbot_eval(
+            pair=pair,
+            timeframe=timeframe,
+            userdir=userdir,
+            timerange=timerange,
+            prefer_exchange=prefer_exchange,
+            bot_path=str(Path(outdir) / "best_topbot_bottom.json"),
+            top_path=str(Path(outdir) / "best_topbot_top.json"),
+            outdir=_tb_before,
+        )
+        # Logret
+        _lr_before = _ts_outdir(str(Path(__file__).resolve().parent / "plot" / "xgb_eval"), prefix="tmp_logret")
+        logret_eval(
+            pair=pair,
+            timeframe=timeframe,
+            userdir=userdir,
+            timerange=timerange,
+            prefer_exchange=prefer_exchange,
+            logret_path=str(Path(outdir) / "best_logret.json"),
+            outdir=_lr_before,
+        )
+        # Impulse (optional)
+        up_path = Path(outdir) / "best_impulse_up.json"
+        dn_path = Path(outdir) / "best_impulse_down.json"
+        if up_path.exists() and dn_path.exists():
+            _im_before = _ts_outdir(str(Path(__file__).resolve().parent / "plot" / "xgb_eval"), prefix="tmp_impulse")
+            impulse_eval(
+                pair=pair,
+                timeframe=timeframe,
+                userdir=userdir,
+                timerange=timerange,
+                prefer_exchange=prefer_exchange,
+                up_path=str(up_path),
+                dn_path=str(dn_path),
+                outdir=_im_before,
+            )
+            # move impulse dir into bundle
+            for p in Path(_im_before).glob("**/*"):
+                # ensure flat copy into bundle/impulse
+                dest_dir = Path(bundle_root) / "impulse"
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                if p.is_file():
+                    shutil.copy2(str(p), str(dest_dir / p.name))
+        # move topbot and logret into bundle
+        for src_dir, name in [(_tb_before, "topbot"), (_lr_before, "logret")]:
+            d = Path(bundle_root) / name
+            d.mkdir(parents=True, exist_ok=True)
+            for p in Path(src_dir).glob("**/*"):
+                if p.is_file():
+                    shutil.copy2(str(p), str(d / p.name))
+        typer.echo(json.dumps({"charts_bundle": bundle_root}, indent=2))
+    except Exception as e:
+        typer.echo(f"Chart bundle generation failed: {e}")
+
     # Optional backtest validation
     if bool(auto_backtest):
         try:
