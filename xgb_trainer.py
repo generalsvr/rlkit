@@ -319,6 +319,20 @@ def _plot_logret_classes(index, close: np.ndarray, prob_mat: np.ndarray, classes
     _safe_savefig(fig, out_path)
 
 
+def _load_logret_horizon(logret_path: str) -> int:
+    try:
+        stem = str(Path(str(logret_path)).with_suffix("").as_posix())
+        meta_path = stem + "_meta.json"
+        if os.path.exists(meta_path):
+            import json as _json
+            with open(meta_path, 'r') as f:
+                md = _json.load(f)
+            return int(max(1, int(md.get("horizon", 1))))
+    except Exception:
+        pass
+    return 1
+
+
 def _train_xgb_classifier(
     X_tr: np.ndarray,
     y_tr: np.ndarray,
@@ -1476,6 +1490,136 @@ def logret_eval(
     _plot_logret_classes(idx, close, pr, classes=[-2,-1,0,1,2], title=f"Logret class band + strong signals {pair} {timeframe}", out_path=os.path.join(root, "logret_class_band.png"), strong_thr=0.55)
     _plot_feature_importance(logret_clf, logret_cols or list(feats.columns), out_path=os.path.join(root, "fi_logret.png"), title="Feature importance - Logret")
     typer.echo(json.dumps({"outdir": root, "samples": int(T)}, indent=2))
+
+
+@app.command("meta-eval")
+def meta_eval(
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    timerange: str = typer.Option("20240101-"),
+    prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
+    bot_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_topbot_bottom.json")),
+    top_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_topbot_top.json")),
+    logret_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_logret.json")),
+    meta_json_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_meta.json")),
+    p_buy_thr: float = typer.Option(0.6),
+    p_sell_thr: float = typer.Option(0.6),
+    meta_thr: float = typer.Option(0.5),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("4H,1D,1W"),
+    device: str = typer.Option("auto"),
+    outdir: str = typer.Option(str(Path(__file__).resolve().parent / "plot" / "xgb_eval")),
+):
+    # Load data and features
+    path = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange) or _find_data_file(userdir, pair, timeframe, prefer_exchange)
+    if not path:
+        raise FileNotFoundError("Dataset not found for evaluation.")
+    raw = _load_ohlcv(path)
+    raw = _slice_timerange_df(raw, timerange)
+    etf_str = str(_coerce_opt(extra_timeframes, "4H,1D,1W"))
+    etf = [s.strip() for s in etf_str.split(",") if s.strip()]
+    feats = make_features(
+        raw,
+        mode=_coerce_opt(feature_mode, "full"),
+        basic_lookback=int(_coerce_opt(basic_lookback, 64)),
+        extra_timeframes=(etf or None),
+    ).reset_index(drop=True)
+    idx = feats.index
+    T = len(feats)
+    close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
+
+    # Load L0 models
+    bot_clf, bot_cols = _load_xgb(str(_coerce_opt(bot_path, bot_path)), device=str(_coerce_opt(device, "auto")))
+    top_clf, top_cols = _load_xgb(str(_coerce_opt(top_path, top_path)), device=str(_coerce_opt(device, "auto")))
+    logret_clf, logret_cols = _load_xgb(str(_coerce_opt(logret_path, logret_path)), device=str(_coerce_opt(device, "auto")))
+    p_bot = _predict_with_cols(bot_clf, feats, bot_cols)
+    p_top = _predict_with_cols(top_clf, feats, top_cols)
+    pr = _predict_with_cols(logret_clf, feats, logret_cols)
+    if pr is None or pr.ndim != 2 or pr.shape[1] != 5:
+        pr = np.zeros((T, 5), dtype=float)
+    p_bottom = p_bot[:, 1] if (p_bot is not None and p_bot.ndim == 2 and p_bot.shape[1] >= 2) else np.zeros(T)
+    p_topp = p_top[:, 1] if (p_top is not None and p_top.ndim == 2 and p_top.shape[1] >= 2) else np.zeros(T)
+    class_vals = np.array([-2, -1, 0, 1, 2], dtype=float)
+    reg_dir = pr @ class_vals
+
+    # Build meta inputs in the same order as training manifest
+    from rl_lib.meta import load_meta_mlp_from_json  # local import to avoid cycle
+    meta_model, meta_cols = load_meta_mlp_from_json(str(_coerce_opt(meta_json_path, meta_json_path)))
+    l0 = pd.DataFrame({
+        "p_bottom": p_bottom,
+        "p_top": p_topp,
+        "p_up": np.zeros(T),
+        "p_dn": np.zeros(T),
+        "reg_direction": reg_dir,
+        "logret_p_-2": pr[:, 0],
+        "logret_p_-1": pr[:, 1],
+        "logret_p_0": pr[:, 2],
+        "logret_p_1": pr[:, 3],
+        "logret_p_2": pr[:, 4],
+    })
+    for c in meta_cols:
+        if c not in l0.columns:
+            l0[c] = 0.0
+    X_meta = l0.reindex(columns=meta_cols).values.astype(np.float32)
+    try:
+        import torch
+        with torch.no_grad():
+            logits = meta_model(torch.from_numpy(X_meta))
+            meta_p = torch.sigmoid(logits).cpu().numpy()
+    except Exception:
+        meta_p = np.zeros((T,), dtype=float)
+
+    # Define signals per simple gate
+    buy_sig = (p_bottom >= float(p_buy_thr)) & (meta_p >= float(meta_thr))
+    sell_sig = (p_topp >= float(p_sell_thr)) & (meta_p >= float(meta_thr))
+    meta_score = (buy_sig.astype(int) - sell_sig.astype(int)).astype(int)  # +1 long, -1 short, 0 flat
+
+    # Shift-aware horizon for sign accuracy
+    H = _load_logret_horizon(str(_coerce_opt(logret_path, logret_path)))
+    sign_acc = None
+    try:
+        # Forward returns over H bars
+        logp = np.log(close + 1e-12)
+        if H > 0 and H < len(close):
+            fwd = np.zeros(T)
+            fwd[:-H] = logp[H:] - logp[:-H]
+            fwd_sign = np.sign(fwd)
+            pred_sign = meta_score.copy()
+            # Evaluate only where a non-zero prediction exists
+            mask = pred_sign != 0
+            hits = np.sum((fwd_sign[mask] * pred_sign[mask]) > 0)
+            total = int(np.sum(mask))
+            sign_acc = float(hits / max(1, total))
+    except Exception:
+        pass
+
+    # Visuals
+    root = _ts_outdir(str(_coerce_opt(outdir, str(Path(__file__).resolve().parent / "plot" / "xgb_eval"))), prefix="meta")
+    # Meta probability series
+    _plot_prob_series(idx, {"meta_p": meta_p, "p_bottom": p_bottom, "p_top": p_topp}, thresholds={"meta": meta_thr, "buy": p_buy_thr, "sell": p_sell_thr}, title=f"Meta score & primary probs {pair} {timeframe}", out_path=os.path.join(root, "meta_probs.png"))
+
+    # Background shading from meta_score (+1/-1), aligned at prediction time
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as _np
+        fig, ax = plt.subplots(figsize=(14, 5))
+        Tn = len(close)
+        band = _np.clip(meta_score.astype(float), -1.0, 1.0).reshape(1, Tn)
+        ax.imshow(band, aspect='auto', cmap='RdYlGn', alpha=0.18,
+                  extent=[0, Tn, float(_np.nanmin(close)), float(_np.nanmax(close))])
+        ax.plot(range(Tn), close, color='#1f77b4', linewidth=1.0)
+        ax.set_title(f"Meta regime shading (+1 long / -1 short) {pair} {timeframe}")
+        ax.grid(alpha=0.25)
+        _safe_savefig(fig, os.path.join(root, "meta_regime.png"))
+    except Exception:
+        pass
+
+    out_info = {"outdir": root, "samples": int(T)}
+    if sign_acc is not None:
+        out_info["sign_accuracy_over_H"] = {"H": int(H), "acc": float(sign_acc)}
+    typer.echo(json.dumps(out_info, indent=2))
 
 
 @app.command("impulse-eval")

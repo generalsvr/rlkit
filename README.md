@@ -229,3 +229,9 @@ python rl_trader.py xgb-tune --pair BTC/USDT --timeframe 1h --exchange bybit   -
 - CPU runs: set `--device cpu`.
 
  
+
+
+python xgb_trainer.py logret-eval --pair ETH/USDT --timeframe 1h --userdir freqtrade_userdir --timerange 20250505-20250515 --prefer-exchange bybit --logret-path ./models/xgb_stack/best_logret.json --outdir ./plot/xgb_eval
+
+python xgb_trainer.py topbot-eval --pair BTC/USDT --timeframe 1h --userdir freqtrade_userdir --timerange 20250505- --prefer-exchange bybit --bot-path ./models/xgb_stack/best_topbot_bottom.json --top-path ./models/xgb_stack/best_topbot_top.json --outdir ./plot/xgb_eval
+
