@@ -593,6 +593,243 @@ def logret_train(
     typer.echo(json.dumps({"logret": {"path": path_out, **metrics}}, indent=2))
 
 
+def _impulse_train_impl(
+    pair: str,
+    timeframe: str,
+    userdir: str,
+    timerange: str,
+    prefer_exchange: str,
+    feature_mode: str,
+    basic_lookback: int,
+    extra_timeframes: str,
+    horizon: int,
+    label_mode: str,
+    alpha_up: float,
+    alpha_dn: float,
+    vol_lookback: int,
+    thr_up_bps: float,
+    thr_dn_bps: float,
+    device: str,
+    n_estimators: int,
+    max_depth: int,
+    min_child_weight: float,
+    learning_rate: float,
+    subsample: float,
+    colsample_bytree: float,
+    reg_alpha: float,
+    reg_lambda: float,
+    n_jobs: int,
+    n_trials: int,
+    sampler: str,
+    seed: int,
+    outdir: str,
+    autodownload: bool,
+):
+    if autodownload:
+        _ = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange)
+        for tf in ["4h", "1d", "1w"]:
+            try:
+                _ensure_dataset(userdir, pair, tf, prefer_exchange, timerange)
+            except Exception:
+                pass
+    path = _find_data_file(userdir, pair, timeframe, prefer_exchange=prefer_exchange)
+    if not path:
+        raise FileNotFoundError("Dataset not found.")
+    raw = _load_ohlcv(path)
+    raw = _slice_timerange_df(raw, timerange)
+    etf = [s.strip() for s in extra_timeframes.split(",") if s.strip()]
+
+    # Coerce
+    feature_mode = _coerce_opt(feature_mode, "full")
+    basic_lookback = int(_coerce_opt(basic_lookback, 64))
+    horizon = int(_coerce_opt(horizon, 8))
+    label_mode = str(_coerce_opt(label_mode, "vol")).lower()
+    alpha_up = float(_coerce_opt(alpha_up, 2.0))
+    alpha_dn = float(_coerce_opt(alpha_dn, 2.0))
+    vol_lookback = int(_coerce_opt(vol_lookback, 256))
+    thr_up_bps = float(_coerce_opt(thr_up_bps, 30.0))
+    thr_dn_bps = float(_coerce_opt(thr_dn_bps, 30.0))
+    device = str(_coerce_opt(device, "auto"))
+    n_estimators = int(_coerce_opt(n_estimators, 600))
+    max_depth = int(_coerce_opt(max_depth, 6))
+    min_child_weight = float(_coerce_opt(min_child_weight, 1.0))
+    learning_rate = float(_coerce_opt(learning_rate, 0.05))
+    subsample = float(_coerce_opt(subsample, 0.8))
+    colsample_bytree = float(_coerce_opt(colsample_bytree, 0.8))
+    reg_alpha = float(_coerce_opt(reg_alpha, 0.0))
+    reg_lambda = float(_coerce_opt(reg_lambda, 1.0))
+    n_jobs = int(_coerce_opt(n_jobs, 0))
+    n_trials = int(_coerce_opt(n_trials, 0))
+    sampler = str(_coerce_opt(sampler, "tpe"))
+    seed = int(_coerce_opt(seed, 42))
+
+    feats = make_features(raw, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=(etf or None))
+    feats = feats.reset_index(drop=True)
+    close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
+    logp_s = pd.Series(np.log(close + 1e-12), index=feats.index)
+    T = len(feats)
+    valid = T - horizon
+    if valid <= 300:
+        raise ValueError("Not enough data to train Impulse classifier.")
+    fwd = [logp_s.shift(-i) - logp_s for i in range(1, horizon + 1)]
+    fwd_mat = np.vstack([s.to_numpy() for s in fwd])
+    fwd_valid = fwd_mat[:, :valid]
+    fwd_max = np.nanmax(fwd_valid, axis=0)
+    fwd_min = np.nanmin(fwd_valid, axis=0)
+    logret = np.diff(np.log(close + 1e-12), prepend=np.log(close[0] + 1e-12))
+    sigma = pd.Series(logret).rolling(vol_lookback, min_periods=20).std().fillna(0.0).to_numpy()
+    sigma = sigma[:valid]
+
+    if label_mode == "vol":
+        thr = sigma * np.sqrt(max(1, horizon))
+        y_up = (fwd_max > (alpha_up * thr)).astype(int)
+        y_dn = (fwd_min < (-alpha_dn * thr)).astype(int)
+    else:
+        bps_to_lr = 1e-4
+        y_up = (fwd_max > (thr_up_bps * bps_to_lr)).astype(int)
+        y_dn = (fwd_min < (-(thr_dn_bps * bps_to_lr))).astype(int)
+
+    X = feats.iloc[:valid, :].copy()
+    cut = int(max(100, min(valid - 50, int(valid * 0.8))))
+    X_tr = X.iloc[:cut, :].values
+    X_val = X.iloc[cut:, :].values
+    y_up_tr = y_up[:cut]
+    y_up_val = y_up[cut:]
+    y_dn_tr = y_dn[:cut]
+    y_dn_val = y_dn[cut:]
+
+    def _fit_eval(params: Dict[str, Any]) -> Tuple[Any, Any, float]:
+        up_m, mu = _train_xgb_classifier(
+            X_tr, y_up_tr, X_val, y_up_val, device,
+            n_estimators=int(params["n_estimators"]), max_depth=int(params["max_depth"]),
+            min_child_weight=float(params["min_child_weight"]), learning_rate=float(params["learning_rate"]),
+            subsample=float(params["subsample"]), colsample_bytree=float(params["colsample_bytree"]),
+            reg_alpha=float(params["reg_alpha"]), reg_lambda=float(params["reg_lambda"]), n_jobs=n_jobs,
+            objective="binary:logistic",
+        )
+        dn_m, md = _train_xgb_classifier(
+            X_tr, y_dn_tr, X_val, y_dn_val, device,
+            n_estimators=int(params["n_estimators"]), max_depth=int(params["max_depth"]),
+            min_child_weight=float(params["min_child_weight"]), learning_rate=float(params["learning_rate"]),
+            subsample=float(params["subsample"]), colsample_bytree=float(params["colsample_bytree"]),
+            reg_alpha=float(params["reg_alpha"]), reg_lambda=float(params["reg_lambda"]), n_jobs=n_jobs,
+            objective="binary:logistic",
+        )
+        val = float(np.nanmean([float(mu.get("auprc", float("nan"))), float(md.get("auprc", float("nan")))]))
+        return up_m, dn_m, val
+
+    if int(n_trials) and n_trials > 0:
+        import optuna
+        from optuna.samplers import TPESampler, RandomSampler
+        smp = RandomSampler(seed=int(seed)) if sampler.lower() == "random" else TPESampler(seed=int(seed))
+        def objective(trial: "optuna.trial.Trial") -> float:
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 300, 1200, step=50),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "min_child_weight": trial.suggest_float("min_child_weight", 0.5, 10.0, log=True),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
+                "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 1.0),
+                "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 2.0),
+            }
+            _, _, score = _fit_eval(params)
+            return score
+        study = optuna.create_study(direction="maximize", sampler=smp)
+        typer.echo(f"Optuna Impulse trials: {n_trials}")
+        study.optimize(objective, n_trials=int(n_trials))
+        best_params = study.best_params
+        up_model, dn_model, best_score = _fit_eval(best_params)
+        typer.echo(f"Best Impulse mean AUPRC: {best_score:.6f}")
+    else:
+        base_params = dict(
+            n_estimators=int(n_estimators), max_depth=int(max_depth), min_child_weight=float(min_child_weight),
+            learning_rate=float(learning_rate), subsample=float(subsample), colsample_bytree=float(colsample_bytree),
+            reg_alpha=float(reg_alpha), reg_lambda=float(reg_lambda)
+        )
+        up_model, dn_model, _ = _fit_eval(base_params)
+
+    os.makedirs(outdir, exist_ok=True)
+    up_path = os.path.join(outdir, "best_impulse_up.json")
+    dn_path = os.path.join(outdir, "best_impulse_down.json")
+    up_model.save_model(_ensure_outdir(up_path))
+    dn_model.save_model(_ensure_outdir(dn_path))
+    _save_feature_columns(up_path, list(X.columns))
+    _save_feature_columns(dn_path, list(X.columns))
+    typer.echo(json.dumps({"impulse_up": {"path": up_path}, "impulse_down": {"path": dn_path}}, indent=2))
+
+
+@app.command("impulse_train")
+def impulse_train_cmd(
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    timerange: str = typer.Option("20190101-"),
+    prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("4H,1D,1W"),
+    horizon: int = typer.Option(8),
+    label_mode: str = typer.Option("vol", help="vol|abs"),
+    alpha_up: float = typer.Option(2.0),
+    alpha_dn: float = typer.Option(2.0),
+    vol_lookback: int = typer.Option(256),
+    thr_up_bps: float = typer.Option(30.0),
+    thr_dn_bps: float = typer.Option(30.0),
+    device: str = typer.Option("auto"),
+    n_estimators: int = typer.Option(600),
+    max_depth: int = typer.Option(6),
+    min_child_weight: float = typer.Option(1.0),
+    learning_rate: float = typer.Option(0.05),
+    subsample: float = typer.Option(0.8),
+    colsample_bytree: float = typer.Option(0.8),
+    reg_alpha: float = typer.Option(0.0),
+    reg_lambda: float = typer.Option(1.0),
+    n_jobs: int = typer.Option(0),
+    n_trials: int = typer.Option(0, "--n-trials", "--n_trials", help="If >0, run Optuna tuning"),
+    sampler: str = typer.Option("tpe"),
+    seed: int = typer.Option(42),
+    outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
+    autodownload: bool = typer.Option(True),
+):
+    _impulse_train_impl(**locals())
+
+
+@app.command("impulse-train")
+def impulse_train_cmd_dash(
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    timerange: str = typer.Option("20190101-"),
+    prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("4H,1D,1W"),
+    horizon: int = typer.Option(8),
+    label_mode: str = typer.Option("vol", help="vol|abs"),
+    alpha_up: float = typer.Option(2.0),
+    alpha_dn: float = typer.Option(2.0),
+    vol_lookback: int = typer.Option(256),
+    thr_up_bps: float = typer.Option(30.0),
+    thr_dn_bps: float = typer.Option(30.0),
+    device: str = typer.Option("auto"),
+    n_estimators: int = typer.Option(600),
+    max_depth: int = typer.Option(6),
+    min_child_weight: float = typer.Option(1.0),
+    learning_rate: float = typer.Option(0.05),
+    subsample: float = typer.Option(0.8),
+    colsample_bytree: float = typer.Option(0.8),
+    reg_alpha: float = typer.Option(0.0),
+    reg_lambda: float = typer.Option(1.0),
+    n_jobs: int = typer.Option(0),
+    n_trials: int = typer.Option(0, "--n-trials", "--n_trials", help="If >0, run Optuna tuning"),
+    sampler: str = typer.Option("tpe"),
+    seed: int = typer.Option(42),
+    outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
+    autodownload: bool = typer.Option(True),
+):
+    _impulse_train_impl(**locals())
+
 def _load_xgb(path: str, device: str = "auto") -> Tuple[Any, Optional[List[str]]]:
     import xgboost as xgb
     dev = _resolve_device(device)
