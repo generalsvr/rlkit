@@ -433,6 +433,7 @@ def train_meta_mlp_manager(
         "feature_columns": cols,
         "input_dim": int(Xn.shape[1]),
         "hidden": list(hidden or [128, 64]),
+        "dropout": 0.1,
         "val_auprc": float(best_ap),
     }
     with open(out_json_path, "w") as f:
@@ -448,7 +449,8 @@ def load_meta_mlp_from_json(json_path: str) -> Tuple[MetaMLP, List[str]]:
         raise ValueError("Manifest is not a MetaMLP")
     input_dim = int(man["input_dim"])
     hidden = list(man.get("hidden", [128, 64]))
-    model = MetaMLP(input_dim=input_dim, hidden=hidden, dropout=0.0)
+    dropout = float(man.get("dropout", 0.1))
+    model = MetaMLP(input_dim=input_dim, hidden=hidden, dropout=dropout)
     state = torch.load(man["weights_path"], map_location="cpu")
     if isinstance(state, dict) and "model" in state:
         model.load_state_dict(state["model"])
