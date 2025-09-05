@@ -630,7 +630,7 @@ def train_all(
     timerange: str = typer.Option("20190101-"),
     prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
-    optuna_trials: int = typer.Option(40, help="Trials for Optuna when tuning XGB models", "--optuna-trials", "--optuna_trials"),
+    optuna_trials: int = typer.Option(40, "--optuna-trials", "--optuna_trials", help="Trials for Optuna when tuning XGB models"),
 ):
     # Ensure datasets across TFs
     for tf in [timeframe, "4h", "1d", "1w"]:
