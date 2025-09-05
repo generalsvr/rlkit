@@ -515,8 +515,12 @@ def make_features(
             for tf in extra_timeframes:
                 try:
                     tf_str = str(tf).upper()
-                    # Use uppercase frequency aliases (e.g., 4H, 1D, 1W) to avoid pandas deprecation of lowercase
-                    resample_tf = tf_str
+                    # Normalize alias per pandas guidance: hours 'h', days 'D', weeks 'W'
+                    # If the alias ends with 'H' replace with 'h', else keep uppercase (e.g., 1D, 1W)
+                    if tf_str.endswith('H'):
+                        resample_tf = tf_str[:-1] + 'h'
+                    else:
+                        resample_tf = tf_str
                     agg = {
                         "open": "first",
                         "high": "max",

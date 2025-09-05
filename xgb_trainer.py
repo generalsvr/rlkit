@@ -1316,14 +1316,20 @@ def topbot_eval(
         raise FileNotFoundError("Dataset not found for evaluation.")
     raw = _load_ohlcv(path)
     raw = _slice_timerange_df(raw, timerange)
-    etf = [s.strip() for s in extra_timeframes.split(",") if s.strip()]
-    feats = make_features(raw, mode=_coerce_opt(feature_mode, "full"), basic_lookback=int(_coerce_opt(basic_lookback, 64)), extra_timeframes=(etf or None))
+    etf_str = str(_coerce_opt(extra_timeframes, "4H,1D,1W"))
+    etf = [s.strip() for s in etf_str.split(",") if s.strip()]
+    feats = make_features(
+        raw,
+        mode=_coerce_opt(feature_mode, "full"),
+        basic_lookback=int(_coerce_opt(basic_lookback, 64)),
+        extra_timeframes=(etf or None),
+    )
     feats = feats.reset_index(drop=True)
     idx = feats.index
     close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
     # Load models and predict
-    bot_clf, bot_cols = _load_xgb(str(_coerce_opt(bot_path, bot_path)), device=device)
-    top_clf, top_cols = _load_xgb(str(_coerce_opt(top_path, top_path)), device=device)
+    bot_clf, bot_cols = _load_xgb(str(_coerce_opt(bot_path, bot_path)), device=str(_coerce_opt(device, "auto")))
+    top_clf, top_cols = _load_xgb(str(_coerce_opt(top_path, top_path)), device=str(_coerce_opt(device, "auto")))
     p_bot = _predict_with_cols(bot_clf, feats, bot_cols)
     p_top = _predict_with_cols(top_clf, feats, top_cols)
     T = len(feats)
@@ -1331,7 +1337,7 @@ def topbot_eval(
     p_topp = p_top[:, 1] if (p_top is not None and p_top.ndim == 2 and p_top.shape[1] >= 2) else np.zeros(T)
 
     # Visuals
-    root = _ts_outdir(outdir, prefix="topbot")
+    root = _ts_outdir(str(_coerce_opt(outdir, str(Path(__file__).resolve().parent / "plot" / "xgb_eval"))), prefix="topbot")
     # Probabilities
     _plot_prob_series(idx, {"p_bottom": p_bottom, "p_top": p_topp}, thresholds=None, title=f"Top/Bottom Probabilities {pair} {timeframe}", out_path=os.path.join(root, "topbot_probs.png"))
     # Events at p>=0.6 as default view
@@ -1365,13 +1371,19 @@ def logret_eval(
         raise FileNotFoundError("Dataset not found for evaluation.")
     raw = _load_ohlcv(path)
     raw = _slice_timerange_df(raw, timerange)
-    etf = [s.strip() for s in extra_timeframes.split(",") if s.strip()]
-    feats = make_features(raw, mode=_coerce_opt(feature_mode, "full"), basic_lookback=int(_coerce_opt(basic_lookback, 64)), extra_timeframes=(etf or None))
+    etf_str = str(_coerce_opt(extra_timeframes, "4H,1D,1W"))
+    etf = [s.strip() for s in etf_str.split(",") if s.strip()]
+    feats = make_features(
+        raw,
+        mode=_coerce_opt(feature_mode, "full"),
+        basic_lookback=int(_coerce_opt(basic_lookback, 64)),
+        extra_timeframes=(etf or None),
+    )
     feats = feats.reset_index(drop=True)
     idx = feats.index
     close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
 
-    logret_clf, logret_cols = _load_xgb(str(_coerce_opt(logret_path, logret_path)), device=device)
+    logret_clf, logret_cols = _load_xgb(str(_coerce_opt(logret_path, logret_path)), device=str(_coerce_opt(device, "auto")))
     pr = _predict_with_cols(logret_clf, feats, logret_cols)
     T = len(feats)
     if pr is None or pr.ndim != 2 or pr.shape[1] != 5:
@@ -1379,7 +1391,7 @@ def logret_eval(
     class_vals = np.array([-2, -1, 0, 1, 2], dtype=float)
     reg_dir = pr @ class_vals
 
-    root = _ts_outdir(outdir, prefix="logret")
+    root = _ts_outdir(str(_coerce_opt(outdir, str(Path(__file__).resolve().parent / "plot" / "xgb_eval"))), prefix="logret")
     _plot_prob_series(idx, {
         "p_-2": pr[:, 0],
         "p_-1": pr[:, 1],
@@ -1424,21 +1436,27 @@ def impulse_eval(
         raise FileNotFoundError("Dataset not found for evaluation.")
     raw = _load_ohlcv(path)
     raw = _slice_timerange_df(raw, timerange)
-    etf = [s.strip() for s in extra_timeframes.split(",") if s.strip()]
-    feats = make_features(raw, mode=_coerce_opt(feature_mode, "full"), basic_lookback=int(_coerce_opt(basic_lookback, 64)), extra_timeframes=(etf or None))
+    etf_str = str(_coerce_opt(extra_timeframes, "4H,1D,1W"))
+    etf = [s.strip() for s in etf_str.split(",") if s.strip()]
+    feats = make_features(
+        raw,
+        mode=_coerce_opt(feature_mode, "full"),
+        basic_lookback=int(_coerce_opt(basic_lookback, 64)),
+        extra_timeframes=(etf or None),
+    )
     feats = feats.reset_index(drop=True)
     idx = feats.index
     close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
 
-    up_clf, up_cols = _load_xgb(str(_coerce_opt(up_path, up_path)), device=device)
-    dn_clf, dn_cols = _load_xgb(str(_coerce_opt(dn_path, dn_path)), device=device)
+    up_clf, up_cols = _load_xgb(str(_coerce_opt(up_path, up_path)), device=str(_coerce_opt(device, "auto")))
+    dn_clf, dn_cols = _load_xgb(str(_coerce_opt(dn_path, dn_path)), device=str(_coerce_opt(device, "auto")))
     p_up = _predict_with_cols(up_clf, feats, up_cols)
     p_dn = _predict_with_cols(dn_clf, feats, dn_cols)
     T = len(feats)
     p_up1 = p_up[:, 1] if (p_up is not None and p_up.ndim == 2 and p_up.shape[1] >= 2) else np.zeros(T)
     p_dn1 = p_dn[:, 1] if (p_dn is not None and p_dn.ndim == 2 and p_dn.shape[1] >= 2) else np.zeros(T)
 
-    root = _ts_outdir(outdir, prefix="impulse")
+    root = _ts_outdir(str(_coerce_opt(outdir, str(Path(__file__).resolve().parent / "plot" / "xgb_eval"))), prefix="impulse")
     _plot_prob_series(idx, {"p_up": p_up1, "p_dn": p_dn1}, thresholds=None, title=f"Impulse probabilities {pair} {timeframe}", out_path=os.path.join(root, "impulse_probs.png"))
     ev = {
         "up_sig": (p_up1 >= 0.6).astype(int),
