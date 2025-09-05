@@ -1,0 +1,646 @@
+"""
+CLI for training XGBoost stack models:
+ - Top/Bottom classifiers (pivot detectors)
+ - Logret multi-class classifier (movement character)
+ - Meta MLP manager trained with Triple-Barrier labels
+
+Usage examples (BTC 1h):
+  python xgb_trainer.py topbot-train --pair BTC/USDT --timeframe 1h --timerange 20190101-
+  python xgb_trainer.py logret-train --pair BTC/USDT --timeframe 1h --timerange 20190101-
+  python xgb_trainer.py meta-train --pair BTC/USDT --timeframe 1h --timerange 20190101-
+  python xgb_trainer.py train-all --pair BTC/USDT --timeframe 1h --timerange 20190101-
+"""
+
+from __future__ import annotations
+
+import os
+import json
+from pathlib import Path
+from typing import Optional, List, Tuple, Dict, Any
+import subprocess
+
+import numpy as np
+import pandas as pd
+import typer
+
+from rl_lib.train_sb3 import _find_data_file, _load_ohlcv, _slice_timerange_df
+from rl_lib.features import make_features
+from rl_lib.meta import triple_barrier_labels, train_meta_mlp_manager
+
+
+app = typer.Typer(add_completion=False)
+
+
+def _ensure_outdir(p: str) -> str:
+    d = os.path.dirname(p)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    return p
+
+
+def _save_feature_columns(model_path: str, cols: List[str]):
+    try:
+        with open(str(Path(model_path).with_suffix("").as_posix()) + "_feature_columns.json", "w") as f:
+            json.dump(list(cols), f)
+    except Exception:
+        pass
+
+
+def _label_pivots(close: np.ndarray, left: int, right: int, min_gap: int) -> Tuple[np.ndarray, np.ndarray]:
+    T = len(close)
+    y_bot = np.zeros(T, dtype=int)
+    y_top = np.zeros(T, dtype=int)
+    last_b = -10**9
+    last_t = -10**9
+    for i in range(T):
+        l0 = max(0, i - left)
+        r1 = min(T, i + right + 1)
+        win = close[l0:r1]
+        if win.size == 0:
+            continue
+        c = close[i]
+        if i - last_b >= min_gap and c == np.min(win):
+            y_bot[i] = 1
+            last_b = i
+        if i - last_t >= min_gap and c == np.max(win):
+            y_top[i] = 1
+            last_t = i
+    # Clear ambiguous overlap where both 1 -> set none
+    amb = (y_bot == 1) & (y_top == 1)
+    y_bot[amb] = 0
+    y_top[amb] = 0
+    return y_bot, y_top
+
+
+def _resolve_device(dev: str) -> str:
+    s = str(dev).lower()
+    if s in ("auto", "cuda"):
+        try:
+            import cupy as _cp  # type: ignore
+            _ = _cp.zeros(1)
+            return "cuda"
+        except Exception:
+            return "cpu"
+    return "cpu"
+
+
+def _train_xgb_classifier(
+    X_tr: np.ndarray,
+    y_tr: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    device: str,
+    n_estimators: int = 600,
+    max_depth: int = 6,
+    min_child_weight: float = 1.0,
+    learning_rate: float = 0.05,
+    subsample: float = 0.8,
+    colsample_bytree: float = 0.8,
+    reg_alpha: float = 0.0,
+    reg_lambda: float = 1.0,
+    n_jobs: int = 0,
+    objective: str = "binary:logistic",
+    num_class: int = 0,
+) -> Tuple[Any, Dict[str, float]]:
+    import xgboost as xgb
+    from sklearn.metrics import average_precision_score, f1_score, accuracy_score
+
+    dev = _resolve_device(device)
+    kwargs = dict(
+        tree_method="hist",
+        device=dev,
+        random_state=42,
+        n_jobs=(int(n_jobs) if int(n_jobs) > 0 else -1),
+        learning_rate=float(learning_rate),
+        max_depth=int(max_depth),
+        min_child_weight=float(min_child_weight),
+        subsample=float(subsample),
+        colsample_bytree=float(colsample_bytree),
+        reg_alpha=float(reg_alpha),
+        reg_lambda=float(reg_lambda),
+        n_estimators=int(n_estimators),
+        eval_metric=("mlogloss" if objective.startswith("multi:") else "aucpr"),
+    )
+    if objective.startswith("multi:"):
+        model = xgb.XGBClassifier(objective=objective, num_class=int(max(2, num_class)), **kwargs)
+    else:
+        # Class imbalance weight for binary
+        pos = float(np.sum(y_tr == 1))
+        neg = float(np.sum(y_tr == 0))
+        spw = float(max(1.0, (neg / max(1.0, pos))))
+        model = xgb.XGBClassifier(objective=objective, scale_pos_weight=spw, **kwargs)
+
+    model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+
+    metrics: Dict[str, float] = {}
+    if objective.startswith("multi:"):
+        p = model.predict_proba(X_val)
+        y_hat = np.argmax(p, axis=1)
+        try:
+            metrics["acc"] = float(accuracy_score(y_val, y_hat))
+        except Exception:
+            metrics["acc"] = float("nan")
+    else:
+        p = model.predict_proba(X_val)[:, 1]
+        y_hat = (p >= 0.5).astype(int)
+        try:
+            metrics["auprc"] = float(average_precision_score(y_val, p))
+            metrics["f1"] = float(f1_score(y_val, y_hat))
+            metrics["acc"] = float(accuracy_score(y_val, y_hat))
+        except Exception:
+            metrics["auprc"] = metrics.get("auprc", float("nan"))
+    return model, metrics
+
+
+def _predict_with_cols(model: Any, feats: pd.DataFrame, cols: Optional[List[str]]) -> Optional[np.ndarray]:
+    if cols is None:
+        return None
+    X = feats.copy()
+    for c in cols:
+        if c not in X.columns:
+            X[c] = 0.0
+    Xv = X.reindex(columns=cols).values
+    try:
+        return model.predict_proba(Xv)
+    except Exception:
+        return None
+
+
+def _ensure_dataset(userdir: str, pair: str, timeframe: str, exchange: str, timerange: str = "20190101-") -> Optional[str]:
+    """Ensure dataset exists; if not, download via Freqtrade non-interactively."""
+    hit = _find_data_file(userdir, pair, timeframe, prefer_exchange=exchange)
+    if hit and os.path.exists(hit):
+        return hit
+    Path(userdir).mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "freqtrade", "download-data",
+        "--pairs", pair,
+        "--timeframes", timeframe,
+        "--userdir", userdir,
+        "--timerange", timerange,
+        "--exchange", exchange,
+        "--data-format-ohlcv", "parquet",
+    ]
+    try:
+        typer.echo(f"Downloading dataset: {' '.join(cmd)}")
+        subprocess.run(cmd, check=True)
+    except Exception as e:
+        typer.echo(f"Download failed for {pair} {timeframe}: {e}")
+    return _find_data_file(userdir, pair, timeframe, prefer_exchange=exchange)
+
+
+@app.command()
+def topbot_train(
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    timerange: str = typer.Option("20190101-"),
+    prefer_exchange: str = typer.Option("bybit"),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("4H,1D,1W", help="Optional comma-separated HTFs e.g. '4H,1D,1W'"),
+    left_bars: int = typer.Option(3),
+    right_bars: int = typer.Option(3),
+    min_gap_bars: int = typer.Option(4),
+    device: str = typer.Option("auto"),
+    n_estimators: int = typer.Option(600),
+    max_depth: int = typer.Option(6),
+    min_child_weight: float = typer.Option(1.0),
+    learning_rate: float = typer.Option(0.05),
+    subsample: float = typer.Option(0.8),
+    colsample_bytree: float = typer.Option(0.8),
+    reg_alpha: float = typer.Option(0.0),
+    reg_lambda: float = typer.Option(1.0),
+    n_jobs: int = typer.Option(0),
+    n_trials: int = typer.Option(0, help="If >0, run Optuna tuning"),
+    sampler: str = typer.Option("tpe", help="tpe|random"),
+    seed: int = typer.Option(42),
+    outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
+    autodownload: bool = typer.Option(True),
+):
+    # Auto-download base and HTFs
+    if autodownload:
+        _ = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange)
+        for tf in ["4h", "1d", "1w"]:
+            try:
+                _ensure_dataset(userdir, pair, tf, prefer_exchange, timerange)
+            except Exception:
+                pass
+    path = _find_data_file(userdir, pair, timeframe, prefer_exchange=prefer_exchange)
+    if not path:
+        raise FileNotFoundError("Dataset not found. Run download first.")
+    raw = _load_ohlcv(path)
+    raw = _slice_timerange_df(raw, timerange)
+    etf = [s.strip() for s in extra_timeframes.split(",") if s.strip()]
+    feats = make_features(raw, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=(etf or None))
+    feats = feats.reset_index(drop=True)
+    c = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
+    yb, yt = _label_pivots(c, int(left_bars), int(right_bars), int(min_gap_bars))
+    # Split
+    valid_len = len(feats)
+    if valid_len < 400:
+        raise ValueError("Not enough data to train TopBot.")
+    cut = int(valid_len * 0.8)
+    X_tr = feats.iloc[:cut, :].values
+    X_val = feats.iloc[cut:, :].values
+    yb_tr = yb[:cut]
+    yb_val = yb[cut:]
+    yt_tr = yt[:cut]
+    yt_val = yt[cut:]
+
+    # Train binary classifiers (Optuna optional)
+    def _fit_eval(params: Dict[str, Any]) -> Tuple[Any, Any, float]:
+        bot_m, m1 = _train_xgb_classifier(
+            X_tr, yb_tr, X_val, yb_val, device,
+            n_estimators=int(params["n_estimators"]),
+            max_depth=int(params["max_depth"]),
+            min_child_weight=float(params["min_child_weight"]),
+            learning_rate=float(params["learning_rate"]),
+            subsample=float(params["subsample"]),
+            colsample_bytree=float(params["colsample_bytree"]),
+            reg_alpha=float(params["reg_alpha"]),
+            reg_lambda=float(params["reg_lambda"]),
+            n_jobs=n_jobs,
+            objective="binary:logistic",
+        )
+        top_m, m2 = _train_xgb_classifier(
+            X_tr, yt_tr, X_val, yt_val, device,
+            n_estimators=int(params["n_estimators"]),
+            max_depth=int(params["max_depth"]),
+            min_child_weight=float(params["min_child_weight"]),
+            learning_rate=float(params["learning_rate"]),
+            subsample=float(params["subsample"]),
+            colsample_bytree=float(params["colsample_bytree"]),
+            reg_alpha=float(params["reg_alpha"]),
+            reg_lambda=float(params["reg_lambda"]),
+            n_jobs=n_jobs,
+            objective="binary:logistic",
+        )
+        val = float(np.nanmean([float(m1.get("auprc", float("nan"))), float(m2.get("auprc", float("nan")))]))
+        return bot_m, top_m, val
+
+    if int(n_trials) and n_trials > 0:
+        import optuna
+        from optuna.samplers import TPESampler, RandomSampler
+        smp = RandomSampler(seed=int(seed)) if sampler.lower() == "random" else TPESampler(seed=int(seed))
+        def objective(trial: "optuna.trial.Trial") -> float:
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 300, 1200, step=50),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "min_child_weight": trial.suggest_float("min_child_weight", 0.5, 10.0, log=True),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
+                "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 1.0),
+                "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 2.0),
+            }
+            _, _, score = _fit_eval(params)
+            return score
+        study = optuna.create_study(direction="maximize", sampler=smp)
+        typer.echo(f"Optuna TopBot trials: {n_trials}")
+        study.optimize(objective, n_trials=int(n_trials))
+        best_params = study.best_params
+        bot_model, top_model, best_score = _fit_eval(best_params)
+        typer.echo(f"Best TopBot mean AUPRC: {best_score:.6f}")
+    else:
+        base_params = dict(
+            n_estimators=int(n_estimators), max_depth=int(max_depth), min_child_weight=float(min_child_weight),
+            learning_rate=float(learning_rate), subsample=float(subsample), colsample_bytree=float(colsample_bytree),
+            reg_alpha=float(reg_alpha), reg_lambda=float(reg_lambda)
+        )
+        bot_model, top_model, _ = _fit_eval(base_params)
+
+    os.makedirs(outdir, exist_ok=True)
+    bot_path = os.path.join(outdir, "best_topbot_bottom.json")
+    top_path = os.path.join(outdir, "best_topbot_top.json")
+    bot_model.save_model(_ensure_outdir(bot_path))
+    top_model.save_model(_ensure_outdir(top_path))
+    _save_feature_columns(bot_path, list(feats.columns))
+    _save_feature_columns(top_path, list(feats.columns))
+
+    typer.echo(json.dumps({"bottom": {"path": bot_path, **m1}, "top": {"path": top_path, **m2}}, indent=2))
+
+
+@app.command()
+def logret_train(
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    timerange: str = typer.Option("20190101-"),
+    prefer_exchange: str = typer.Option("bybit"),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("4H,1D,1W", help="Optional comma-separated HTFs e.g. '4H,1D,1W'"),
+    horizon: int = typer.Option(1, help="Forward bars for return aggregation"),
+    strong_mult: float = typer.Option(1.5, help="Threshold multiplier for strong moves vs ATR"),
+    device: str = typer.Option("auto"),
+    n_estimators: int = typer.Option(600),
+    max_depth: int = typer.Option(6),
+    min_child_weight: float = typer.Option(1.0),
+    learning_rate: float = typer.Option(0.05),
+    subsample: float = typer.Option(0.8),
+    colsample_bytree: float = typer.Option(0.8),
+    reg_alpha: float = typer.Option(0.0),
+    reg_lambda: float = typer.Option(1.0),
+    n_jobs: int = typer.Option(0),
+    n_trials: int = typer.Option(0, help="If >0, run Optuna tuning"),
+    sampler: str = typer.Option("tpe"),
+    seed: int = typer.Option(42),
+    outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
+    autodownload: bool = typer.Option(True),
+):
+    if autodownload:
+        _ = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange)
+        for tf in ["4h", "1d", "1w"]:
+            try:
+                _ensure_dataset(userdir, pair, tf, prefer_exchange, timerange)
+            except Exception:
+                pass
+    path = _find_data_file(userdir, pair, timeframe, prefer_exchange=prefer_exchange)
+    if not path:
+        raise FileNotFoundError("Dataset not found.")
+    raw = _load_ohlcv(path)
+    raw = _slice_timerange_df(raw, timerange)
+    etf = [s.strip() for s in extra_timeframes.split(",") if s.strip()]
+    feats = make_features(raw, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=(etf or None))
+    feats = feats.reset_index(drop=True)
+    close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
+    logp = np.log(close + 1e-12)
+    H = int(max(1, horizon))
+    T = len(feats)
+    valid = T - H
+    if valid <= 300:
+        raise ValueError("Not enough data to train Logret classifier.")
+    fwd = logp[H:] - logp[:-H]
+    atr = feats["atr"].astype(float).to_numpy()
+    atr = atr[:valid]
+    # Labels: -2,-1,0,1,2
+    labels = np.zeros(valid, dtype=int)
+    thr = float(strong_mult) * atr
+    labels[fwd > thr] = 2
+    labels[(fwd > 0.0) & (fwd <= thr)] = 1
+    labels[(fwd < 0.0) & (fwd >= -thr)] = -1
+    labels[fwd < -thr] = -2
+    # Features aligned to valid range
+    X = feats.iloc[:valid, :].copy()
+    # Train/val split
+    cut = int(max(100, min(valid - 50, int(valid * 0.8))))
+    X_tr = X.iloc[:cut, :].values
+    X_val = X.iloc[cut:, :].values
+    y_tr = labels[:cut]
+    y_val = labels[cut:]
+    # Fit multi-class XGB (Optuna optional)
+    def _fit_eval(params: Dict[str, Any]) -> Tuple[Any, float]:
+        mdl, metrics = _train_xgb_classifier(
+            X_tr, y_tr, X_val, y_val, device,
+            n_estimators=int(params["n_estimators"]),
+            max_depth=int(params["max_depth"]),
+            min_child_weight=float(params["min_child_weight"]),
+            learning_rate=float(params["learning_rate"]),
+            subsample=float(params["subsample"]),
+            colsample_bytree=float(params["colsample_bytree"]),
+            reg_alpha=float(params["reg_alpha"]),
+            reg_lambda=float(params["reg_lambda"]),
+            n_jobs=n_jobs,
+            objective="multi:softprob",
+            num_class=5,
+        )
+        return mdl, float(metrics.get("acc", float("nan")))
+
+    if int(n_trials) and n_trials > 0:
+        import optuna
+        from optuna.samplers import TPESampler, RandomSampler
+        smp = RandomSampler(seed=int(seed)) if sampler.lower() == "random" else TPESampler(seed=int(seed))
+        def objective(trial: "optuna.trial.Trial") -> float:
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 300, 1200, step=50),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "min_child_weight": trial.suggest_float("min_child_weight", 0.5, 10.0, log=True),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
+                "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 1.0),
+                "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 2.0),
+            }
+            _, acc = _fit_eval(params)
+            return acc
+        study = optuna.create_study(direction="maximize", sampler=smp)
+        typer.echo(f"Optuna Logret trials: {n_trials}")
+        study.optimize(objective, n_trials=int(n_trials))
+        best_params = study.best_params
+        model, best_acc = _fit_eval(best_params)
+        metrics = {"acc": float(best_acc)}
+        typer.echo(f"Best Logret ACC: {best_acc:.6f}")
+    else:
+        base_params = dict(
+            n_estimators=int(n_estimators), max_depth=int(max_depth), min_child_weight=float(min_child_weight),
+            learning_rate=float(learning_rate), subsample=float(subsample), colsample_bytree=float(colsample_bytree),
+            reg_alpha=float(reg_alpha), reg_lambda=float(reg_lambda)
+        )
+        model, acc = _fit_eval(base_params)
+        metrics = {"acc": float(acc)}
+    os.makedirs(outdir, exist_ok=True)
+    path_out = os.path.join(outdir, "best_logret.json")
+    model.save_model(_ensure_outdir(path_out))
+    _save_feature_columns(path_out, list(X.columns))
+    # Save label mapping
+    meta = {"classes": [-2, -1, 0, 1, 2], "horizon": int(H), "strong_mult": float(strong_mult), "metrics": metrics}
+    with open(str(Path(path_out).with_suffix("").as_posix()) + "_meta.json", "w") as f:
+        json.dump(meta, f, indent=2)
+    typer.echo(json.dumps({"logret": {"path": path_out, **metrics}}, indent=2))
+
+
+def _load_xgb(path: str, device: str = "auto") -> Tuple[Any, Optional[List[str]]]:
+    import xgboost as xgb
+    dev = _resolve_device(device)
+    clf = xgb.XGBClassifier(device=dev)
+    clf.load_model(path)
+    cols_path = str(Path(path).with_suffix("").as_posix()) + "_feature_columns.json"
+    cols = None
+    if os.path.exists(cols_path):
+        try:
+            with open(cols_path, "r") as f:
+                cols = json.load(f)
+        except Exception:
+            cols = None
+    return clf, cols
+
+
+@app.command()
+def meta_train(
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    timerange: str = typer.Option("20190101-"),
+    prefer_exchange: str = typer.Option("bybit"),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("4H,1D,1W"),
+    # Model paths (defaults to stack dir)
+    bot_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_topbot_bottom.json")),
+    top_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_topbot_top.json")),
+    logret_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_logret.json")),
+    # Signal thresholds
+    p_buy_thr: float = typer.Option(0.6),
+    p_sell_thr: float = typer.Option(0.6),
+    # Triple barrier
+    pt_mult: float = typer.Option(2.0),
+    sl_mult: float = typer.Option(1.0),
+    max_holding: int = typer.Option(24),
+    # MLP
+    epochs: int = typer.Option(80),
+    lr: float = typer.Option(1e-3),
+    batch_size: int = typer.Option(512),
+    device: str = typer.Option("auto"),
+    outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
+    autodownload: bool = typer.Option(True),
+):
+    if autodownload:
+        _ = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange)
+        for tf in ["4h", "1d", "1w"]:
+            try:
+                _ensure_dataset(userdir, pair, tf, prefer_exchange, timerange)
+            except Exception:
+                pass
+    # Load data and features
+    path = _find_data_file(userdir, pair, timeframe, prefer_exchange=prefer_exchange)
+    if not path:
+        raise FileNotFoundError("Dataset not found.")
+    raw = _load_ohlcv(path)
+    raw = _slice_timerange_df(raw, timerange)
+    etf = [s.strip() for s in extra_timeframes.split(",") if s.strip()]
+    feats = make_features(raw, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=(etf or None))
+    feats = feats.reset_index(drop=True)
+    T = len(feats)
+
+    # Load TopBot models and predict probabilities
+    bot_clf, bot_cols = _load_xgb(bot_path, device=device)
+    top_clf, top_cols = _load_xgb(top_path, device=device)
+    p_bot = _predict_with_cols(bot_clf, feats, bot_cols)
+    p_top = _predict_with_cols(top_clf, feats, top_cols)
+    p_bottom = p_bot[:, 1] if (p_bot is not None and p_bot.ndim == 2 and p_bot.shape[1] >= 2) else np.zeros(T)
+    p_topp = p_top[:, 1] if (p_top is not None and p_top.ndim == 2 and p_top.shape[1] >= 2) else np.zeros(T)
+
+    # Load Logret classifier and predict class probabilities
+    logret_clf, logret_cols = _load_xgb(logret_path, device=device)
+    pr = _predict_with_cols(logret_clf, feats, logret_cols)
+    if pr is None or pr.ndim != 2 or pr.shape[1] != 5:
+        pr = np.zeros((T, 5), dtype=float)
+    # reg_direction proxy from probabilities
+    class_vals = np.array([-2, -1, 0, 1, 2], dtype=float)
+    reg_dir = np.dot(pr, class_vals)
+
+    # Assemble L0 outputs frame
+    l0 = pd.DataFrame({
+        "p_bottom": p_bottom,
+        "p_top": p_topp,
+        "p_up": np.zeros(T),
+        "p_dn": np.zeros(T),
+        "reg_direction": reg_dir,
+        "logret_p_-2": pr[:, 0],
+        "logret_p_-1": pr[:, 1],
+        "logret_p_0": pr[:, 2],
+        "logret_p_1": pr[:, 3],
+        "logret_p_2": pr[:, 4],
+    }, index=feats.index)
+
+    # Build meta dataset using triple-barrier on primary signals
+    close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
+    high = feats["high"].astype(float).to_numpy() if "high" in feats.columns else raw["high"].astype(float).to_numpy()
+    low = feats["low"].astype(float).to_numpy() if "low" in feats.columns else raw["low"].astype(float).to_numpy()
+    # ATR normalized from features; fallback compute
+    if "atr" in feats.columns:
+        atrn = feats["atr"].astype(float).to_numpy()
+    else:
+        tr1 = feats["high"].astype(float).to_numpy() - feats["low"].astype(float).to_numpy()
+        tr2 = np.abs(feats["high"].astype(float).to_numpy() - np.roll(close, 1))
+        tr3 = np.abs(feats["low"].astype(float).to_numpy() - np.roll(close, 1))
+        tr = np.maximum.reduce([tr1, tr2, tr3])
+        tr[0] = tr1[0]
+        atrn = pd.Series(tr).ewm(alpha=1/14, adjust=False).mean().to_numpy() / (close + 1e-12)
+
+    buy_entries = (p_bottom >= float(p_buy_thr)).astype(int)
+    sell_entries = (p_topp >= float(p_sell_thr)).astype(int)
+    y_long, _ = triple_barrier_labels(close, high, low, atrn, entries=buy_entries, direction=+1, pt_mult=float(pt_mult), sl_mult=float(sl_mult), max_holding=int(max_holding))
+    y_short, _ = triple_barrier_labels(close, high, low, atrn, entries=sell_entries, direction=-1, pt_mult=float(pt_mult), sl_mult=float(sl_mult), max_holding=int(max_holding))
+
+    # Collect samples and build X,y
+    rows: List[List[float]] = []
+    labels: List[int] = []
+    feat_cols = list(l0.columns)
+    for i in range(T):
+        if buy_entries[i] == 1 and y_long[i] >= 0:
+            rows.append([float(l0.iloc[i][c]) for c in feat_cols])
+            labels.append(int(y_long[i]))
+        if sell_entries[i] == 1 and y_short[i] >= 0:
+            rows.append([float(l0.iloc[i][c]) for c in feat_cols])
+            labels.append(int(y_short[i]))
+    if not rows:
+        raise ValueError("No meta samples generated. Adjust thresholds/barrier params.")
+
+    X_meta = pd.DataFrame(rows, columns=feat_cols)
+    y_meta = np.asarray(labels, dtype=int)
+
+    os.makedirs(outdir, exist_ok=True)
+    out_json = os.path.join(outdir, "best_meta.json")
+    res = train_meta_mlp_manager(X_meta, y_meta, out_json_path=_ensure_outdir(out_json), epochs=int(epochs), lr=float(lr), batch_size=int(batch_size), device=device)
+    typer.echo(json.dumps(res, indent=2))
+
+
+@app.command()
+def train_all(
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    timerange: str = typer.Option("20190101-"),
+    prefer_exchange: str = typer.Option("bybit"),
+    outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
+    optuna_trials: int = typer.Option(40, help="Trials for Optuna when tuning XGB models"),
+):
+    # Ensure datasets across TFs
+    for tf in [timeframe, "4h", "1d", "1w"]:
+        try:
+            _ensure_dataset(userdir, pair, tf, prefer_exchange, timerange)
+        except Exception as e:
+            typer.echo(f"Auto-download failed for {pair} {tf}: {e}")
+    # Train TopBot with Optuna
+    topbot_train(
+        pair=pair,
+        timeframe=timeframe,
+        userdir=userdir,
+        timerange=timerange,
+        prefer_exchange=prefer_exchange,
+        extra_timeframes="4H,1D,1W",
+        n_trials=int(optuna_trials),
+        outdir=outdir,
+        autodownload=False,
+    )
+    # Train Logret with Optuna
+    logret_train(
+        pair=pair,
+        timeframe=timeframe,
+        userdir=userdir,
+        timerange=timerange,
+        prefer_exchange=prefer_exchange,
+        extra_timeframes="4H,1D,1W",
+        n_trials=int(optuna_trials),
+        outdir=outdir,
+        autodownload=False,
+    )
+    # Train Meta (uses outputs)
+    meta_train(
+        pair=pair,
+        timeframe=timeframe,
+        userdir=userdir,
+        timerange=timerange,
+        prefer_exchange=prefer_exchange,
+        extra_timeframes="4H,1D,1W",
+        outdir=outdir,
+        autodownload=False,
+    )
+
+
+if __name__ == "__main__":
+    app()
+
+
