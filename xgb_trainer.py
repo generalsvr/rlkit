@@ -197,6 +197,57 @@ def _plot_feature_importance(model: Any, feature_names: List[str], out_path: str
     _safe_savefig(fig, out_path)
 
 
+# -----------------------------
+# CV and permutation helpers
+# -----------------------------
+
+def _make_time_series_splits(
+    num_rows: int,
+    n_splits: int,
+    min_train: int,
+    val_size: int,
+    scheme: str = "expanding",
+) -> List[Tuple[np.ndarray, np.ndarray]]:
+    splits: List[Tuple[np.ndarray, np.ndarray]] = []
+    if n_splits <= 0 or num_rows <= (min_train + val_size):
+        return splits
+    s = scheme.strip().lower()
+    for k in range(int(n_splits)):
+        if s == "rolling":
+            train_start = max(0, (min_train + k * val_size) - min_train)
+            train_end = min_train + k * val_size
+        else:  # expanding
+            train_start = 0
+            train_end = min_train + k * val_size
+        val_start = train_end
+        val_end = min(num_rows, val_start + val_size)
+        if val_end - val_start < max(20, int(val_size * 0.5)):
+            break
+        if val_start <= train_start or train_end <= train_start:
+            break
+        train_idx = np.arange(train_start, train_end, dtype=int)
+        val_idx = np.arange(val_start, val_end, dtype=int)
+        splits.append((train_idx, val_idx))
+        if val_end >= num_rows:
+            break
+    return splits
+
+
+def _permute_labels_time_aware(y: np.ndarray, mode: str = "shift", rng: Optional[np.random.RandomState] = None) -> np.ndarray:
+    if rng is None:
+        rng = np.random.RandomState(42)
+    y_perm = y.copy()
+    m = mode.strip().lower()
+    if m == "shuffle":
+        rng.shuffle(y_perm)
+        return y_perm
+    # default: circular shift by random offset preserving run-lengths distribution
+    if y_perm.size <= 2:
+        return y_perm
+    off = int(rng.randint(1, max(2, y_perm.size - 1)))
+    return np.roll(y_perm, off)
+
+
 def _train_xgb_classifier(
     X_tr: np.ndarray,
     y_tr: np.ndarray,
@@ -409,6 +460,11 @@ def topbot_train(
     seed: int = typer.Option(42),
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
     autodownload: bool = typer.Option(True),
+    # validation options
+    cv_splits: int = typer.Option(0, help="If >0, run time-aware CV with given splits"),
+    cv_scheme: str = typer.Option("expanding", help="expanding|rolling"),
+    cv_val_size: int = typer.Option(2000, help="Validation fold size (bars)"),
+    perm_test: int = typer.Option(0, help="If >0, run permutation test with N shuffles"),
 ):
     # Auto-download base and HTFs
     if autodownload:
@@ -544,6 +600,53 @@ def topbot_train(
         m_bot = {}; m_top = {}
     typer.echo(json.dumps({"bottom": {"path": bot_path, **m_bot}, "top": {"path": top_path, **m_top}}, indent=2))
 
+    # Time-aware CV (optional)
+    if int(cv_splits) > 0:
+        splits = _make_time_series_splits(
+            num_rows=valid_len,
+            n_splits=int(cv_splits),
+            min_train=max(400, int(valid_len * 0.3)),
+            val_size=int(cv_val_size),
+            scheme=str(cv_scheme),
+        )
+        cv_metrics: List[Dict[str, float]] = []
+        from sklearn.metrics import average_precision_score
+        for tr_idx, va_idx in splits:
+            X_tr = feats.iloc[tr_idx, :].values
+            X_va = feats.iloc[va_idx, :].values
+            yb_tr = yb[tr_idx]
+            yb_va = yb[va_idx]
+            yt_tr = yt[tr_idx]
+            yt_va = yt[va_idx]
+            bm, _ = _train_xgb_classifier(X_tr, yb_tr, X_va, yb_va, device, n_estimators=n_estimators, max_depth=max_depth, min_child_weight=min_child_weight, learning_rate=learning_rate, subsample=subsample, colsample_bytree=colsample_bytree, reg_alpha=reg_alpha, reg_lambda=reg_lambda, n_jobs=n_jobs, objective="binary:logistic")
+            tm, _ = _train_xgb_classifier(X_tr, yt_tr, X_va, yt_va, device, n_estimators=n_estimators, max_depth=max_depth, min_child_weight=min_child_weight, learning_rate=learning_rate, subsample=subsample, colsample_bytree=colsample_bytree, reg_alpha=reg_alpha, reg_lambda=reg_lambda, n_jobs=n_jobs, objective="binary:logistic")
+            p_b = bm.predict_proba(X_va)[:, 1]
+            p_t = tm.predict_proba(X_va)[:, 1]
+            cv_metrics.append({
+                "ap_bottom": float(average_precision_score(yb_va, p_b)),
+                "ap_top": float(average_precision_score(yt_va, p_t)),
+            })
+        typer.echo(json.dumps({"cv": cv_metrics}, indent=2))
+
+    # Permutation test (optional)
+    if int(perm_test) > 0:
+        from sklearn.metrics import average_precision_score
+        rng = np.random.RandomState(42)
+        p_b = bot_model.predict_proba(X_val)[:, 1]
+        p_t = top_model.predict_proba(X_val)[:, 1]
+        ap_b = float(average_precision_score(yb_val, p_b))
+        ap_t = float(average_precision_score(yt_val, p_t))
+        null_b: List[float] = []
+        null_t: List[float] = []
+        for _ in range(int(perm_test)):
+            yb_perm = _permute_labels_time_aware(yb_val, mode="shift", rng=rng)
+            yt_perm = _permute_labels_time_aware(yt_val, mode="shift", rng=rng)
+            null_b.append(float(average_precision_score(yb_perm, p_b)))
+            null_t.append(float(average_precision_score(yt_perm, p_t)))
+        pval_b = float((np.sum(np.array(null_b) >= ap_b) + 1) / (len(null_b) + 1))
+        pval_t = float((np.sum(np.array(null_t) >= ap_t) + 1) / (len(null_t) + 1))
+        typer.echo(json.dumps({"perm_test": {"ap_bottom": ap_b, "pval_bottom": pval_b, "ap_top": ap_t, "pval_top": pval_t}}, indent=2))
+
 
 @app.command()
 def logret_train(
@@ -572,6 +675,11 @@ def logret_train(
     seed: int = typer.Option(42),
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
     autodownload: bool = typer.Option(True),
+    # validation options
+    cv_splits: int = typer.Option(0, help="If >0, run time-aware CV"),
+    cv_scheme: str = typer.Option("expanding"),
+    cv_val_size: int = typer.Option(2000),
+    perm_test: int = typer.Option(0, help="If >0, run permutation test (val only)"),
 ):
     if autodownload:
         _ = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange)
@@ -695,6 +803,42 @@ def logret_train(
         json.dump(meta, f, indent=2)
     typer.echo(json.dumps({"logret": {"path": path_out, **metrics}}, indent=2))
 
+    # Time-aware CV (optional)
+    if int(cv_splits) > 0:
+        splits = _make_time_series_splits(
+            num_rows=valid,
+            n_splits=int(cv_splits),
+            min_train=max(600, int(valid * 0.3)),
+            val_size=int(cv_val_size),
+            scheme=str(cv_scheme),
+        )
+        cv_metrics: List[Dict[str, float]] = []
+        from sklearn.metrics import accuracy_score
+        for tr_idx, va_idx in splits:
+            X_tr = X.iloc[tr_idx, :].values
+            X_va = X.iloc[va_idx, :].values
+            y_tr = labels[tr_idx]
+            y_va = labels[va_idx]
+            mdl, _ = _train_xgb_classifier(X_tr, y_tr, X_va, y_va, device, n_estimators=n_estimators, max_depth=max_depth, min_child_weight=min_child_weight, learning_rate=learning_rate, subsample=subsample, colsample_bytree=colsample_bytree, reg_alpha=reg_alpha, reg_lambda=reg_lambda, n_jobs=n_jobs, objective="multi:softprob", num_class=5)
+            pr = mdl.predict_proba(X_va)
+            y_hat = np.argmax(pr, axis=1)
+            cv_metrics.append({"acc": float(accuracy_score(y_va, y_hat))})
+        typer.echo(json.dumps({"cv": cv_metrics}, indent=2))
+
+    # Permutation test (optional)
+    if int(perm_test) > 0:
+        from sklearn.metrics import accuracy_score
+        pr = model.predict_proba(X_val)
+        y_hat = np.argmax(pr, axis=1)
+        acc = float(accuracy_score(y_val, y_hat))
+        rng = np.random.RandomState(42)
+        null_acc: List[float] = []
+        for _ in range(int(perm_test)):
+            y_perm = _permute_labels_time_aware(y_val, mode="shift", rng=rng)
+            null_acc.append(float(accuracy_score(y_perm, y_hat)))
+        pval = float((np.sum(np.array(null_acc) >= acc) + 1) / (len(null_acc) + 1))
+        typer.echo(json.dumps({"perm_test": {"acc": acc, "pval": pval}}, indent=2))
+
 
 def _impulse_train_impl(
     pair: str,
@@ -727,6 +871,11 @@ def _impulse_train_impl(
     seed: int,
     outdir: str,
     autodownload: bool,
+    # validation options
+    cv_splits: int = 0,
+    cv_scheme: str = "expanding",
+    cv_val_size: int = 2000,
+    perm_test: int = 0,
 ):
     if autodownload:
         _ = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange)
@@ -861,6 +1010,53 @@ def _impulse_train_impl(
     _save_feature_columns(dn_path, list(X.columns))
     typer.echo(json.dumps({"impulse_up": {"path": up_path}, "impulse_down": {"path": dn_path}}, indent=2))
 
+    # Time-aware CV (optional)
+    if int(cv_splits) > 0:
+        splits = _make_time_series_splits(
+            num_rows=valid,
+            n_splits=int(cv_splits),
+            min_train=max(600, int(valid * 0.3)),
+            val_size=int(cv_val_size),
+            scheme=str(cv_scheme),
+        )
+        cv_metrics: List[Dict[str, float]] = []
+        from sklearn.metrics import average_precision_score
+        for tr_idx, va_idx in splits:
+            X_tr = X.iloc[tr_idx, :].values
+            X_va = X.iloc[va_idx, :].values
+            yu_tr = y_up[tr_idx]
+            yu_va = y_up[va_idx]
+            yd_tr = y_dn[tr_idx]
+            yd_va = y_dn[va_idx]
+            um, _ = _train_xgb_classifier(X_tr, yu_tr, X_va, yu_va, device, n_estimators=n_estimators, max_depth=max_depth, min_child_weight=min_child_weight, learning_rate=learning_rate, subsample=subsample, colsample_bytree=colsample_bytree, reg_alpha=reg_alpha, reg_lambda=reg_lambda, n_jobs=n_jobs, objective="binary:logistic")
+            dm, _ = _train_xgb_classifier(X_tr, yd_tr, X_va, yd_va, device, n_estimators=n_estimators, max_depth=max_depth, min_child_weight=min_child_weight, learning_rate=learning_rate, subsample=subsample, colsample_bytree=colsample_bytree, reg_alpha=reg_alpha, reg_lambda=reg_lambda, n_jobs=n_jobs, objective="binary:logistic")
+            pu = um.predict_proba(X_va)[:, 1]
+            pdn = dm.predict_proba(X_va)[:, 1]
+            cv_metrics.append({
+                "ap_up": float(average_precision_score(yu_va, pu)),
+                "ap_dn": float(average_precision_score(yd_va, pdn)),
+            })
+        typer.echo(json.dumps({"cv": cv_metrics}, indent=2))
+
+    # Permutation test (optional) on the held-out validation slice used above
+    if int(perm_test) > 0:
+        from sklearn.metrics import average_precision_score
+        pu = up_model.predict_proba(X_val)[:, 1]
+        pdn = dn_model.predict_proba(X_val)[:, 1]
+        ap_u = float(average_precision_score(y_up_val, pu))
+        ap_d = float(average_precision_score(y_dn_val, pdn))
+        rng = np.random.RandomState(42)
+        null_u: List[float] = []
+        null_d: List[float] = []
+        for _ in range(int(perm_test)):
+            yu_perm = _permute_labels_time_aware(y_up_val, mode="shift", rng=rng)
+            yd_perm = _permute_labels_time_aware(y_dn_val, mode="shift", rng=rng)
+            null_u.append(float(average_precision_score(yu_perm, pu)))
+            null_d.append(float(average_precision_score(yd_perm, pdn)))
+        pval_u = float((np.sum(np.array(null_u) >= ap_u) + 1) / (len(null_u) + 1))
+        pval_d = float((np.sum(np.array(null_d) >= ap_d) + 1) / (len(null_d) + 1))
+        typer.echo(json.dumps({"perm_test": {"ap_up": ap_u, "pval_up": pval_u, "ap_dn": ap_d, "pval_dn": pval_d}}, indent=2))
+
 
 @app.command("impulse_train")
 def impulse_train_cmd(
@@ -894,6 +1090,11 @@ def impulse_train_cmd(
     seed: int = typer.Option(42),
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
     autodownload: bool = typer.Option(True),
+    # validation
+    cv_splits: int = typer.Option(0),
+    cv_scheme: str = typer.Option("expanding"),
+    cv_val_size: int = typer.Option(2000),
+    perm_test: int = typer.Option(0),
 ):
     _impulse_train_impl(**locals())
 
@@ -930,6 +1131,11 @@ def impulse_train_cmd_dash(
     seed: int = typer.Option(42),
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
     autodownload: bool = typer.Option(True),
+    # validation
+    cv_splits: int = typer.Option(0),
+    cv_scheme: str = typer.Option("expanding"),
+    cv_val_size: int = typer.Option(2000),
+    perm_test: int = typer.Option(0),
 ):
     _impulse_train_impl(**locals())
 
@@ -1253,6 +1459,11 @@ def train_all(
     prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
     optuna_trials: int = typer.Option(40, "--optuna-trials", "--optuna_trials", help="Trials for Optuna when tuning XGB models"),
+    # global validation flags passed into sub-trainers
+    cv_splits: int = typer.Option(0, help="If >0, run time-aware CV in sub-trainers"),
+    cv_scheme: str = typer.Option("expanding"),
+    cv_val_size: int = typer.Option(2000),
+    perm_test: int = typer.Option(0, help="If >0, run permutation tests in sub-trainers"),
     auto_backtest: bool = typer.Option(True, "--auto-backtest", "--auto_backtest"),
     backtest_timerange: str = typer.Option("20240101-", "--backtest-timerange", "--backtest_timerange"),
 ):
@@ -1273,6 +1484,10 @@ def train_all(
         n_trials=int(optuna_trials),
         outdir=outdir,
         autodownload=False,
+        cv_splits=int(cv_splits),
+        cv_scheme=str(cv_scheme),
+        cv_val_size=int(cv_val_size),
+        perm_test=int(perm_test),
     )
     # Train Logret with Optuna
     logret_train(
@@ -1285,6 +1500,10 @@ def train_all(
         n_trials=int(optuna_trials),
         outdir=outdir,
         autodownload=False,
+        cv_splits=int(cv_splits),
+        cv_scheme=str(cv_scheme),
+        cv_val_size=int(cv_val_size),
+        perm_test=int(perm_test),
     )
     # Train Impulse with Optuna
     try:
@@ -1298,6 +1517,10 @@ def train_all(
             n_trials=int(optuna_trials),
             outdir=outdir,
             autodownload=False,
+            cv_splits=int(cv_splits),
+            cv_scheme=str(cv_scheme),
+            cv_val_size=int(cv_val_size),
+            perm_test=int(perm_test),
         )
     except Exception as e:
         typer.echo(f"Impulse training skipped/failed: {e}")
