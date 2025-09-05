@@ -654,6 +654,9 @@ def meta_train(
     etf = [s.strip() for s in extra_timeframes.split(",") if s.strip()]
     feature_mode = _coerce_opt(feature_mode, "full")
     basic_lookback = int(_coerce_opt(basic_lookback, 64))
+    bot_path = str(_coerce_opt(bot_path, str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_topbot_bottom.json")))
+    top_path = str(_coerce_opt(top_path, str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_topbot_top.json")))
+    logret_path = str(_coerce_opt(logret_path, str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_logret.json")))
     p_buy_thr = float(_coerce_opt(p_buy_thr, 0.6))
     p_sell_thr = float(_coerce_opt(p_sell_thr, 0.6))
     pt_mult = float(_coerce_opt(pt_mult, 2.0))
