@@ -453,13 +453,16 @@ def logret_train(
     fwd = logp[H:] - logp[:-H]
     atr = feats["atr"].astype(float).to_numpy()
     atr = atr[:valid]
-    # Labels: -2,-1,0,1,2
-    labels = np.zeros(valid, dtype=int)
+    # Labels: map {-2,-1,0,1,2} -> indices {0,1,2,3,4} for XGBoost
+    raw_labels = np.zeros(valid, dtype=int)
     thr = float(strong_mult) * atr
-    labels[fwd > thr] = 2
-    labels[(fwd > 0.0) & (fwd <= thr)] = 1
-    labels[(fwd < 0.0) & (fwd >= -thr)] = -1
-    labels[fwd < -thr] = -2
+    raw_labels[fwd > thr] = 2
+    raw_labels[(fwd > 0.0) & (fwd <= thr)] = 1
+    raw_labels[(fwd < 0.0) & (fwd >= -thr)] = -1
+    raw_labels[fwd < -thr] = -2
+    classes_ord = np.array([-2, -1, 0, 1, 2], dtype=int)
+    label_to_idx = {c: i for i, c in enumerate(classes_ord)}
+    labels = np.vectorize(lambda x: label_to_idx.get(int(x), 2))(raw_labels).astype(int)
     # Features aligned to valid range
     X = feats.iloc[:valid, :].copy()
     # Train/val split
