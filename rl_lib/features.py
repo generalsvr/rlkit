@@ -515,7 +515,8 @@ def make_features(
             for tf in extra_timeframes:
                 try:
                     tf_str = str(tf).upper()
-                    resample_tf = tf_str.lower()
+                    # Use uppercase frequency aliases (e.g., 4H, 1D, 1W) to avoid pandas deprecation of lowercase
+                    resample_tf = tf_str
                     agg = {
                         "open": "first",
                         "high": "max",

@@ -1507,7 +1507,7 @@ def train_all(
     )
     # Train Impulse with Optuna
     try:
-        impulse_train(
+        impulse_train_cmd(
             pair=pair,
             timeframe=timeframe,
             userdir=userdir,
