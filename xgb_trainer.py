@@ -176,6 +176,67 @@ def _predict_with_cols(model: Any, feats: pd.DataFrame, cols: Optional[List[str]
         return None
 
 
+def _ensure_backtest_config(userdir: str, timeframe: str, exchange: str, pair: str) -> Path:
+    config_path = Path(userdir) / "config.json"
+    if not config_path.exists():
+        cfg = {
+            "timeframe": timeframe,
+            "user_data_dir": str(userdir),
+            "strategy": "XGBStackedStrategy",
+            "exchange": {
+                "name": exchange,
+                "key": "",
+                "secret": "",
+                "pair_whitelist": [pair]
+            },
+            "stake_currency": "USDT",
+            "stake_amount": "unlimited",
+            "dry_run": True,
+            "max_open_trades": 1,
+            "trading_mode": "futures",
+            "margin_mode": "isolated",
+            "dataformat_ohlcv": "parquet",
+        }
+        os.makedirs(userdir, exist_ok=True)
+        with open(config_path, "w") as f:
+            json.dump(cfg, f, indent=2)
+    return config_path
+
+
+def _run_backtest_stacked(
+    userdir: str,
+    pair: str,
+    timeframe: str,
+    timerange: str,
+    model_dir: str,
+    extra_tfs: str,
+    exchange: str,
+):
+    env = os.environ.copy()
+    env["XGB_BOTTOM_PATH"] = str(Path(model_dir) / "best_topbot_bottom.json")
+    env["XGB_TOP_PATH"] = str(Path(model_dir) / "best_topbot_top.json")
+    env["XGB_LOGRET_PATH"] = str(Path(model_dir) / "best_logret.json")
+    env["XGB_META_PATH"] = str(Path(model_dir) / "best_meta.json")
+    up_path = Path(model_dir) / "best_impulse_up.json"
+    dn_path = Path(model_dir) / "best_impulse_down.json"
+    if up_path.exists():
+        env["XGB_UP_PATH"] = str(up_path)
+    if dn_path.exists():
+        env["XGB_DN_PATH"] = str(dn_path)
+    env["XGB_EXTRA_TFS"] = extra_tfs
+    config_path = _ensure_backtest_config(userdir, timeframe, exchange, pair)
+    cmd = [
+        "freqtrade", "backtesting",
+        "--userdir", userdir,
+        "--config", str(config_path),
+        "--strategy", "XGBStackedStrategy",
+        "--timeframe", timeframe,
+        "--pairs", pair,
+        "--timerange", timerange,
+    ]
+    typer.echo(f"Running backtest: {' '.join(cmd)}")
+    subprocess.run(cmd, check=True, env=env)
+
 def _ensure_dataset(userdir: str, pair: str, timeframe: str, exchange: str, timerange: str = "20190101-") -> Optional[str]:
     """Ensure dataset exists; if not, try multiple pair variants with Freqtrade download-data."""
     # Fast path
@@ -689,6 +750,8 @@ def train_all(
     prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
     optuna_trials: int = typer.Option(40, "--optuna-trials", "--optuna_trials", help="Trials for Optuna when tuning XGB models"),
+    auto_backtest: bool = typer.Option(True, "--auto-backtest", "--auto_backtest"),
+    backtest_timerange: str = typer.Option("20240101-", "--backtest-timerange", "--backtest_timerange"),
 ):
     # Ensure datasets across TFs
     for tf in [timeframe, "4h", "1d", "1w"]:
@@ -720,6 +783,21 @@ def train_all(
         outdir=outdir,
         autodownload=False,
     )
+    # Train Impulse with Optuna
+    try:
+        impulse_train(
+            pair=pair,
+            timeframe=timeframe,
+            userdir=userdir,
+            timerange=timerange,
+            prefer_exchange=prefer_exchange,
+            extra_timeframes="4H,1D,1W",
+            n_trials=int(optuna_trials),
+            outdir=outdir,
+            autodownload=False,
+        )
+    except Exception as e:
+        typer.echo(f"Impulse training skipped/failed: {e}")
     # Train Meta (uses outputs)
     meta_train(
         pair=pair,
@@ -731,6 +809,20 @@ def train_all(
         outdir=outdir,
         autodownload=False,
     )
+    # Optional backtest validation
+    if bool(auto_backtest):
+        try:
+            _run_backtest_stacked(
+                userdir=userdir,
+                pair=pair,
+                timeframe=timeframe,
+                timerange=backtest_timerange,
+                model_dir=outdir,
+                extra_tfs="4h,1d,1w",
+                exchange=prefer_exchange,
+            )
+        except Exception as e:
+            typer.echo(f"Auto backtest failed: {e}")
 
 
 if __name__ == "__main__":

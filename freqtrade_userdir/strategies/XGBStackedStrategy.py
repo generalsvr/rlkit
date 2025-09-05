@@ -37,6 +37,8 @@ class XGBStackedStrategy(IStrategy):
         self.bottom_model_path = os.environ.get("XGB_BOTTOM_PATH", str(Path(_project_root) / "models" / "xgb_stack" / "best_topbot_bottom.json"))
         self.top_model_path = os.environ.get("XGB_TOP_PATH", str(Path(_project_root) / "models" / "xgb_stack" / "best_topbot_top.json"))
         self.logret_path = os.environ.get("XGB_LOGRET_PATH", str(Path(_project_root) / "models" / "xgb_stack" / "best_logret.json"))
+        self.up_model_path = os.environ.get("XGB_UP_PATH", str(Path(_project_root) / "models" / "xgb_stack" / "best_impulse_up.json"))
+        self.down_model_path = os.environ.get("XGB_DN_PATH", str(Path(_project_root) / "models" / "xgb_stack" / "best_impulse_down.json"))
         # Meta model manifest (MLP)
         self.meta_json_path = os.environ.get("XGB_META_PATH", str(Path(_project_root) / "models" / "xgb_stack" / "best_meta.json"))
 
@@ -55,10 +57,14 @@ class XGBStackedStrategy(IStrategy):
         self._bot = None
         self._top = None
         self._logret = None
+        self._upc = None
+        self._dnc = None
         self._meta = None
         self._bot_cols: Optional[List[str]] = None
         self._top_cols: Optional[List[str]] = None
         self._logret_cols: Optional[List[str]] = None
+        self._up_cols: Optional[List[str]] = None
+        self._dn_cols: Optional[List[str]] = None
         self._meta_cols: Optional[List[str]] = None
 
     def _resolve_device(self) -> str:
@@ -109,6 +115,34 @@ class XGBStackedStrategy(IStrategy):
                     self._logret_cols = json.loads(Path(fc).read_text())
                 except Exception:
                     self._logret_cols = None
+        # Impulse up
+        if self._upc is None and self.up_model_path and os.path.exists(self.up_model_path):
+            try:
+                upc = xgb.XGBClassifier(device=dev)
+                upc.load_model(self.up_model_path)
+                self._upc = upc
+                fc = Path(self.up_model_path).with_suffix("").as_posix() + "_feature_columns.json"
+                if os.path.exists(fc):
+                    try:
+                        self._up_cols = json.loads(Path(fc).read_text())
+                    except Exception:
+                        self._up_cols = None
+            except Exception:
+                self._upc = None
+        # Impulse down
+        if self._dnc is None and self.down_model_path and os.path.exists(self.down_model_path):
+            try:
+                dnc = xgb.XGBClassifier(device=dev)
+                dnc.load_model(self.down_model_path)
+                self._dnc = dnc
+                fc = Path(self.down_model_path).with_suffix("").as_posix() + "_feature_columns.json"
+                if os.path.exists(fc):
+                    try:
+                        self._dn_cols = json.loads(Path(fc).read_text())
+                    except Exception:
+                        self._dn_cols = None
+            except Exception:
+                self._dnc = None
         # Meta MLP
         if self._meta is None and self.meta_json_path and os.path.exists(self.meta_json_path):
             try:
@@ -132,7 +166,7 @@ class XGBStackedStrategy(IStrategy):
         self._load_models()
         # Union feature columns for L0 models
         union_cols: Optional[List[str]] = None
-        for cols in (self._bot_cols, self._top_cols, self._logret_cols):
+        for cols in (self._bot_cols, self._top_cols, self._logret_cols, self._up_cols, self._dn_cols):
             if cols:
                 if union_cols is None:
                     union_cols = list(cols)
@@ -147,6 +181,8 @@ class XGBStackedStrategy(IStrategy):
         p_bottom = None
         p_top = None
         pr_logret = None
+        p_up = None
+        p_dn = None
         if self._bot is not None and self._bot_cols is not None:
             Xb = self._view(feats, self._bot_cols)
             try:
@@ -167,6 +203,18 @@ class XGBStackedStrategy(IStrategy):
                 pr_logret = self._logret.predict_proba(Xr)
             except Exception:
                 pr_logret = None
+        if self._upc is not None and self._up_cols is not None:
+            Xu = self._view(feats, self._up_cols)
+            try:
+                p_up = self._upc.predict_proba(Xu)[:, 1]
+            except Exception:
+                p_up = None
+        if self._dnc is not None and self._dn_cols is not None:
+            Xd = self._view(feats, self._dn_cols)
+            try:
+                p_dn = self._dnc.predict_proba(Xd)[:, 1]
+            except Exception:
+                p_dn = None
 
         T = len(feats)
         if p_bottom is None:
@@ -175,6 +223,10 @@ class XGBStackedStrategy(IStrategy):
             p_top = np.zeros(T)
         if pr_logret is None or pr_logret.ndim != 2 or pr_logret.shape[1] != 5:
             pr_logret = np.zeros((T, 5))
+        if p_up is None:
+            p_up = np.zeros(T)
+        if p_dn is None:
+            p_dn = np.zeros(T)
 
         # reg_direction proxy from class probabilities
         class_vals = np.array([-2, -1, 0, 1, 2], dtype=float)
@@ -188,8 +240,8 @@ class XGBStackedStrategy(IStrategy):
             l0 = pd.DataFrame({
                 "p_bottom": p_bottom,
                 "p_top": p_top,
-                "p_up": np.zeros(T),
-                "p_dn": np.zeros(T),
+                "p_up": p_up,
+                "p_dn": p_dn,
                 "reg_direction": reg_dir,
                 "logret_p_-2": pr_logret[:, 0],
                 "logret_p_-1": pr_logret[:, 1],
