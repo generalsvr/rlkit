@@ -248,6 +248,77 @@ def _permute_labels_time_aware(y: np.ndarray, mode: str = "shift", rng: Optional
     return np.roll(y_perm, off)
 
 
+# -----------------------------
+# Logret advanced visuals
+# -----------------------------
+
+def _plot_regdir_shading(index, close: np.ndarray, reg_dir: np.ndarray, title: str, out_path: str):
+    import matplotlib.pyplot as plt
+    import numpy as _np
+    T = int(_np.size(close))
+    vals = _np.clip(_np.asarray(reg_dir, dtype=float), -2.0, 2.0) / 2.0  # [-1,1]
+    # Build a 2D array for background shading across full y-range
+    bg = vals.reshape(1, T)
+    fig, ax = plt.subplots(figsize=(14, 5))
+    # imshow with diverging colormap; red negative, green positive
+    try:
+        # extent uses x in sample index space
+        ax.imshow(bg, aspect='auto', cmap='RdYlGn', alpha=0.18,
+                  extent=[0, T, float(_np.nanmin(close)), float(_np.nanmax(close))])
+    except Exception:
+        pass
+    ax.plot(range(T), close, color='#1f77b4', linewidth=1.1, label='Close')
+    ax.axhline(float(_np.nanmedian(close)), linestyle=':', color='#999', linewidth=0.7, alpha=0.6)
+    ax.set_title(title)
+    ax.grid(alpha=0.25)
+    _safe_savefig(fig, out_path)
+
+
+def _plot_logret_classes(index, close: np.ndarray, prob_mat: np.ndarray, classes: list[int], title: str, out_path: str, strong_thr: float = 0.5):
+    import matplotlib.pyplot as plt
+    import numpy as _np
+    T = prob_mat.shape[0]
+    cls_idx = _np.argmax(prob_mat, axis=1)
+    max_p = _np.max(prob_mat, axis=1)
+    # Map classes {-2,-1,0,1,2} to 0..4 for colormap
+    cls_vals = _np.asarray([classes[i] for i in cls_idx], dtype=int)
+    # Normalize to 0..4 band
+    band = (_np.array([cls_vals]) + 2).astype(float)
+
+    fig = plt.figure(figsize=(14, 6))
+    gs = fig.add_gridspec(2, 1, height_ratios=[3, 0.5], hspace=0.15)
+    ax1 = fig.add_subplot(gs[0, 0])
+    ax2 = fig.add_subplot(gs[1, 0], sharex=ax1)
+
+    # Price with strong signals
+    ax1.plot(range(T), close, color='#1f77b4', linewidth=1.0)
+    strong_mask = max_p >= float(strong_thr)
+    pos_mask = strong_mask & (cls_vals > 0)
+    neg_mask = strong_mask & (cls_vals < 0)
+    neu_mask = strong_mask & (cls_vals == 0)
+    try:
+        ax1.scatter(_np.where(pos_mask)[0], close[pos_mask], s=18, color='#2ca02c', label='Strong +', zorder=5)
+        ax1.scatter(_np.where(neg_mask)[0], close[neg_mask], s=18, color='#d62728', label='Strong -', zorder=5)
+        ax1.scatter(_np.where(neu_mask)[0], close[neu_mask], s=14, color='#7f7f7f', label='Strong 0', zorder=5)
+    except Exception:
+        pass
+    ax1.legend(loc='best')
+    ax1.set_title(title)
+    ax1.grid(alpha=0.25)
+
+    # Class band (0..4) with custom colormap mapping [-2..2]
+    try:
+        import matplotlib.colors as mcolors
+        cmap = mcolors.ListedColormap(['#8c564b', '#d62728', '#7f7f7f', '#2ca02c', '#17becf'])
+        ax2.imshow(band, aspect='auto', cmap=cmap, interpolation='nearest')
+        ax2.set_yticks([])
+        ax2.set_xlim(0, T)
+        # xticks keep
+    except Exception:
+        pass
+    _safe_savefig(fig, out_path)
+
+
 def _train_xgb_classifier(
     X_tr: np.ndarray,
     y_tr: np.ndarray,
@@ -1400,18 +1471,9 @@ def logret_eval(
         "p_2": pr[:, 4],
     }, thresholds=None, title=f"Logret class probabilities {pair} {timeframe}", out_path=os.path.join(root, "logret_probs.png"))
     # Direction proxy overlay
-    try:
-        import matplotlib.pyplot as plt
-        fig, ax1 = plt.subplots(figsize=(14, 5))
-        ax1.plot(idx, close, color="#1f77b4", linewidth=1.0)
-        ax1.set_title(f"Price with reg_direction (proxy) {pair} {timeframe}")
-        ax2 = ax1.twinx()
-        ax2.plot(idx, reg_dir, color="#ff7f0e", linewidth=0.9, alpha=0.8)
-        ax2.axhline(0.0, color="#888", linestyle="--", linewidth=0.8)
-        ax1.grid(alpha=0.25)
-        _safe_savefig(fig, os.path.join(root, "logret_regdir.png"))
-    except Exception:
-        pass
+    _plot_regdir_shading(idx, close, reg_dir, title=f"Price with reg_direction shading {pair} {timeframe}", out_path=os.path.join(root, "logret_regdir.png"))
+    # Class band with strong-signal markers
+    _plot_logret_classes(idx, close, pr, classes=[-2,-1,0,1,2], title=f"Logret class band + strong signals {pair} {timeframe}", out_path=os.path.join(root, "logret_class_band.png"), strong_thr=0.55)
     _plot_feature_importance(logret_clf, logret_cols or list(feats.columns), out_path=os.path.join(root, "fi_logret.png"), title="Feature importance - Logret")
     typer.echo(json.dumps({"outdir": root, "samples": int(T)}, indent=2))
 
