@@ -167,25 +167,43 @@ def _predict_with_cols(model: Any, feats: pd.DataFrame, cols: Optional[List[str]
 
 
 def _ensure_dataset(userdir: str, pair: str, timeframe: str, exchange: str, timerange: str = "20190101-") -> Optional[str]:
-    """Ensure dataset exists; if not, download via Freqtrade non-interactively."""
+    """Ensure dataset exists; if not, try multiple pair variants with Freqtrade download-data."""
+    # Fast path
     hit = _find_data_file(userdir, pair, timeframe, prefer_exchange=exchange)
     if hit and os.path.exists(hit):
         return hit
     Path(userdir).mkdir(parents=True, exist_ok=True)
-    cmd = [
-        "freqtrade", "download-data",
-        "--pairs", pair,
-        "--timeframes", timeframe,
-        "--userdir", userdir,
-        "--timerange", timerange,
-        "--exchange", exchange,
-        "--data-format-ohlcv", "parquet",
-    ]
-    try:
-        typer.echo(f"Downloading dataset: {' '.join(cmd)}")
-        subprocess.run(cmd, check=True)
-    except Exception as e:
-        typer.echo(f"Download failed for {pair} {timeframe}: {e}")
+
+    variants = [pair]
+    up = pair.upper()
+    # For Bybit futures, BTC/USDT:USDT is often required
+    if ":" not in pair and (up.endswith("/USDT") or up.endswith("_USDT")):
+        variants.append(f"{pair}:USDT")
+
+    last_err: Optional[Exception] = None
+    for pv in variants:
+        cmd = [
+            "freqtrade", "download-data",
+            "--pairs", pv,
+            "--timeframes", timeframe,
+            "--userdir", userdir,
+            "--timerange", timerange,
+            "--exchange", exchange,
+            "--data-format-ohlcv", "parquet",
+        ]
+        try:
+            typer.echo(f"Downloading dataset: {' '.join(cmd)}")
+            subprocess.run(cmd, check=True)
+        except Exception as e:
+            last_err = e
+        # Check after each attempt
+        hit = _find_data_file(userdir, pv, timeframe, prefer_exchange=exchange)
+        if hit and os.path.exists(hit):
+            return hit
+
+    if last_err is not None:
+        typer.echo(f"Download attempts failed for variants {variants}: {last_err}")
+    # Final check with original pair
     return _find_data_file(userdir, pair, timeframe, prefer_exchange=exchange)
 
 
@@ -195,7 +213,7 @@ def topbot_train(
     timeframe: str = typer.Option("1h"),
     userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
     timerange: str = typer.Option("20190101-"),
-    prefer_exchange: str = typer.Option("bybit"),
+    prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
     feature_mode: str = typer.Option("full"),
     basic_lookback: int = typer.Option(64),
     extra_timeframes: str = typer.Option("4H,1D,1W", help="Optional comma-separated HTFs e.g. '4H,1D,1W'"),
@@ -212,7 +230,7 @@ def topbot_train(
     reg_alpha: float = typer.Option(0.0),
     reg_lambda: float = typer.Option(1.0),
     n_jobs: int = typer.Option(0),
-    n_trials: int = typer.Option(0, help="If >0, run Optuna tuning"),
+    n_trials: int = typer.Option(0, help="If >0, run Optuna tuning", "--n-trials", "--n_trials"),
     sampler: str = typer.Option("tpe", help="tpe|random"),
     seed: int = typer.Option(42),
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
@@ -327,7 +345,7 @@ def logret_train(
     timeframe: str = typer.Option("1h"),
     userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
     timerange: str = typer.Option("20190101-"),
-    prefer_exchange: str = typer.Option("bybit"),
+    prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
     feature_mode: str = typer.Option("full"),
     basic_lookback: int = typer.Option(64),
     extra_timeframes: str = typer.Option("4H,1D,1W", help="Optional comma-separated HTFs e.g. '4H,1D,1W'"),
@@ -343,7 +361,7 @@ def logret_train(
     reg_alpha: float = typer.Option(0.0),
     reg_lambda: float = typer.Option(1.0),
     n_jobs: int = typer.Option(0),
-    n_trials: int = typer.Option(0, help="If >0, run Optuna tuning"),
+    n_trials: int = typer.Option(0, help="If >0, run Optuna tuning", "--n-trials", "--n_trials"),
     sampler: str = typer.Option("tpe"),
     seed: int = typer.Option(42),
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
@@ -472,7 +490,7 @@ def meta_train(
     timeframe: str = typer.Option("1h"),
     userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
     timerange: str = typer.Option("20190101-"),
-    prefer_exchange: str = typer.Option("bybit"),
+    prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
     feature_mode: str = typer.Option("full"),
     basic_lookback: int = typer.Option(64),
     extra_timeframes: str = typer.Option("4H,1D,1W"),
@@ -593,9 +611,9 @@ def train_all(
     timeframe: str = typer.Option("1h"),
     userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
     timerange: str = typer.Option("20190101-"),
-    prefer_exchange: str = typer.Option("bybit"),
+    prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
-    optuna_trials: int = typer.Option(40, help="Trials for Optuna when tuning XGB models"),
+    optuna_trials: int = typer.Option(40, help="Trials for Optuna when tuning XGB models", "--optuna-trials", "--optuna_trials"),
 ):
     # Ensure datasets across TFs
     for tf in [timeframe, "4h", "1d", "1w"]:
