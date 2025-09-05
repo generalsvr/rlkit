@@ -46,6 +46,16 @@ def _save_feature_columns(model_path: str, cols: List[str]):
         pass
 
 
+def _coerce_opt(value: Any, default: Any):
+    try:
+        from typer.models import OptionInfo  # type: ignore
+        if isinstance(value, OptionInfo):
+            return default
+    except Exception:
+        pass
+    return value
+
+
 def _label_pivots(close: np.ndarray, left: int, right: int, min_gap: int) -> Tuple[np.ndarray, np.ndarray]:
     T = len(close)
     y_bot = np.zeros(T, dtype=int)
@@ -250,6 +260,9 @@ def topbot_train(
     raw = _load_ohlcv(path)
     raw = _slice_timerange_df(raw, timerange)
     etf = [s.strip() for s in extra_timeframes.split(",") if s.strip()]
+    # Coerce Typer OptionInfo to concrete values when invoked programmatically
+    feature_mode = _coerce_opt(feature_mode, "full")
+    basic_lookback = int(_coerce_opt(basic_lookback, 64))
     feats = make_features(raw, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=(etf or None))
     feats = feats.reset_index(drop=True)
     c = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
@@ -380,6 +393,8 @@ def logret_train(
     raw = _load_ohlcv(path)
     raw = _slice_timerange_df(raw, timerange)
     etf = [s.strip() for s in extra_timeframes.split(",") if s.strip()]
+    feature_mode = _coerce_opt(feature_mode, "full")
+    basic_lookback = int(_coerce_opt(basic_lookback, 64))
     feats = make_features(raw, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=(etf or None))
     feats = feats.reset_index(drop=True)
     close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
@@ -527,6 +542,8 @@ def meta_train(
     raw = _load_ohlcv(path)
     raw = _slice_timerange_df(raw, timerange)
     etf = [s.strip() for s in extra_timeframes.split(",") if s.strip()]
+    feature_mode = _coerce_opt(feature_mode, "full")
+    basic_lookback = int(_coerce_opt(basic_lookback, 64))
     feats = make_features(raw, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=(etf or None))
     feats = feats.reset_index(drop=True)
     T = len(feats)
