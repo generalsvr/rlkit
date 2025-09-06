@@ -209,6 +209,21 @@ class XGBStackedStrategy(IStrategy):
                     # Build a full feature matrix for AE inputs (may require more columns than union_cols)
                     full_feats = make_features(df, feature_columns=None, mode=self.feature_mode, extra_timeframes=self.extra_timeframes)
                     full_feats = full_feats.reset_index(drop=True)
+                    # Normalize TF prefixes to uppercase (e.g., 4h_ -> 4H_) to match AE manifest
+                    try:
+                        import re as _re
+                        rename_map = {}
+                        for _c in list(full_feats.columns):
+                            m = _re.match(r"^([0-9]+)([hdwHDW])_(.+)$", _c)
+                            if m:
+                                num, unit, rest = m.group(1), m.group(2), m.group(3)
+                                _new = f"{num}{unit.upper()}_{rest}"
+                                if _new != _c:
+                                    rename_map[_c] = _new
+                        if rename_map:
+                            full_feats = full_feats.rename(columns=rename_map)
+                    except Exception:
+                        pass
                     ae_df = compute_embeddings(full_feats, ae_manifest_path=self.ae_path, device=self._resolve_device(), out_col_prefix="ae", window=None)
                 feats = feats.join(ae_df, how="left")
                 if self.ae_debug:
