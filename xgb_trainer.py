@@ -992,7 +992,6 @@ def _impulse_train_impl(
     feature_mode: str,
     basic_lookback: int,
     extra_timeframes: str,
-    ae_path: str = "",
     horizon: int,
     label_mode: str,
     alpha_up: float,
@@ -1015,6 +1014,7 @@ def _impulse_train_impl(
     seed: int,
     outdir: str,
     autodownload: bool,
+    ae_path: str = "",
     # validation options
     cv_splits: int = 0,
     cv_scheme: str = "expanding",
