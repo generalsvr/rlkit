@@ -407,7 +407,12 @@ def compute_embeddings(
     W = int(window or man["window"])
     mu = np.asarray(man.get("input_mu", np.zeros(len(feat_cols))), dtype=float)
     std = np.asarray(man.get("input_std", np.ones(len(feat_cols))), dtype=float)
-    X = feats[feat_cols].astype(float).to_numpy(copy=False)
+    # Ensure all required columns exist; create missing as zeros
+    missing = [c for c in feat_cols if c not in feats.columns]
+    if missing:
+        for c in missing:
+            feats[c] = 0.0
+    X = feats.reindex(columns=feat_cols).astype(float).to_numpy(copy=False)
     Xn = (X - mu) / (std + 1e-12)
     T = Xn.shape[0]
     if T < W:

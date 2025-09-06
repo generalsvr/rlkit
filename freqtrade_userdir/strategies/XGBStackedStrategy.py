@@ -207,7 +207,8 @@ class XGBStackedStrategy(IStrategy):
                     ae_df = ae_df.reindex(index=feats.index).fillna(0.0)
                 else:
                     # Build a full feature matrix for AE inputs (may require more columns than union_cols)
-                    full_feats = make_features(df, feature_columns=None, mode=self.feature_mode, extra_timeframes=self.extra_timeframes)
+                    # Force mode='full' to ensure all engineered columns exist regardless of strategy feature_mode
+                    full_feats = make_features(df, feature_columns=None, mode='full', extra_timeframes=self.extra_timeframes)
                     full_feats = full_feats.reset_index(drop=True)
                     # Normalize TF prefixes to uppercase (e.g., 4h_ -> 4H_) to match AE manifest
                     try:
