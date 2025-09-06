@@ -77,6 +77,10 @@ def ae_train(
     raw_htf: bool = typer.Option(False, help="Train AE on raw OHLCV + multi-HTF only (no indicators)"),
     raw_extra_timeframes: str = typer.Option("4H,1D,1W", help="HTFs to include when raw_htf=True"),
     ae_cols: str = typer.Option("close,volume", help="Comma list of base columns to include (when raw_htf=True)"),
+    # Optuna
+    n_trials: int = typer.Option(0, help="If >0, run Optuna to tune AE"),
+    sampler: str = typer.Option("tpe", help="tpe|random"),
+    seed: int = typer.Option(42),
 ):
     params = AETrainParams(
         pair=str(_coerce_opt(pair, "BTC/USDT")),
@@ -101,8 +105,45 @@ def ae_train(
     params.raw_extra_timeframes = str(_coerce_opt(raw_extra_timeframes, "4H,1D,1W"))
     params.ae_cols = str(_coerce_opt(ae_cols, "close,volume"))
     os.makedirs(Path(out_path).parent, exist_ok=True)
-    meta = train_autoencoder(params)
-    typer.echo(json.dumps({"ae": meta}, indent=2))
+
+    if int(n_trials) and n_trials > 0:
+        import optuna
+        from optuna.samplers import TPESampler, RandomSampler
+        smp = RandomSampler(seed=int(seed)) if sampler.lower() == "random" else TPESampler(seed=int(seed))
+        def objective(trial: "optuna.trial.Trial") -> float:
+            trial_params = AETrainParams(**{**params.__dict__})
+            # Suggest core hypers
+            trial_params.embed_dim = int(trial.suggest_categorical("embed_dim", [8, 12, 16, 24, 32]))
+            trial_params.base_channels = int(trial.suggest_categorical("base_channels", [16, 32, 48, 64]))
+            trial_params.lr = float(trial.suggest_float("lr", 1e-4, 3e-3, log=True))
+            trial_params.weight_decay = float(trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True))
+            trial_params.batch_size = int(trial.suggest_categorical("batch_size", [128, 256, 512]))
+            trial_params.epochs = int(trial.suggest_int("epochs", 15, 50))
+            trial_params.window = int(trial.suggest_categorical("window", [96, 128, 192]))
+            # Quiet logs per trial
+            trial_params.verbose = False
+            meta = train_autoencoder(trial_params, save_manifest=False)
+            # Lower is better (val_mse)
+            return float(meta.get("val_mse", float("inf")))
+        study = optuna.create_study(direction="minimize", sampler=smp)
+        typer.echo(f"Optuna AE trials: {n_trials}")
+        study.optimize(objective, n_trials=int(n_trials))
+        best = study.best_params
+        # Train final model with best params, verbose
+        params.embed_dim = int(best.get("embed_dim", params.embed_dim))
+        params.base_channels = int(best.get("base_channels", params.base_channels))
+        params.lr = float(best.get("lr", params.lr))
+        params.weight_decay = float(best.get("weight_decay", params.weight_decay))
+        params.batch_size = int(best.get("batch_size", params.batch_size))
+        params.epochs = int(best.get("epochs", params.epochs))
+        params.window = int(best.get("window", params.window))
+        params.verbose = True
+        meta = train_autoencoder(params, save_manifest=True)
+        best_out = {"best_params": best, "val_mse": meta.get("val_mse", None)}
+        typer.echo(json.dumps({"ae": meta, **best_out}, indent=2))
+    else:
+        meta = train_autoencoder(params)
+        typer.echo(json.dumps({"ae": meta}, indent=2))
 
 
 

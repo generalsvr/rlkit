@@ -163,6 +163,9 @@ class AETrainParams:
     weight_decay: float = 1e-5
     device: str = "auto"
     out_path: str = "models/xgb_stack/ae_conv1d.json"
+    # Logging
+    verbose: bool = True
+    log_every: int = 1
 
 
 def _resolve_device(dev: str) -> torch.device:
@@ -226,7 +229,7 @@ def build_raw_multitf_features(
     return out
 
 
-def train_autoencoder(params: AETrainParams) -> Dict[str, Any]:
+def train_autoencoder(params: AETrainParams, save_manifest: bool = True) -> Dict[str, Any]:
     if not _TORCH_OK:
         raise ImportError("PyTorch required to train Autoencoder")
 
@@ -323,6 +326,11 @@ def train_autoencoder(params: AETrainParams) -> Dict[str, Any]:
                 va_loss += float(loss.detach().cpu().item())
                 nb2 += 1
         va_loss = va_loss / max(1, nb2)
+        if bool(params.verbose) and (int(params.log_every) > 0) and ((ep + 1) % int(params.log_every) == 0):
+            try:
+                print(f"[AE] epoch={ep+1}/{int(params.epochs)} train_mse={tr_loss:.6f} val_mse={va_loss:.6f}")
+            except Exception:
+                pass
         if np.isfinite(va_loss) and va_loss < best_val:
             best_val = va_loss
             best_state = {"model": model.state_dict()}
@@ -330,9 +338,7 @@ def train_autoencoder(params: AETrainParams) -> Dict[str, Any]:
     if best_state is None:
         best_state = {"model": model.state_dict()}
 
-    os.makedirs(os.path.dirname(params.out_path) or ".", exist_ok=True)
     weights_path = str(os.path.splitext(params.out_path)[0]) + ".pt"
-    torch.save(best_state, weights_path)
     meta = {
         "type": "Conv1dAE",
         "weights_path": weights_path,
@@ -348,8 +354,14 @@ def train_autoencoder(params: AETrainParams) -> Dict[str, Any]:
         "raw_extra_timeframes": [s.strip() for s in (params.raw_extra_timeframes or "").split(",") if s.strip()],
         "ae_base_cols": [s.strip() for s in (params.ae_cols or "close,volume").split(",") if s.strip()],
     }
-    with open(params.out_path, "w") as f:
-        json.dump(meta, f, indent=2)
+    if save_manifest:
+        os.makedirs(os.path.dirname(params.out_path) or ".", exist_ok=True)
+        try:
+            torch.save(best_state, weights_path)
+        except Exception:
+            pass
+        with open(params.out_path, "w") as f:
+            json.dump(meta, f, indent=2)
     return meta
 
 
