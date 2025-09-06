@@ -19,6 +19,12 @@ for _p in (str(_userdir_root), str(_project_root)):
 
 from rl_lib.features import make_features
 from rl_lib.meta import load_meta_mlp_from_json
+try:
+    # Optional AE embeddings
+    from rl_lib.autoencoder import compute_embeddings, compute_embeddings_from_raw
+    _AE_OK = True
+except Exception:
+    _AE_OK = False
 
 
 class XGBStackedStrategy(IStrategy):
@@ -58,6 +64,10 @@ class XGBStackedStrategy(IStrategy):
         self.logret_dir_thr = float(os.environ.get("LOGRET_DIR_THR", "0.0"))
         self.p_up_thr = float(os.environ.get("XGB_P_UP_THR", os.environ.get("XGB_P_BUY_THR", str(self.p_buy_thr))))
         self.p_dn_thr = float(os.environ.get("XGB_P_DN_THR", os.environ.get("XGB_P_SELL_THR", str(self.p_sell_thr))))
+
+        # Optional AE manifest for embeddings
+        self.ae_path = os.environ.get("XGB_AE_PATH", "").strip()
+        self._ae_manifest: Optional[dict] = None
 
         # Lazy loaded models
         self._bot = None
@@ -182,6 +192,24 @@ class XGBStackedStrategy(IStrategy):
                             union_cols.append(c)
         feats = make_features(df, feature_columns=union_cols, mode=self.feature_mode, extra_timeframes=self.extra_timeframes)
         feats = feats.reset_index(drop=True)
+
+        # Append AE embeddings if configured
+        if self.ae_path and _AE_OK:
+            try:
+                import json as _json
+                if self._ae_manifest is None:
+                    with open(self.ae_path, 'r') as f:
+                        self._ae_manifest = _json.load(f)
+                man = self._ae_manifest or {}
+                if bool(man.get("raw_htf", False)):
+                    ae_df = compute_embeddings_from_raw(df, ae_manifest_path=self.ae_path, device=self._resolve_device(), out_col_prefix="ae")
+                    ae_df = ae_df.reindex(index=feats.index).fillna(0.0)
+                else:
+                    ae_df = compute_embeddings(feats, ae_manifest_path=self.ae_path, device=self._resolve_device(), out_col_prefix="ae", window=None)
+                feats = feats.join(ae_df, how="left")
+            except Exception:
+                # Fail silent if AE unavailable
+                pass
 
         # Predict L0 outputs
         p_bottom = None
