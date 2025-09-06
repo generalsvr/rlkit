@@ -68,6 +68,7 @@ class XGBStackedStrategy(IStrategy):
         # Optional AE manifest for embeddings
         self.ae_path = os.environ.get("XGB_AE_PATH", "").strip()
         self._ae_manifest: Optional[dict] = None
+        self.ae_debug = bool(int(os.environ.get("XGB_AE_DEBUG", "0") or "0"))
 
         # Lazy loaded models
         self._bot = None
@@ -205,11 +206,26 @@ class XGBStackedStrategy(IStrategy):
                     ae_df = compute_embeddings_from_raw(df, ae_manifest_path=self.ae_path, device=self._resolve_device(), out_col_prefix="ae")
                     ae_df = ae_df.reindex(index=feats.index).fillna(0.0)
                 else:
-                    ae_df = compute_embeddings(feats, ae_manifest_path=self.ae_path, device=self._resolve_device(), out_col_prefix="ae", window=None)
+                    # Build a full feature matrix for AE inputs (may require more columns than union_cols)
+                    full_feats = make_features(df, feature_columns=None, mode=self.feature_mode, extra_timeframes=self.extra_timeframes)
+                    full_feats = full_feats.reset_index(drop=True)
+                    ae_df = compute_embeddings(full_feats, ae_manifest_path=self.ae_path, device=self._resolve_device(), out_col_prefix="ae", window=None)
                 feats = feats.join(ae_df, how="left")
-            except Exception:
+                if self.ae_debug:
+                    try:
+                        import numpy as _np
+                        ae_cols = [c for c in feats.columns if c.startswith("ae_")]
+                        nz = int(_np.sum(_np.any(feats[ae_cols].to_numpy() != 0.0, axis=1))) if ae_cols else 0
+                        print(f"[XGBStackedStrategy] AE applied: cols={len(ae_cols)} nonzero_rows={nz}/{len(feats)}")
+                    except Exception:
+                        pass
+            except Exception as e:
                 # Fail silent if AE unavailable
-                pass
+                if self.ae_debug:
+                    try:
+                        print(f"[XGBStackedStrategy] AE failed: {e}")
+                    except Exception:
+                        pass
 
         # Predict L0 outputs
         p_bottom = None
