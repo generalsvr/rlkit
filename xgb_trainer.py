@@ -65,13 +65,13 @@ def ae_train(
     feature_mode: str = typer.Option("full"),
     basic_lookback: int = typer.Option(64),
     extra_timeframes: str = typer.Option("4H,1D,1W"),
-    window: int = typer.Option(128),
-    embed_dim: int = typer.Option(16),
+    window: int = typer.Option(192),
+    embed_dim: int = typer.Option(32),
     base_channels: int = typer.Option(32),
-    batch_size: int = typer.Option(256),
-    epochs: int = typer.Option(40),
-    lr: float = typer.Option(1e-3),
-    weight_decay: float = typer.Option(1e-5),
+    batch_size: int = typer.Option(128),
+    epochs: int = typer.Option(47),
+    lr: float = typer.Option(1.4433402406338895e-4),
+    weight_decay: float = typer.Option(1.2424747083660194e-6),
     device: str = typer.Option("auto"),
     out_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "ae_conv1d.json")),
     raw_htf: bool = typer.Option(False, help="Train AE on raw OHLCV + multi-HTF only (no indicators)"),
@@ -692,7 +692,7 @@ def topbot_train(
                 ae_df = compute_embeddings_from_raw(raw, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae")
                 ae_df = ae_df.reindex(index=feats.index).fillna(0.0)
             else:
-                ae_df = compute_embeddings(feats, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae", window=int(basic_lookback) if int(basic_lookback) > 0 else 128)
+                ae_df = compute_embeddings(feats, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae", window=None)
             feats = feats.join(ae_df, how="left")
         except Exception as e:
             typer.echo(f"AE embeddings failed (TopBot), proceeding without: {e}")
@@ -916,7 +916,7 @@ def logret_train(
                 ae_df = compute_embeddings_from_raw(raw, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae")
                 ae_df = ae_df.reindex(index=feats.index).fillna(0.0)
             else:
-                ae_df = compute_embeddings(feats, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae", window=int(basic_lookback) if int(basic_lookback) > 0 else 128)
+                ae_df = compute_embeddings(feats, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae", window=None)
             feats = feats.join(ae_df, how="left")
         except Exception as e:
             typer.echo(f"AE embeddings failed (Logret), proceeding without: {e}")
@@ -1438,7 +1438,7 @@ def meta_train(
                 ae_df = compute_embeddings_from_raw(raw, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae")
                 ae_df = ae_df.reindex(index=feats.index).fillna(0.0)
             else:
-                ae_df = compute_embeddings(feats, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae", window=int(basic_lookback) if int(basic_lookback) > 0 else 128)
+                ae_df = compute_embeddings(feats, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae", window=None)
             feats = feats.join(ae_df, how="left")
         except Exception as e:
             typer.echo(f"AE embeddings failed (Meta), proceeding without: {e}")
@@ -1855,16 +1855,14 @@ def train_all(
                 feature_mode="full",
                 basic_lookback=64,
                 extra_timeframes="4H,1D,1W",
-                raw_htf=True,
-                raw_extra_timeframes="4H,1D,1W",
-                ae_cols="close,volume",
-                window=128,
-                embed_dim=16,
+                raw_htf=False,
+                window=192,
+                embed_dim=32,
                 base_channels=32,
-                batch_size=256,
-                epochs=30,
-                lr=1e-3,
-                weight_decay=1e-5,
+                batch_size=128,
+                epochs=47,
+                lr=1.4433402406338895e-4,
+                weight_decay=1.2424747083660194e-6,
                 device="auto",
                 out_path=str(ae_out),
             )
