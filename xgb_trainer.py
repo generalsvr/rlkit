@@ -26,7 +26,7 @@ import typer
 from rl_lib.train_sb3 import _find_data_file, _load_ohlcv, _slice_timerange_df
 from rl_lib.features import make_features
 from rl_lib.meta import triple_barrier_labels, train_meta_mlp_manager
-from rl_lib.autoencoder import AETrainParams, train_autoencoder, compute_embeddings
+from rl_lib.autoencoder import AETrainParams, train_autoencoder, compute_embeddings, compute_embeddings_from_raw
 
 
 app = typer.Typer(add_completion=False)
@@ -74,6 +74,9 @@ def ae_train(
     weight_decay: float = typer.Option(1e-5),
     device: str = typer.Option("auto"),
     out_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "ae_conv1d.json")),
+    raw_htf: bool = typer.Option(False, help="Train AE on raw OHLCV + multi-HTF only (no indicators)"),
+    raw_extra_timeframes: str = typer.Option("4H,1D,1W", help="HTFs to include when raw_htf=True"),
+    ae_cols: str = typer.Option("close,volume", help="Comma list of base columns to include (when raw_htf=True)"),
 ):
     params = AETrainParams(
         pair=str(_coerce_opt(pair, "BTC/USDT")),
@@ -94,6 +97,9 @@ def ae_train(
         device=str(_coerce_opt(device, "auto")),
         out_path=str(_coerce_opt(out_path, out_path)),
     )
+    params.raw_htf = bool(_coerce_opt(raw_htf, False))
+    params.raw_extra_timeframes = str(_coerce_opt(raw_extra_timeframes, "4H,1D,1W"))
+    params.ae_cols = str(_coerce_opt(ae_cols, "close,volume"))
     os.makedirs(Path(out_path).parent, exist_ok=True)
     meta = train_autoencoder(params)
     typer.echo(json.dumps({"ae": meta}, indent=2))
@@ -637,7 +643,15 @@ def topbot_train(
     feats = feats.reset_index(drop=True)
     if str(ae_path).strip():
         try:
-            ae_df = compute_embeddings(feats, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae", window=int(basic_lookback) if int(basic_lookback) > 0 else 128)
+            # Detect if AE was trained in raw_htf mode by reading manifest keys
+            import json as _json
+            with open(ae_path, "r") as _f:
+                _man = _json.load(_f)
+            if bool(_man.get("raw_htf", False)):
+                ae_df = compute_embeddings_from_raw(raw, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae")
+                ae_df = ae_df.reindex(index=feats.index).fillna(0.0)
+            else:
+                ae_df = compute_embeddings(feats, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae", window=int(basic_lookback) if int(basic_lookback) > 0 else 128)
             feats = feats.join(ae_df, how="left")
         except Exception as e:
             typer.echo(f"AE embeddings failed (TopBot), proceeding without: {e}")
@@ -854,7 +868,14 @@ def logret_train(
     feats = feats.reset_index(drop=True)
     if str(ae_path).strip():
         try:
-            ae_df = compute_embeddings(feats, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae", window=int(basic_lookback) if int(basic_lookback) > 0 else 128)
+            import json as _json
+            with open(ae_path, "r") as _f:
+                _man = _json.load(_f)
+            if bool(_man.get("raw_htf", False)):
+                ae_df = compute_embeddings_from_raw(raw, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae")
+                ae_df = ae_df.reindex(index=feats.index).fillna(0.0)
+            else:
+                ae_df = compute_embeddings(feats, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae", window=int(basic_lookback) if int(basic_lookback) > 0 else 128)
             feats = feats.join(ae_df, how="left")
         except Exception as e:
             typer.echo(f"AE embeddings failed (Logret), proceeding without: {e}")
@@ -1369,7 +1390,14 @@ def meta_train(
     feats = feats.reset_index(drop=True)
     if str(ae_path).strip():
         try:
-            ae_df = compute_embeddings(feats, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae", window=int(basic_lookback) if int(basic_lookback) > 0 else 128)
+            import json as _json
+            with open(ae_path, "r") as _f:
+                _man = _json.load(_f)
+            if bool(_man.get("raw_htf", False)):
+                ae_df = compute_embeddings_from_raw(raw, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae")
+                ae_df = ae_df.reindex(index=feats.index).fillna(0.0)
+            else:
+                ae_df = compute_embeddings(feats, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae", window=int(basic_lookback) if int(basic_lookback) > 0 else 128)
             feats = feats.join(ae_df, how="left")
         except Exception as e:
             typer.echo(f"AE embeddings failed (Meta), proceeding without: {e}")
@@ -1786,6 +1814,9 @@ def train_all(
                 feature_mode="full",
                 basic_lookback=64,
                 extra_timeframes="4H,1D,1W",
+                raw_htf=True,
+                raw_extra_timeframes="4H,1D,1W",
+                ae_cols="close,volume",
                 window=128,
                 embed_dim=16,
                 base_channels=32,
