@@ -150,6 +150,10 @@ class AETrainParams:
     feature_mode: str = "full"
     basic_lookback: int = 64
     extra_timeframes: str = "4H,1D,1W"
+    # Raw multi-HTF mode (no indicators): if True, build inputs from raw OHLCV resampled across TFs
+    raw_htf: bool = False
+    raw_extra_timeframes: str = "4H,1D,1W"
+    ae_cols: str = "close,volume"  # which base columns to include across TFs
     window: int = 128
     embed_dim: int = 16
     base_channels: int = 32
@@ -167,6 +171,61 @@ def _resolve_device(dev: str) -> torch.device:
     return torch.device("cpu")
 
 
+def build_raw_multitf_features(
+    df: pd.DataFrame,
+    extra_timeframes: Optional[List[str]] = None,
+    base_cols: Optional[List[str]] = None,
+) -> pd.DataFrame:
+    """
+    Build a raw OHLCV + HTF OHLCV matrix aligned to base index. No indicators.
+    Columns:
+      base: 'open','high','low','close','volume' (subset selectable via base_cols)
+      for each TF in extra_timeframes: 'TF_open','TF_high','TF_low','TF_close','TF_volume'
+    """
+    if base_cols is None:
+        base_cols = ["open","high","low","close","volume"]
+    base = df[[c for c in ["open","high","low","close","volume"] if c in df.columns]].copy()
+    base = base.astype(float)
+    out = pd.DataFrame(index=base.index)
+    for c in base_cols:
+        if c in base.columns:
+            out[c] = base[c].values
+        else:
+            out[c] = 0.0
+    if extra_timeframes:
+        if isinstance(base.index, pd.DatetimeIndex):
+            for tf in extra_timeframes:
+                tfs = str(tf).upper()
+                # Pandas alias normalization: H expects lowercase
+                resample_tf = tfs[:-1] + 'h' if tfs.endswith('H') else tfs
+                try:
+                    agg = {
+                        "open": "first",
+                        "high": "max",
+                        "low": "min",
+                        "close": "last",
+                        "volume": "sum",
+                    }
+                    res = base.resample(resample_tf).agg(agg).dropna(how="all")
+                    res_aligned = res.reindex(base.index).ffill().fillna(0.0)
+                    for c in ["open","high","low","close","volume"]:
+                        nm = f"{tfs}_{c}"
+                        if c in res_aligned.columns:
+                            out[nm] = res_aligned[c].astype(float).values
+                        else:
+                            out[nm] = 0.0
+                except Exception:
+                    # Skip TF on failure
+                    for c in ["open","high","low","close","volume"]:
+                        out[f"{tfs}_{c}"] = 0.0
+        else:
+            # Non-datetime index; only base available
+            pass
+    # Sanitize
+    out = out.replace([np.inf,-np.inf], np.nan).fillna(0.0)
+    return out
+
+
 def train_autoencoder(params: AETrainParams) -> Dict[str, Any]:
     if not _TORCH_OK:
         raise ImportError("PyTorch required to train Autoencoder")
@@ -176,17 +235,38 @@ def train_autoencoder(params: AETrainParams) -> Dict[str, Any]:
         raise FileNotFoundError("Dataset not found. Download via Freqtrade.")
     raw = _load_ohlcv(path)
     raw = _slice_timerange_df(raw, params.timerange)
-    etf = [s.strip() for s in (params.extra_timeframes or "").split(",") if s.strip()]
-    feats = make_features(
-        raw,
-        mode=(params.feature_mode or "full"),
-        basic_lookback=int(params.basic_lookback),
-        extra_timeframes=(etf or None),
-    ).reset_index(drop=True)
-
-    # Choose numeric feature columns excluding raw OHLCV to avoid trivial recon? Keep all for generality.
-    feature_cols = [c for c in feats.columns if pd.api.types.is_numeric_dtype(feats[c])]
-    ds = SequenceDataset(feats, window=int(params.window), feature_columns=feature_cols)
+    # Build feature matrix per mode
+    if bool(params.raw_htf):
+        etf = [s.strip() for s in (params.raw_extra_timeframes or "").split(",") if s.strip()]
+        base_cols = [s.strip() for s in (params.ae_cols or "close,volume").split(",") if s.strip()]
+        feats = build_raw_multitf_features(raw, extra_timeframes=etf, base_cols=base_cols)
+        feats = feats.reset_index(drop=True)
+        # Select training columns: base_cols + TF-prefixed for those columns
+        feature_cols = []
+        for c in base_cols:
+            if c in feats.columns:
+                feature_cols.append(c)
+        for tf in etf:
+            tfs = str(tf).upper()
+            for c in ["open","high","low","close","volume"]:
+                if c in base_cols:
+                    nm = f"{tfs}_{c}"
+                    if nm in feats.columns:
+                        feature_cols.append(nm)
+        if not feature_cols:
+            feature_cols = list(feats.columns)
+        ds = SequenceDataset(feats, window=int(params.window), feature_columns=feature_cols)
+    else:
+        etf = [s.strip() for s in (params.extra_timeframes or "").split(",") if s.strip()]
+        feats = make_features(
+            raw,
+            mode=(params.feature_mode or "full"),
+            basic_lookback=int(params.basic_lookback),
+            extra_timeframes=(etf or None),
+        ).reset_index(drop=True)
+        # Choose numeric feature columns
+        feature_cols = [c for c in feats.columns if pd.api.types.is_numeric_dtype(feats[c])]
+        ds = SequenceDataset(feats, window=int(params.window), feature_columns=feature_cols)
 
     # Train/val split by time
     n = len(ds)
@@ -264,6 +344,9 @@ def train_autoencoder(params: AETrainParams) -> Dict[str, Any]:
         "input_std": ds.std.tolist(),
         "val_mse": float(best_val),
         "train_params": asdict(params),
+        "raw_htf": bool(params.raw_htf),
+        "raw_extra_timeframes": [s.strip() for s in (params.raw_extra_timeframes or "").split(",") if s.strip()],
+        "ae_base_cols": [s.strip() for s in (params.ae_cols or "close,volume").split(",") if s.strip()],
     }
     with open(params.out_path, "w") as f:
         json.dump(meta, f, indent=2)
@@ -348,5 +431,27 @@ def compute_embeddings(
     cols = [f"{out_col_prefix}_{i}" for i in range(Z_full.shape[1])]
     out = pd.DataFrame(Z_full, index=feats.index, columns=cols)
     return out
+
+
+def compute_embeddings_from_raw(
+    raw: pd.DataFrame,
+    ae_manifest_path: str,
+    device: str = "auto",
+    out_col_prefix: str = "ae",
+) -> pd.DataFrame:
+    """
+    Compute embeddings using raw multi-HTF OHLCV per AE manifest. No indicators.
+    """
+    if not _TORCH_OK:
+        raise ImportError("PyTorch required for embeddings")
+    model, man = load_autoencoder(ae_manifest_path, device=device)
+    etf = list(man.get("raw_extra_timeframes", []))
+    base_cols = list(man.get("ae_base_cols", ["close","volume"]))
+    feats = build_raw_multitf_features(raw, extra_timeframes=etf, base_cols=base_cols)
+    # Ensure we select exactly the trained columns
+    feat_cols = list(man.get("feature_columns", list(feats.columns)))
+    feats = feats.reindex(columns=feat_cols)
+    # Now reuse compute_embeddings logic by passing constructed feats
+    return compute_embeddings(feats, ae_manifest_path, device=device, out_col_prefix=out_col_prefix, window=None)
 
 
