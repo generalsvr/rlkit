@@ -226,7 +226,14 @@ class XGBStackedStrategy(IStrategy):
                     except Exception:
                         pass
                     ae_df = compute_embeddings(full_feats, ae_manifest_path=self.ae_path, device=self._resolve_device(), out_col_prefix="ae", window=None)
-                feats = feats.join(ae_df, how="left")
+                    ae_df = ae_df.reindex(index=feats.index).fillna(0.0)
+                # Overwrite/assign AE columns to avoid overlap issues
+                try:
+                    for _c in ae_df.columns:
+                        feats[_c] = ae_df[_c].astype(float).values
+                except Exception:
+                    # fallback join if assignment fails
+                    feats = feats.drop(columns=[c for c in ae_df.columns if c in feats.columns], errors='ignore').join(ae_df, how='left')
                 if self.ae_debug:
                     try:
                         import numpy as _np
