@@ -26,6 +26,7 @@ import typer
 from rl_lib.train_sb3 import _find_data_file, _load_ohlcv, _slice_timerange_df
 from rl_lib.features import make_features
 from rl_lib.meta import triple_barrier_labels, train_meta_mlp_manager
+from rl_lib.autoencoder import AETrainParams, train_autoencoder, compute_embeddings
 
 
 app = typer.Typer(add_completion=False)
@@ -54,6 +55,49 @@ def _coerce_opt(value: Any, default: Any):
     except Exception:
         pass
     return value
+@app.command("ae-train")
+def ae_train(
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    timerange: str = typer.Option("20190101-"),
+    prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("4H,1D,1W"),
+    window: int = typer.Option(128),
+    embed_dim: int = typer.Option(16),
+    base_channels: int = typer.Option(32),
+    batch_size: int = typer.Option(256),
+    epochs: int = typer.Option(40),
+    lr: float = typer.Option(1e-3),
+    weight_decay: float = typer.Option(1e-5),
+    device: str = typer.Option("auto"),
+    out_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "ae_conv1d.json")),
+):
+    params = AETrainParams(
+        pair=str(_coerce_opt(pair, "BTC/USDT")),
+        timeframe=str(_coerce_opt(timeframe, "1h")),
+        userdir=str(_coerce_opt(userdir, str(Path(__file__).resolve().parent / "freqtrade_userdir"))),
+        timerange=str(_coerce_opt(timerange, "20190101-")),
+        prefer_exchange=str(_coerce_opt(prefer_exchange, "bybit")),
+        feature_mode=str(_coerce_opt(feature_mode, "full")),
+        basic_lookback=int(_coerce_opt(basic_lookback, 64)),
+        extra_timeframes=str(_coerce_opt(extra_timeframes, "4H,1D,1W")),
+        window=int(_coerce_opt(window, 128)),
+        embed_dim=int(_coerce_opt(embed_dim, 16)),
+        base_channels=int(_coerce_opt(base_channels, 32)),
+        batch_size=int(_coerce_opt(batch_size, 256)),
+        epochs=int(_coerce_opt(epochs, 40)),
+        lr=float(_coerce_opt(lr, 1e-3)),
+        weight_decay=float(_coerce_opt(weight_decay, 1e-5)),
+        device=str(_coerce_opt(device, "auto")),
+        out_path=str(_coerce_opt(out_path, out_path)),
+    )
+    os.makedirs(Path(out_path).parent, exist_ok=True)
+    meta = train_autoencoder(params)
+    typer.echo(json.dumps({"ae": meta}, indent=2))
+
 
 
 def _label_pivots(close: np.ndarray, left: int, right: int, min_gap: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -527,6 +571,7 @@ def topbot_train(
     feature_mode: str = typer.Option("full"),
     basic_lookback: int = typer.Option(64),
     extra_timeframes: str = typer.Option("4H,1D,1W", help="Optional comma-separated HTFs e.g. '4H,1D,1W'"),
+    ae_path: str = typer.Option("", help="Optional path to AE manifest (.json) to append embeddings"),
     left_bars: int = typer.Option(3),
     right_bars: int = typer.Option(3),
     min_gap_bars: int = typer.Option(4),
@@ -590,6 +635,12 @@ def topbot_train(
     device = str(_coerce_opt(device, "auto"))
     feats = make_features(raw, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=(etf or None))
     feats = feats.reset_index(drop=True)
+    if str(ae_path).strip():
+        try:
+            ae_df = compute_embeddings(feats, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae", window=int(basic_lookback) if int(basic_lookback) > 0 else 128)
+            feats = feats.join(ae_df, how="left")
+        except Exception as e:
+            typer.echo(f"AE embeddings failed (TopBot), proceeding without: {e}")
     c = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
     yb, yt = _label_pivots(c, int(left_bars), int(right_bars), int(min_gap_bars))
     # Split
@@ -743,6 +794,7 @@ def logret_train(
     feature_mode: str = typer.Option("full"),
     basic_lookback: int = typer.Option(64),
     extra_timeframes: str = typer.Option("4H,1D,1W", help="Optional comma-separated HTFs e.g. '4H,1D,1W'"),
+    ae_path: str = typer.Option("", help="Optional path to AE manifest (.json) to append embeddings"),
     horizon: int = typer.Option(1, help="Forward bars for return aggregation"),
     strong_mult: float = typer.Option(1.5, help="Threshold multiplier for strong moves vs ATR"),
     device: str = typer.Option("auto"),
@@ -800,6 +852,12 @@ def logret_train(
     strong_mult = float(_coerce_opt(strong_mult, 1.5))
     feats = make_features(raw, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=(etf or None))
     feats = feats.reset_index(drop=True)
+    if str(ae_path).strip():
+        try:
+            ae_df = compute_embeddings(feats, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae", window=int(basic_lookback) if int(basic_lookback) > 0 else 128)
+            feats = feats.join(ae_df, how="left")
+        except Exception as e:
+            typer.echo(f"AE embeddings failed (Logret), proceeding without: {e}")
     close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
     logp = np.log(close + 1e-12)
     H = int(max(1, horizon))
@@ -934,6 +992,7 @@ def _impulse_train_impl(
     feature_mode: str,
     basic_lookback: int,
     extra_timeframes: str,
+    ae_path: str = "",
     horizon: int,
     label_mode: str,
     alpha_up: float,
@@ -1002,6 +1061,12 @@ def _impulse_train_impl(
 
     feats = make_features(raw, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=(etf or None))
     feats = feats.reset_index(drop=True)
+    if str(ae_path).strip():
+        try:
+            ae_df = compute_embeddings(feats, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae", window=int(basic_lookback) if int(basic_lookback) > 0 else 128)
+            feats = feats.join(ae_df, how="left")
+        except Exception as e:
+            typer.echo(f"AE embeddings failed (Impulse), proceeding without: {e}")
     close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
     logp_s = pd.Series(np.log(close + 1e-12), index=feats.index)
     T = len(feats)
@@ -1153,6 +1218,7 @@ def impulse_train_cmd(
     feature_mode: str = typer.Option("full"),
     basic_lookback: int = typer.Option(64),
     extra_timeframes: str = typer.Option("4H,1D,1W"),
+    ae_path: str = typer.Option(""),
     horizon: int = typer.Option(8),
     label_mode: str = typer.Option("vol", help="vol|abs"),
     alpha_up: float = typer.Option(2.0),
@@ -1194,6 +1260,7 @@ def impulse_train_cmd_dash(
     feature_mode: str = typer.Option("full"),
     basic_lookback: int = typer.Option(64),
     extra_timeframes: str = typer.Option("4H,1D,1W"),
+    ae_path: str = typer.Option(""),
     horizon: int = typer.Option(8),
     label_mode: str = typer.Option("vol", help="vol|abs"),
     alpha_up: float = typer.Option(2.0),
@@ -1254,6 +1321,7 @@ def meta_train(
     bot_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_topbot_bottom.json")),
     top_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_topbot_top.json")),
     logret_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_logret.json")),
+    ae_path: str = typer.Option("", help="Optional AE manifest to append embeddings to meta inputs"),
     # Signal thresholds
     p_buy_thr: float = typer.Option(0.6),
     p_sell_thr: float = typer.Option(0.6),
@@ -1299,6 +1367,12 @@ def meta_train(
     device = str(_coerce_opt(device, "auto"))
     feats = make_features(raw, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=(etf or None))
     feats = feats.reset_index(drop=True)
+    if str(ae_path).strip():
+        try:
+            ae_df = compute_embeddings(feats, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae", window=int(basic_lookback) if int(basic_lookback) > 0 else 128)
+            feats = feats.join(ae_df, how="left")
+        except Exception as e:
+            typer.echo(f"AE embeddings failed (Meta), proceeding without: {e}")
     T = len(feats)
 
     # Load TopBot models and predict probabilities
@@ -1683,6 +1757,8 @@ def train_all(
     prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
     optuna_trials: int = typer.Option(40, "--optuna-trials", "--optuna_trials", help="Trials for Optuna when tuning XGB models"),
+    ae_enable: bool = typer.Option(False, help="If true, train AE and include embeddings"),
+    ae_out: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "ae_conv1d.json"), help="AE manifest output path"),
     # global validation flags passed into sub-trainers
     cv_splits: int = typer.Option(0, help="If >0, run time-aware CV in sub-trainers"),
     cv_scheme: str = typer.Option("expanding"),
@@ -1697,6 +1773,34 @@ def train_all(
             _ensure_dataset(userdir, pair, tf, prefer_exchange, timerange)
         except Exception as e:
             typer.echo(f"Auto-download failed for {pair} {tf}: {e}")
+    # Optional: Train AE
+    ae_path_used = ""
+    if bool(ae_enable):
+        try:
+            params = AETrainParams(
+                pair=pair,
+                timeframe=timeframe,
+                userdir=userdir,
+                timerange=timerange,
+                prefer_exchange=prefer_exchange,
+                feature_mode="full",
+                basic_lookback=64,
+                extra_timeframes="4H,1D,1W",
+                window=128,
+                embed_dim=16,
+                base_channels=32,
+                batch_size=256,
+                epochs=30,
+                lr=1e-3,
+                weight_decay=1e-5,
+                device="auto",
+                out_path=str(ae_out),
+            )
+            _ = train_autoencoder(params)
+            ae_path_used = str(ae_out)
+        except Exception as e:
+            typer.echo(f"AE training failed, continuing without embeddings: {e}")
+
     # Train TopBot with Optuna
     topbot_train(
         pair=pair,
@@ -1712,6 +1816,7 @@ def train_all(
         cv_scheme=str(cv_scheme),
         cv_val_size=int(cv_val_size),
         perm_test=int(perm_test),
+        ae_path=ae_path_used,
     )
     # Train Logret with Optuna
     logret_train(
@@ -1728,6 +1833,7 @@ def train_all(
         cv_scheme=str(cv_scheme),
         cv_val_size=int(cv_val_size),
         perm_test=int(perm_test),
+        ae_path=ae_path_used,
     )
     # Train Impulse with Optuna
     try:
@@ -1745,6 +1851,7 @@ def train_all(
             cv_scheme=str(cv_scheme),
             cv_val_size=int(cv_val_size),
             perm_test=int(perm_test),
+            ae_path=ae_path_used,
         )
     except Exception as e:
         typer.echo(f"Impulse training skipped/failed: {e}")
@@ -1758,6 +1865,7 @@ def train_all(
         extra_timeframes="4H,1D,1W",
         outdir=outdir,
         autodownload=False,
+        ae_path=ae_path_used,
     )
     # Generate evaluation charts bundle
     try:
