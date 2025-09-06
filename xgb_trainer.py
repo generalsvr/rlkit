@@ -1398,6 +1398,9 @@ def meta_train(
     device: str = typer.Option("auto"),
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
     autodownload: bool = typer.Option(True),
+    # New: train meta on full engineered features too (in addition to L0 outputs)
+    use_all_features: bool = typer.Option(False, help="If true, append all engineered features to L1 inputs"),
+    meta_hidden: str = typer.Option("256,128,64", help="Comma-separated hidden sizes for Meta MLP"),
 ):
     if autodownload:
         _ = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange)
@@ -1475,6 +1478,16 @@ def meta_train(
         "logret_p_2": pr[:, 4],
     }, index=feats.index)
 
+    # Optionally append all engineered features to L1 inputs
+    if bool(use_all_features):
+        try:
+            # Avoid column name collisions by only adding missing
+            for c in list(feats.columns):
+                if c not in l0.columns:
+                    l0[c] = feats[c].astype(float).values
+        except Exception as e:
+            typer.echo(f"Warning: use_all_features failed, proceeding with L0 only: {e}")
+
     # Build meta dataset using triple-barrier on primary signals
     close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
     high = feats["high"].astype(float).to_numpy() if "high" in feats.columns else raw["high"].astype(float).to_numpy()
@@ -1514,7 +1527,14 @@ def meta_train(
 
     os.makedirs(outdir, exist_ok=True)
     out_json = os.path.join(outdir, "best_meta.json")
-    res = train_meta_mlp_manager(X_meta, y_meta, out_json_path=_ensure_outdir(out_json), epochs=int(epochs), lr=float(lr), batch_size=int(batch_size), device=device)
+    # Parse meta_hidden
+    try:
+        hid = [int(x.strip()) for x in str(meta_hidden).split(',') if x.strip()]
+        if not hid:
+            hid = [256, 128, 64]
+    except Exception:
+        hid = [256, 128, 64]
+    res = train_meta_mlp_manager(X_meta, y_meta, out_json_path=_ensure_outdir(out_json), hidden=hid, epochs=int(epochs), lr=float(lr), batch_size=int(batch_size), device=device)
     typer.echo(json.dumps(res, indent=2))
 
 
@@ -1937,6 +1957,35 @@ def train_all(
         autodownload=False,
         ae_path=ae_path_used,
     )
+    # Train Meta (L0-only)
+    meta_train(
+        pair=pair,
+        timeframe=timeframe,
+        userdir=userdir,
+        timerange=timerange,
+        prefer_exchange=prefer_exchange,
+        extra_timeframes="4H,1D,1W",
+        outdir=outdir,
+        autodownload=False,
+        use_all_features=False,
+        meta_hidden="256,128,64",
+    )
+    # Train Meta (L0 + all engineered features) for comparison
+    try:
+        meta_train(
+            pair=pair,
+            timeframe=timeframe,
+            userdir=userdir,
+            timerange=timerange,
+            prefer_exchange=prefer_exchange,
+            extra_timeframes="4H,1D,1W",
+            outdir=outdir,
+            autodownload=False,
+            use_all_features=True,
+            meta_hidden="512,256,128,64",
+        )
+    except Exception as e:
+        typer.echo(f"Full-feature meta training failed: {e}")
     # Generate evaluation charts bundle
     try:
         bundle_root = _ts_outdir(str(Path(__file__).resolve().parent / "plot" / "xgb_eval"), prefix="bundle")
