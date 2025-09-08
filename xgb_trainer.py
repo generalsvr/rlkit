@@ -1369,6 +1369,232 @@ def _load_xgb(path: str, device: str = "auto") -> Tuple[Any, Optional[List[str]]
     return clf, cols
 
 
+# -----------------------------
+# Trend Change (within horizon) trainer
+# -----------------------------
+
+def _label_trend_change_within_horizon(y_top: np.ndarray, y_bot: np.ndarray, horizon: int) -> np.ndarray:
+    T = int(len(y_top))
+    H = int(max(1, horizon))
+    y = np.zeros(T, dtype=int)
+    # Binary label: 1 if any pivot (top/bottom) occurs in (t, t+H]
+    for t in range(T):
+        r1 = t + 1
+        r2 = min(T, t + H + 1)
+        if r1 < r2:
+            if int(np.any(y_top[r1:r2] == 1)) or int(np.any(y_bot[r1:r2] == 1)):
+                y[t] = 1
+    return y
+
+
+@app.command("trendchange-train")
+def trendchange_train(
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    timerange: str = typer.Option("20190101-"),
+    prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("4H,1D,1W"),
+    ae_path: str = typer.Option("", help="Optional path to AE manifest (.json) to append embeddings"),
+    # Labeling options
+    left_bars: int = typer.Option(3),
+    right_bars: int = typer.Option(3),
+    min_gap_bars: int = typer.Option(4),
+    horizon: int = typer.Option(8, help="Bars ahead to look for first pivot (trend change)"),
+    # XGB
+    device: str = typer.Option("auto"),
+    n_estimators: int = typer.Option(600),
+    max_depth: int = typer.Option(6),
+    min_child_weight: float = typer.Option(1.0),
+    learning_rate: float = typer.Option(0.05),
+    subsample: float = typer.Option(0.8),
+    colsample_bytree: float = typer.Option(0.8),
+    reg_alpha: float = typer.Option(0.0),
+    reg_lambda: float = typer.Option(1.0),
+    n_jobs: int = typer.Option(0),
+    # Tuning
+    n_trials: int = typer.Option(0, "--n-trials", "--n_trials", help="If >0, run Optuna tuning"),
+    sampler: str = typer.Option("tpe", help="tpe|random"),
+    seed: int = typer.Option(42),
+    # IO
+    outdir: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack")),
+    autodownload: bool = typer.Option(True),
+    # validation options
+    cv_splits: int = typer.Option(0, help="If >0, run time-aware CV with given splits"),
+    cv_scheme: str = typer.Option("expanding", help="expanding|rolling"),
+    cv_val_size: int = typer.Option(2000, help="Validation fold size (bars)"),
+    perm_test: int = typer.Option(0, help="If >0, run permutation test with N shuffles"),
+):
+    if autodownload:
+        _ = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange)
+        for tf in ["4h", "1d", "1w"]:
+            try:
+                _ensure_dataset(userdir, pair, tf, prefer_exchange, timerange)
+            except Exception:
+                pass
+    path = _find_data_file(userdir, pair, timeframe, prefer_exchange=prefer_exchange)
+    if not path:
+        raise FileNotFoundError("Dataset not found. Run download first.")
+    raw = _load_ohlcv(path)
+    raw = _slice_timerange_df(raw, timerange)
+    etf = [s.strip() for s in extra_timeframes.split(",") if s.strip()]
+
+    # Coerce
+    feature_mode = _coerce_opt(feature_mode, "full")
+    basic_lookback = int(_coerce_opt(basic_lookback, 64))
+    left_bars = int(_coerce_opt(left_bars, 3))
+    right_bars = int(_coerce_opt(right_bars, 3))
+    min_gap_bars = int(_coerce_opt(min_gap_bars, 4))
+    horizon = int(_coerce_opt(horizon, 8))
+    device = str(_coerce_opt(device, "auto"))
+    n_estimators = int(_coerce_opt(n_estimators, 600))
+    max_depth = int(_coerce_opt(max_depth, 6))
+    min_child_weight = float(_coerce_opt(min_child_weight, 1.0))
+    learning_rate = float(_coerce_opt(learning_rate, 0.05))
+    subsample = float(_coerce_opt(subsample, 0.8))
+    colsample_bytree = float(_coerce_opt(colsample_bytree, 0.8))
+    reg_alpha = float(_coerce_opt(reg_alpha, 0.0))
+    reg_lambda = float(_coerce_opt(reg_lambda, 1.0))
+    n_jobs = int(_coerce_opt(n_jobs, 0))
+    n_trials = int(_coerce_opt(n_trials, 0))
+    sampler = str(_coerce_opt(sampler, "tpe"))
+    seed = int(_coerce_opt(seed, 42))
+
+    feats = make_features(raw, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=(etf or None)).reset_index(drop=True)
+    if str(ae_path).strip():
+        try:
+            import json as _json
+            with open(ae_path, "r") as _f:
+                _man = _json.load(_f)
+            if bool(_man.get("raw_htf", False)):
+                ae_df = compute_embeddings_from_raw(raw, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae")
+                ae_df = ae_df.reindex(index=feats.index).fillna(0.0)
+            else:
+                ae_df = compute_embeddings(feats, ae_manifest_path=str(ae_path), device=str(device), out_col_prefix="ae", window=None)
+            feats = feats.join(ae_df, how="left")
+        except Exception as e:
+            typer.echo(f"AE embeddings failed (TrendChange), proceeding without: {e}")
+
+    close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
+    yb, yt = _label_pivots(close, int(left_bars), int(right_bars), int(min_gap_bars))
+    y_change = _label_trend_change_within_horizon(yt, yb, int(horizon))
+
+    T = len(feats)
+    valid = max(0, T - int(horizon))
+    if valid <= 400:
+        raise ValueError("Not enough data to train TrendChange.")
+    X = feats.iloc[:valid, :].copy()
+    y = y_change[:valid]
+
+    # Split time-based
+    cut = int(max(200, min(valid - 50, int(valid * 0.8))))
+    X_tr = X.iloc[:cut, :].values
+    X_val = X.iloc[cut:, :].values
+    y_tr = y[:cut]
+    y_val = y[cut:]
+
+    def _fit_eval(params: Dict[str, Any]) -> Tuple[Any, float]:
+        mdl, metrics = _train_xgb_classifier(
+            X_tr, y_tr, X_val, y_val, device,
+            n_estimators=int(params["n_estimators"]),
+            max_depth=int(params["max_depth"]),
+            min_child_weight=float(params["min_child_weight"]),
+            learning_rate=float(params["learning_rate"]),
+            subsample=float(params["subsample"]),
+            colsample_bytree=float(params["colsample_bytree"]),
+            reg_alpha=float(params["reg_alpha"]),
+            reg_lambda=float(params["reg_lambda"]),
+            n_jobs=n_jobs,
+            objective="binary:logistic",
+        )
+        return mdl, float(metrics.get("auprc", float("nan")))
+
+    if int(n_trials) and n_trials > 0:
+        import optuna
+        from optuna.samplers import TPESampler, RandomSampler
+        smp = RandomSampler(seed=int(seed)) if sampler.lower() == "random" else TPESampler(seed=int(seed))
+        def objective(trial: "optuna.trial.Trial") -> float:
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 300, 1200, step=50),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "min_child_weight": trial.suggest_float("min_child_weight", 0.5, 10.0, log=True),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
+                "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 1.0),
+                "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 2.0),
+            }
+            _, score = _fit_eval(params)
+            return score
+        study = optuna.create_study(direction="maximize", sampler=smp)
+        typer.echo(f"Optuna TrendChange trials: {n_trials}")
+        study.optimize(objective, n_trials=int(n_trials))
+        best_params = study.best_params
+        model, best_ap = _fit_eval(best_params)
+        typer.echo(f"Best TrendChange AUPRC: {best_ap:.6f}")
+    else:
+        base_params = dict(
+            n_estimators=int(n_estimators), max_depth=int(max_depth), min_child_weight=float(min_child_weight),
+            learning_rate=float(learning_rate), subsample=float(subsample), colsample_bytree=float(colsample_bytree),
+            reg_alpha=float(reg_alpha), reg_lambda=float(reg_lambda)
+        )
+        model, _ = _fit_eval(base_params)
+
+    os.makedirs(outdir, exist_ok=True)
+    tc_path = os.path.join(outdir, "best_trendchange.json")
+    model.save_model(_ensure_outdir(tc_path))
+    _save_feature_columns(tc_path, list(X.columns))
+
+    # Report metrics on held-out slice
+    try:
+        from sklearn.metrics import average_precision_score
+        p = model.predict_proba(X_val)[:, 1]
+        ap = float(average_precision_score(y_val, p))
+    except Exception:
+        ap = float("nan")
+    typer.echo(json.dumps({"trendchange": {"path": tc_path, "auprc": ap}}, indent=2))
+
+    # CV (optional)
+    if int(cv_splits) > 0:
+        splits = _make_time_series_splits(
+            num_rows=valid,
+            n_splits=int(cv_splits),
+            min_train=max(600, int(valid * 0.3)),
+            val_size=int(cv_val_size),
+            scheme=str(cv_scheme),
+        )
+        cv_metrics: List[Dict[str, float]] = []
+        from sklearn.metrics import average_precision_score
+        for tr_idx, va_idx in splits:
+            X_tr = X.iloc[tr_idx, :].values
+            X_va = X.iloc[va_idx, :].values
+            y_tr = y[tr_idx]
+            y_va = y[va_idx]
+            mdl, _ = _train_xgb_classifier(
+                X_tr, y_tr, X_va, y_va, device,
+                n_estimators=n_estimators, max_depth=max_depth, min_child_weight=min_child_weight,
+                learning_rate=learning_rate, subsample=subsample, colsample_bytree=colsample_bytree,
+                reg_alpha=reg_alpha, reg_lambda=reg_lambda, n_jobs=n_jobs, objective="binary:logistic"
+            )
+            pv = mdl.predict_proba(X_va)[:, 1]
+            cv_metrics.append({"ap": float(average_precision_score(y_va, pv))})
+        typer.echo(json.dumps({"cv": cv_metrics}, indent=2))
+
+    # Permutation test (optional)
+    if int(perm_test) > 0:
+        from sklearn.metrics import average_precision_score
+        pv = model.predict_proba(X_val)[:, 1]
+        ap_obs = float(average_precision_score(y_val, pv))
+        rng = np.random.RandomState(42)
+        null_ap: List[float] = []
+        for _ in range(int(perm_test)):
+            y_perm = _permute_labels_time_aware(y_val, mode="shift", rng=rng)
+            null_ap.append(float(average_precision_score(y_perm, pv)))
+        pval = float((np.sum(np.array(null_ap) >= ap_obs) + 1) / (len(null_ap) + 1))
+        typer.echo(json.dumps({"perm_test": {"ap": ap_obs, "pval": pval}}, indent=2))
+
 @app.command()
 def meta_train(
     pair: str = typer.Option("BTC/USDT"),
@@ -1785,6 +2011,50 @@ def meta_eval(
     typer.echo(json.dumps(out_info, indent=2))
 
 
+@app.command("trendchange-eval")
+def trendchange_eval(
+    pair: str = typer.Option("BTC/USDT"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
+    timerange: str = typer.Option("20240101-"),
+    prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
+    trendchange_path: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "xgb_stack" / "best_trendchange.json")),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("4H,1D,1W"),
+    outdir: str = typer.Option(str(Path(__file__).resolve().parent / "plot" / "xgb_eval")),
+    device: str = typer.Option("auto"),
+    p_thr: float = typer.Option(0.6, help="Threshold for marking predicted trend changes"),
+):
+    path = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange) or _find_data_file(userdir, pair, timeframe, prefer_exchange)
+    if not path:
+        raise FileNotFoundError("Dataset not found for evaluation.")
+    raw = _load_ohlcv(path)
+    raw = _slice_timerange_df(raw, timerange)
+    etf_str = str(_coerce_opt(extra_timeframes, "4H,1D,1W"))
+    etf = [s.strip() for s in etf_str.split(",") if s.strip()]
+    feats = make_features(
+        raw,
+        mode=_coerce_opt(feature_mode, "full"),
+        basic_lookback=int(_coerce_opt(basic_lookback, 64)),
+        extra_timeframes=(etf or None),
+    ).reset_index(drop=True)
+    idx = feats.index
+    close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
+
+    clf, cols = _load_xgb(str(_coerce_opt(trendchange_path, trendchange_path)), device=str(_coerce_opt(device, "auto")))
+    pr = _predict_with_cols(clf, feats, cols)
+    T = len(feats)
+    p_change = pr[:, 1] if (pr is not None and pr.ndim == 2 and pr.shape[1] >= 2) else np.zeros(T)
+
+    root = _ts_outdir(str(_coerce_opt(outdir, str(Path(__file__).resolve().parent / "plot" / "xgb_eval"))), prefix="trendchange")
+    _plot_prob_series(idx, {"p_change": p_change}, thresholds={"thr": float(p_thr)}, title=f"Trend change probability {pair} {timeframe}", out_path=os.path.join(root, "trendchange_probs.png"))
+    ev = {"trend_change_pred": (p_change >= float(p_thr)).astype(int)}
+    _plot_price_with_events(idx, close, ev, title=f"Price with predicted trend changes {pair} {timeframe}", out_path=os.path.join(root, "trendchange_events.png"))
+    _plot_feature_importance(clf, cols or list(feats.columns), out_path=os.path.join(root, "fi_trendchange.png"), title="Feature importance - TrendChange")
+    typer.echo(json.dumps({"outdir": root, "samples": int(T)}, indent=2))
+
+
 @app.command("impulse-eval")
 def impulse_eval(
     pair: str = typer.Option("BTC/USDT"),
@@ -1925,6 +2195,26 @@ def train_all(
         perm_test=int(perm_test),
         ae_path=ae_path_used,
     )
+    # Train TrendChange with Optuna
+    try:
+        trendchange_train(
+            pair=pair,
+            timeframe=timeframe,
+            userdir=userdir,
+            timerange=timerange,
+            prefer_exchange=prefer_exchange,
+            extra_timeframes="4H,1D,1W",
+            n_trials=int(optuna_trials),
+            outdir=outdir,
+            autodownload=False,
+            cv_splits=int(cv_splits),
+            cv_scheme=str(cv_scheme),
+            cv_val_size=int(cv_val_size),
+            perm_test=int(perm_test),
+            ae_path=ae_path_used,
+        )
+    except Exception as e:
+        typer.echo(f"TrendChange training skipped/failed: {e}")
     # Train Impulse with Optuna
     try:
         impulse_train_cmd(
@@ -2015,6 +2305,20 @@ def train_all(
             logret_path=str(Path(outdir) / "best_logret.json"),
             outdir=_lr_before,
         )
+        # TrendChange
+        _tc_before = _ts_outdir(str(Path(__file__).resolve().parent / "plot" / "xgb_eval"), prefix="tmp_trendchange")
+        try:
+            trendchange_eval(
+                pair=pair,
+                timeframe=timeframe,
+                userdir=userdir,
+                timerange=timerange,
+                prefer_exchange=prefer_exchange,
+                trendchange_path=str(Path(outdir) / "best_trendchange.json"),
+                outdir=_tc_before,
+            )
+        except Exception as e:
+            typer.echo(f"TrendChange eval failed: {e}")
         # Impulse (optional)
         up_path = Path(outdir) / "best_impulse_up.json"
         dn_path = Path(outdir) / "best_impulse_down.json"
@@ -2037,8 +2341,8 @@ def train_all(
                 dest_dir.mkdir(parents=True, exist_ok=True)
                 if p.is_file():
                     shutil.copy2(str(p), str(dest_dir / p.name))
-        # move topbot and logret into bundle
-        for src_dir, name in [(_tb_before, "topbot"), (_lr_before, "logret")]:
+        # move topbot, logret and trendchange into bundle
+        for src_dir, name in [(_tb_before, "topbot"), (_lr_before, "logret"), (_tc_before, "trendchange")]:
             d = Path(bundle_root) / name
             d.mkdir(parents=True, exist_ok=True)
             for p in Path(src_dir).glob("**/*"):
