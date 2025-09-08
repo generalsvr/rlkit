@@ -200,8 +200,8 @@ def _ts_outdir(base: str, prefix: str = "eval") -> str:
 def _safe_savefig(fig, out_path: str):
     try:
         import matplotlib.pyplot as _plt
-        fig.tight_layout()
-        fig.savefig(out_path, dpi=140)
+        # Use bbox_inches='tight' instead of tight_layout to avoid layout warnings
+        fig.savefig(out_path, dpi=140, bbox_inches='tight')
         _plt.close(fig)
     except Exception:
         try:
@@ -2048,8 +2048,9 @@ def trendchange_eval(
     p_change = pr[:, 1] if (pr is not None and pr.ndim == 2 and pr.shape[1] >= 2) else np.zeros(T)
 
     root = _ts_outdir(str(_coerce_opt(outdir, str(Path(__file__).resolve().parent / "plot" / "xgb_eval"))), prefix="trendchange")
-    _plot_prob_series(idx, {"p_change": p_change}, thresholds={"thr": float(p_thr)}, title=f"Trend change probability {pair} {timeframe}", out_path=os.path.join(root, "trendchange_probs.png"))
-    ev = {"trend_change_pred": (p_change >= float(p_thr)).astype(int)}
+    thr_val = float(_coerce_opt(p_thr, 0.6))
+    _plot_prob_series(idx, {"p_change": p_change}, thresholds={"thr": thr_val}, title=f"Trend change probability {pair} {timeframe}", out_path=os.path.join(root, "trendchange_probs.png"))
+    ev = {"trend_change_pred": (p_change >= thr_val).astype(int)}
     _plot_price_with_events(idx, close, ev, title=f"Price with predicted trend changes {pair} {timeframe}", out_path=os.path.join(root, "trendchange_events.png"))
     _plot_feature_importance(clf, cols or list(feats.columns), out_path=os.path.join(root, "fi_trendchange.png"), title="Feature importance - TrendChange")
     typer.echo(json.dumps({"outdir": root, "samples": int(T)}, indent=2))
