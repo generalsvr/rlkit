@@ -1,0 +1,79 @@
+Metadata-Version: 2.4
+Name: snakelr
+Version: 0.1.0
+Summary: Gymnasium-compatible Snake environment with web and RLlib support.
+Author-email: Your Name <you@example.com>
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: numpy>=1.24.0
+Requires-Dist: gymnasium>=0.29.1
+Requires-Dist: pygame>=2.5.2
+Requires-Dist: fastapi>=0.111.0
+Requires-Dist: uvicorn[standard]>=0.30.0
+Requires-Dist: pydantic>=2.8.0
+Requires-Dist: Pillow>=10.4.0
+Requires-Dist: ray[rllib]>=2.6.0
+Provides-Extra: web
+Requires-Dist: fastapi>=0.111.0; extra == "web"
+Requires-Dist: uvicorn[standard]>=0.30.0; extra == "web"
+Requires-Dist: pydantic>=2.8.0; extra == "web"
+Requires-Dist: Pillow>=10.4.0; extra == "web"
+Provides-Extra: train
+Requires-Dist: ray[rllib]>=2.6.0; extra == "train"
+
+# SnakeLR
+
+Gymnasium-compatible Snake environment with image observations, optional pygame rendering, web UI, and RLlib training script.
+
+## Install
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+## Usage
+
+- Train with RLlib PPO:
+```bash
+python scripts/train_rllib.py --height 15 --width 15 --steps 200
+```
+
+- Manual play (pygame):
+```bash
+python scripts/play_pygame.py
+```
+
+- Web UI (FastAPI):
+```bash
+uvicorn web.app:app --reload
+# open http://127.0.0.1:8000
+```
+
+## Docker
+
+```bash
+docker compose up --build
+# open http://localhost:8000
+```
+
+## RLlib registration
+
+Env id: `Snake-v0`. Use `snakelr.register.register_env()` or register via Tune registry as shown in `scripts/train_rllib.py`.
+
+## Observation / Action
+
+- Observation: HxWx3 RGB NumPy array of board.
+- Action space: Discrete(4) — 0 up, 1 down, 2 left, 3 right.
+
+## Rewards
+
+- +1 food, -1 death, -0.01 per step.
+
+## Optional Features
+
+Enable via `SnakeConfig` or `env_config`:
+- Poison (`enable_poison`)
+- Obstacles (`enable_obstacles`)
+- Multi-food (`enable_multi_food`)
