@@ -187,6 +187,15 @@ def make_features(
         # Realized volatility of returns (rolling std)
         ret_std_14 = pd.Series(logret).rolling(14, min_periods=1).std().fillna(0.0).to_numpy()
 
+        # New: Lagged returns (t-1..t-5) and return autocorrelation (lag-1) over window
+        s_lr = pd.Series(logret)
+        logret_lag_1 = s_lr.shift(1).fillna(0.0).to_numpy()
+        logret_lag_2 = s_lr.shift(2).fillna(0.0).to_numpy()
+        logret_lag_3 = s_lr.shift(3).fillna(0.0).to_numpy()
+        logret_lag_4 = s_lr.shift(4).fillna(0.0).to_numpy()
+        logret_lag_5 = s_lr.shift(5).fillna(0.0).to_numpy()
+        ret_autocorr_64 = s_lr.rolling(64, min_periods=20).corr(s_lr.shift(1)).fillna(0.0).to_numpy()
+
         # Hurst and tail alpha proxies
         hurst = compute_hurst_proxy_from_returns(logret, var_lookback=256)
         hurst = np.nan_to_num(hurst, nan=0.5, posinf=1.0, neginf=0.0)
@@ -244,6 +253,8 @@ def make_features(
         stoch_k = np.clip((c - ll) / (hh - ll + 1e-12), 0.0, 1.0)
         stoch_d = pd.Series(stoch_k).rolling(3, min_periods=1).mean().to_numpy()
         # ROC
+        roc_3 = (c / (np.roll(c, 3) + 1e-12)) - 1.0
+        roc_5 = (c / (np.roll(c, 5) + 1e-12)) - 1.0
         roc_10 = (c / (np.roll(c, 10) + 1e-12)) - 1.0
 
         # Volatility & Risk additions
@@ -252,6 +263,9 @@ def make_features(
         bb_width = (2.0 * bb_std).to_numpy() / (bb_mid.to_numpy() + 1e-12)
         donch_w = (pd.Series(h).rolling(20, min_periods=1).max() - pd.Series(l).rolling(20, min_periods=1).min()).to_numpy() / (c + 1e-12)
         true_range_pct = atr
+        # Vol-of-Vol (rolling std of ATR and realized vol)
+        vol_of_vol_atr_64 = pd.Series(atr).rolling(64, min_periods=14).std().fillna(0.0).to_numpy()
+        vol_of_vol_retstd_64 = pd.Series(ret_std_14).rolling(64, min_periods=14).std().fillna(0.0).to_numpy()
         # Skewness of returns (rolling 30)
         def _skew(arr: np.ndarray) -> float:
             m = float(np.mean(arr))
@@ -275,11 +289,16 @@ def make_features(
         vwap_den = pd.Series(v).rolling(20, min_periods=1).sum().replace(0.0, 1e-12)
         vwap = (vwap_num / vwap_den).to_numpy()
         vwap_ratio = (c - vwap) / (c + 1e-12)
+        # Volume/Range ratio and Amihud illiquidity
+        vol_range_ratio = v / (h - l + 1e-12)
+        amihud_illiquidity = np.abs(logret) / (v + 1e-12)
 
         # Price shape / Microstructure additions
         body = np.abs(c - o)
         rng = (h - l) + 1e-12
         candle_body_frac = body / rng
+        body_range_ratio_signed = (c - o) / (h - l + 1e-12)
+        hl_asymmetry = (h - c) / (c - l + 1e-12)
         upper_shadow_frac = (h - np.maximum(o, c)) / rng
         lower_shadow_frac = (np.minimum(o, c) - l) / rng
         # Trend persistence (signed streak length, clipped)
@@ -291,6 +310,9 @@ def make_features(
             else:
                 streak[i] = sgn[i]
         candle_trend_persistence = np.tanh(streak / 10.0)
+        # Directional change count (sign flips over last N bars)
+        flips = (pd.Series(np.sign(logret)) != pd.Series(np.sign(logret)).shift(1)).astype(int)
+        dir_change_count_20 = flips.rolling(20, min_periods=1).sum().fillna(0.0).to_numpy()
         # Kurtosis rolling (100)
         try:
             kurtosis_rolling = pd.Series(logret).rolling(100, min_periods=20).kurt().fillna(0.0).to_numpy()
@@ -394,21 +416,37 @@ def make_features(
             "stoch_k": stoch_k,
             "stoch_d": stoch_d,
             "roc_10": roc_10,
+            # New short-horizon cumulative returns and lagged returns
+            "roc_3": roc_3,
+            "roc_5": roc_5,
+            "logret_lag_1": logret_lag_1,
+            "logret_lag_2": logret_lag_2,
+            "logret_lag_3": logret_lag_3,
+            "logret_lag_4": logret_lag_4,
+            "logret_lag_5": logret_lag_5,
+            "ret_autocorr_64": ret_autocorr_64,
             # New vol/risk
             "bb_width_20": bb_width,
             "donchian_width_20": donch_w,
             "true_range_pct": true_range_pct,
+            "vol_of_vol_atr_64": vol_of_vol_atr_64,
+            "vol_of_vol_retstd_64": vol_of_vol_retstd_64,
             "vol_skewness_30": vol_skewness,
             "volatility_regime": volatility_regime,
             # Volume
             "obv_z": obv_z,
             "volume_delta_z": volume_delta.astype(float),
             "vwap_ratio_20": vwap_ratio,
+            "vol_range_ratio": vol_range_ratio,
+            "amihud_illiquidity": amihud_illiquidity,
             # Microstructure
             "candle_body_frac": candle_body_frac,
+            "body_range_ratio_signed": body_range_ratio_signed,
+            "hl_asymmetry": hl_asymmetry,
             "upper_shadow_frac": upper_shadow_frac,
             "lower_shadow_frac": lower_shadow_frac,
             "candle_trend_persistence": candle_trend_persistence,
+            "dir_change_count_20": dir_change_count_20,
             "kurtosis_rolling_100": kurtosis_rolling,
             # Stats/Fractal
             "dfa_exponent_64": dfa_exponent,
@@ -634,6 +672,12 @@ def make_features(
                     # Align to base index causally
                     feats_tf_aligned = feats_tf.reindex(base.index).ffill().fillna(0.0)
                     feats = feats.join(feats_tf_aligned, how="left")
+                    # HTF alignment feature: sign(LTF logret) * sign(HTF logret)
+                    try:
+                        align = np.sign(feats["logret"].astype(float).values) * np.sign(feats[f"{tf}_logret"].astype(float).values)
+                        feats[f"{tf}_align_ret"] = align
+                    except Exception:
+                        feats[f"{tf}_align_ret"] = 0.0
                 except Exception:
                     # If resampling fails, skip this timeframe silently
                     continue
