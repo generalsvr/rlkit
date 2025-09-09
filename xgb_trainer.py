@@ -25,7 +25,8 @@ import typer
 
 from rl_lib.train_sb3 import _find_data_file, _load_ohlcv, _slice_timerange_df
 from rl_lib.features import make_features
-from rl_lib.meta import triple_barrier_labels, train_meta_mlp_manager
+from rl_lib.meta import triple_barrier_labels, train_meta_mlp_manager, \
+    triple_barrier_multi_outcomes, train_meta_outcome_mlp, load_meta_outcome_from_json
 from rl_lib.autoencoder import AETrainParams, train_autoencoder, compute_embeddings, compute_embeddings_from_raw
 
 
@@ -322,6 +323,44 @@ def _plot_feature_importance(model: Any, feature_names: List[str], out_path: str
     ax.set_title(title)
     ax.grid(axis="x", alpha=0.3)
     _safe_savefig(fig, out_path)
+
+
+def _extract_feature_importance(model: Any, feature_names: List[str]) -> Dict[str, float]:
+    names = list(feature_names)
+    imp_map: Dict[str, float] = {}
+    try:
+        booster = model.get_booster()  # type: ignore[attr-defined]
+        raw = booster.get_score(importance_type="gain")
+        for k, v in raw.items():
+            try:
+                idx = int(k[1:]) if k.startswith("f") else int(k)
+                nm = names[idx] if 0 <= idx < len(names) else k
+            except Exception:
+                nm = k
+            imp_map[nm] = float(v)
+    except Exception:
+        try:
+            vals = getattr(model, "feature_importances_", None)
+            if vals is not None:
+                for i, v in enumerate(list(vals)):
+                    nm = names[i] if i < len(names) else f"f{i}"
+                    imp_map[nm] = float(v)
+        except Exception:
+            imp_map = {}
+    return imp_map
+
+
+def _save_feature_importance_text(model: Any, feature_names: List[str], out_txt_path: str, top_k: int = 200):
+    try:
+        imp_map = _extract_feature_importance(model, feature_names)
+        if not imp_map:
+            return
+        items = sorted(imp_map.items(), key=lambda x: x[1], reverse=True)[:max(1, int(top_k))]
+        lines = [f"{k}\t{v:.6g}" for k, v in items]
+        with open(out_txt_path, 'w') as f:
+            f.write("\n".join(lines))
+    except Exception:
+        pass
 
 
 # -----------------------------
@@ -1985,6 +2024,11 @@ def topbot_eval(
     # Feature importance
     _plot_feature_importance(bot_clf, bot_cols or list(feats.columns), out_path=os.path.join(root, "fi_bottom.png"), title="Feature importance - Bottom")
     _plot_feature_importance(top_clf, top_cols or list(feats.columns), out_path=os.path.join(root, "fi_top.png"), title="Feature importance - Top")
+    try:
+        _save_feature_importance_text(bot_clf, bot_cols or list(feats.columns), out_txt_path=os.path.join(root, "fi_bottom.txt"), top_k=500)
+        _save_feature_importance_text(top_clf, top_cols or list(feats.columns), out_txt_path=os.path.join(root, "fi_top.txt"), top_k=500)
+    except Exception:
+        pass
     typer.echo(json.dumps({"outdir": root, "samples": int(T)}, indent=2))
 
 
@@ -2053,6 +2097,10 @@ def logret_eval(
     except Exception:
         pass
     _plot_feature_importance(logret_clf, logret_cols or list(feats.columns), out_path=os.path.join(root, "fi_logret.png"), title="Feature importance - Logret")
+    try:
+        _save_feature_importance_text(logret_clf, logret_cols or list(feats.columns), out_txt_path=os.path.join(root, "fi_logret.txt"), top_k=500)
+    except Exception:
+        pass
     typer.echo(json.dumps({"outdir": root, "samples": int(T)}, indent=2))
 
 
@@ -2294,6 +2342,10 @@ def trendchange_eval(
     lo = feats["low"].astype(float).to_numpy() if "low" in feats.columns else raw["low"].astype(float).to_numpy()
     _plot_price_with_events(idx, close, ev, title=f"Price with predicted trend changes {pair} {timeframe}", out_path=os.path.join(root, "trendchange_events.png"), o=o, h=hi, l=lo, use_candles=bool(_coerce_opt(candles, False)))
     _plot_feature_importance(clf, cols or list(feats.columns), out_path=os.path.join(root, "fi_trendchange.png"), title="Feature importance - TrendChange")
+    try:
+        _save_feature_importance_text(clf, cols or list(feats.columns), out_txt_path=os.path.join(root, "fi_trendchange.txt"), top_k=500)
+    except Exception:
+        pass
     typer.echo(json.dumps({"outdir": root, "samples": int(T)}, indent=2))
 
 
@@ -2346,6 +2398,11 @@ def impulse_eval(
     _plot_price_with_events(idx, close, ev, title=f"Price with impulse signals {pair} {timeframe}", out_path=os.path.join(root, "impulse_events.png"))
     _plot_feature_importance(up_clf, up_cols or list(feats.columns), out_path=os.path.join(root, "fi_impulse_up.png"), title="Feature importance - Impulse Up")
     _plot_feature_importance(dn_clf, dn_cols or list(feats.columns), out_path=os.path.join(root, "fi_impulse_dn.png"), title="Feature importance - Impulse Down")
+    try:
+        _save_feature_importance_text(up_clf, up_cols or list(feats.columns), out_txt_path=os.path.join(root, "fi_impulse_up.txt"), top_k=500)
+        _save_feature_importance_text(dn_clf, dn_cols or list(feats.columns), out_txt_path=os.path.join(root, "fi_impulse_dn.txt"), top_k=500)
+    except Exception:
+        pass
     typer.echo(json.dumps({"outdir": root, "samples": int(T)}, indent=2))
 
 

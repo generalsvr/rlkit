@@ -90,6 +90,250 @@ def triple_barrier_labels(
     return labels, horizon
 
 
+def triple_barrier_multi_outcomes(
+    close: np.ndarray,
+    high: np.ndarray,
+    low: np.ndarray,
+    atr_norm: np.ndarray,
+    entries: np.ndarray,
+    direction: int,
+    pt_mult: float = 2.0,
+    sl_mult: float = 1.0,
+    max_holding: int = 24,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Triple-barrier with 3 outcomes per entry: 0=TP, 1=SL, 2=TIME.
+
+    Returns (labels, horizon). labels is -1 where not an entry.
+    """
+    T = len(close)
+    labels = np.full(T, -1, dtype=int)
+    horizon = np.full(T, 0, dtype=int)
+    idxs = np.flatnonzero(entries == 1)
+    if idxs.size == 0:
+        return labels, horizon
+    for idx in idxs:
+        if idx >= T - 2:
+            continue
+        c0 = float(close[idx])
+        atr0 = float(atr_norm[idx])
+        if not np.isfinite(atr0) or atr0 <= 0.0:
+            atr0 = float(np.nanmedian(atr_norm[max(0, idx-200):idx+1]) or 0.005)
+        if direction > 0:
+            pt_level = c0 * (1.0 + pt_mult * atr0)
+            sl_level = c0 * (1.0 - sl_mult * atr0)
+        else:
+            pt_level = c0 * (1.0 - pt_mult * atr0)
+            sl_level = c0 * (1.0 + sl_mult * atr0)
+        decided = False
+        max_h = int(max(1, max_holding))
+        for h in range(1, min(max_h + 1, T - idx)):
+            hi = float(high[idx + h])
+            lo = float(low[idx + h])
+            if direction > 0:
+                hit_pt = hi >= pt_level
+                hit_sl = lo <= sl_level
+            else:
+                hit_pt = lo <= pt_level
+                hit_sl = hi >= sl_level
+            if hit_pt or hit_sl:
+                labels[idx] = 0 if hit_pt and not hit_sl else 1  # 0=TP,1=SL
+                horizon[idx] = h
+                decided = True
+                break
+        if not decided:
+            labels[idx] = 2  # TIME
+            horizon[idx] = max_h
+    return labels, horizon
+
+
+def build_meta_outcome_dataset_from_signals(
+    df: pd.DataFrame,
+    feature_df: pd.DataFrame,
+    primary_scores: Dict[str, np.ndarray],
+    score_thresholds: Dict[str, float],
+    direction_map: Dict[str, int],
+    pt_mult: float = 2.0,
+    sl_mult: float = 1.0,
+    max_holding: int = 24,
+    extra_feature_cols: Optional[List[str]] = None,
+) -> Tuple[pd.DataFrame, np.ndarray]:
+    """Build meta outcome dataset: X rows at candidate entries; y in {0=TP,1=SL,2=TIME}."""
+    close = df["close"].astype(float).to_numpy()
+    high = df["high"].astype(float).to_numpy()
+    low = df["low"].astype(float).to_numpy()
+    atrn = _compute_atr_norm(high, low, close, period=14)
+
+    rows: List[List[float]] = []
+    labels: List[int] = []
+    idx_list: List[int] = []
+
+    base_cols: List[str] = []
+    default_cols = [
+        "atr","ret_std_14","adx_14","volatility_regime","risk_gate",
+        "ema_fast_ratio","ema_slow_ratio","sma_ratio","macd_line","macd_signal",
+    ]
+    if extra_feature_cols:
+        default_cols = list(dict.fromkeys(default_cols + list(extra_feature_cols)))
+    for c in default_cols:
+        if c in feature_df.columns and c not in base_cols:
+            base_cols.append(c)
+
+    for name, scores in primary_scores.items():
+        thr = float(score_thresholds.get(name, 0.6))
+        direction = int(direction_map.get(name, 0))
+        if direction == 0:
+            continue
+        candidates = (scores >= thr).astype(int)
+        y_out, _h = triple_barrier_multi_outcomes(close, high, low, atrn, entries=candidates, direction=direction, pt_mult=pt_mult, sl_mult=sl_mult, max_holding=max_holding)
+        idxs = np.flatnonzero(candidates == 1)
+        for i in idxs:
+            if y_out[i] < 0:
+                continue
+            row: List[float] = []
+            # primary scores
+            for n2, sc in primary_scores.items():
+                v = float(sc[i]) if (isinstance(sc, np.ndarray) and i < sc.shape[0]) else 0.0
+                if not np.isfinite(v):
+                    v = 0.0
+                row.append(v)
+            # base context
+            for c in base_cols:
+                v = float(feature_df.iloc[i][c]) if c in feature_df.columns else 0.0
+                if not np.isfinite(v):
+                    v = 0.0
+                row.append(v)
+            # direction flag
+            row.append(float(direction))
+            rows.append(row)
+            labels.append(int(y_out[i]))
+            idx_list.append(i)
+
+    if not rows:
+        return pd.DataFrame(), np.array([], dtype=int)
+    feat_cols = list(primary_scores.keys()) + base_cols + ["dir"]
+    X = pd.DataFrame(rows, columns=feat_cols, index=pd.Index(idx_list))
+    y = np.asarray(labels, dtype=int)
+    return X, y
+
+
+class MetaOutcomeMLP(nn.Module):
+    def __init__(self, input_dim: int, hidden: List[int] | None = None, dropout: float = 0.1, num_classes: int = 3):
+        super().__init__()
+        if hidden is None:
+            hidden = [128, 64]
+        layers: List[nn.Module] = []
+        prev = input_dim
+        for h in hidden:
+            layers.append(nn.Linear(prev, h))
+            layers.append(nn.ReLU())
+            if dropout and dropout > 0.0:
+                layers.append(nn.Dropout(p=float(dropout)))
+            prev = h
+        layers.append(nn.Linear(prev, int(num_classes)))
+        self.net = nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.net(x)
+
+
+def train_meta_outcome_mlp(
+    X: pd.DataFrame,
+    y: np.ndarray,
+    out_json_path: str,
+    hidden: Optional[List[int]] = None,
+    epochs: int = 100,
+    lr: float = 1e-3,
+    batch_size: int = 512,
+    weight_decay: float = 0.0,
+    device: str = "auto",
+) -> Dict[str, Any]:
+    if not _TORCH_OK:
+        raise ImportError("PyTorch is required for meta outcome MLP.")
+    import json as _json
+    from sklearn.metrics import accuracy_score
+
+    cols = list(X.columns)
+    Xn = np.asarray(X.values, dtype=np.float32)
+    yn = np.asarray(y, dtype=np.int64)
+    n = Xn.shape[0]
+    cut = int(max(50, min(n - 20, int(n * 0.8))))
+    X_tr = Xn[:cut]; y_tr = yn[:cut]
+    X_va = Xn[cut:]; y_va = yn[cut:]
+
+    tr_ds = TensorDataset(torch.from_numpy(X_tr), torch.from_numpy(y_tr))
+    va_ds = TensorDataset(torch.from_numpy(X_va), torch.from_numpy(y_va))
+    tr_ld = DataLoader(tr_ds, batch_size=int(max(1, batch_size)), shuffle=True)
+    va_ld = DataLoader(va_ds, batch_size=4096, shuffle=False)
+
+    dev = torch.device("cuda" if (device in ("auto","cuda") and torch.cuda.is_available()) else "cpu")
+    model = MetaOutcomeMLP(input_dim=Xn.shape[1], hidden=hidden or [128, 64], dropout=0.1, num_classes=3).to(dev)
+    opt = torch.optim.Adam(model.parameters(), lr=float(lr), weight_decay=float(weight_decay))
+    criterion = nn.CrossEntropyLoss()
+
+    best_acc = float('-inf')
+    best_state: Dict[str, Any] | None = None
+    for ep in range(int(max(1, epochs))):
+        model.train()
+        for xb, yb in tr_ld:
+            xb = xb.to(dev); yb = yb.to(dev)
+            opt.zero_grad()
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward(); opt.step()
+        # Eval
+        model.eval()
+        preds: List[int] = []
+        with torch.no_grad():
+            for xb, _yb in va_ld:
+                xb = xb.to(dev)
+                logits = model(xb)
+                ph = torch.argmax(logits, dim=1).cpu().numpy().tolist()
+                preds.extend(ph)
+        try:
+            acc = float(accuracy_score(y_va, np.asarray(preds, dtype=int)))
+        except Exception:
+            acc = float('nan')
+        if np.isfinite(acc) and acc > best_acc:
+            best_acc = acc
+            best_state = {"model": model.state_dict()}
+
+    if best_state is None:
+        best_state = {"model": model.state_dict()}
+    weights_path = os.path.splitext(out_json_path)[0] + ".pt"
+    os.makedirs(os.path.dirname(out_json_path) or ".", exist_ok=True)
+    torch.save(best_state, weights_path)
+    manifest = {
+        "type": "MetaOutcomeMLP",
+        "weights_path": weights_path,
+        "feature_columns": cols,
+        "input_dim": int(Xn.shape[1]),
+        "hidden": list(hidden or [128, 64]),
+        "dropout": 0.1,
+        "val_acc": float(best_acc),
+    }
+    with open(out_json_path, "w") as f:
+        _json.dump(manifest, f, indent=2)
+    return {"manifest": out_json_path, "weights": weights_path, "val_acc": float(best_acc)}
+
+
+def load_meta_outcome_from_json(json_path: str) -> Tuple[MetaOutcomeMLP, List[str]]:
+    import json as _json
+    with open(json_path, "r") as f:
+        man = _json.load(f)
+    if man.get("type") != "MetaOutcomeMLP":
+        raise ValueError("Manifest is not a MetaOutcomeMLP")
+    input_dim = int(man["input_dim"])
+    hidden = list(man.get("hidden", [128, 64]))
+    dropout = float(man.get("dropout", 0.1))
+    model = MetaOutcomeMLP(input_dim=input_dim, hidden=hidden, dropout=dropout, num_classes=3)
+    state = torch.load(man["weights_path"], map_location="cpu")
+    if isinstance(state, dict) and "model" in state:
+        model.load_state_dict(state["model"])
+    else:
+        model.load_state_dict(state)
+    model.eval()
+    return model, list(man.get("feature_columns", []))
+
 def build_meta_dataset_from_signals(
     df: pd.DataFrame,
     feature_df: pd.DataFrame,
