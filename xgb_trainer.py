@@ -211,10 +211,40 @@ def _safe_savefig(fig, out_path: str):
             pass
 
 
-def _plot_price_with_events(index, close: np.ndarray, events: Dict[str, np.ndarray], title: str, out_path: str):
+def _plot_price_with_events(index, close: np.ndarray, events: Dict[str, np.ndarray], title: str, out_path: str, *,
+                            o: Optional[np.ndarray] = None,
+                            h: Optional[np.ndarray] = None,
+                            l: Optional[np.ndarray] = None,
+                            use_candles: bool = False):
     import matplotlib.pyplot as plt
+    import numpy as _np
     fig, ax = plt.subplots(figsize=(14, 6))
-    ax.plot(index, close, color="#1f77b4", linewidth=1.2, label="Close")
+    if bool(use_candles) and o is not None and h is not None and l is not None and len(o) == len(close):
+        # Draw simple candlesticks
+        try:
+            Tn = len(close)
+            # Compute bar width
+            width = 0.8
+            try:
+                # If datetime index, convert to days width fraction
+                import pandas as _pd
+                if isinstance(index, _pd.DatetimeIndex) and len(index) >= 2:
+                    dt = (index[1] - index[0]).total_seconds() / 86400.0
+                    width = max(0.0005, float(dt) * 0.7)
+            except Exception:
+                pass
+            up = (close >= o)
+            colors_body = _np.where(up, "#2ca02c", "#d62728")
+            # Wicks
+            ax.vlines(index, l, h, color=colors_body, linewidth=0.8, alpha=0.9)
+            # Bodies as bars
+            heights = _np.abs(close - o)
+            bottoms = _np.minimum(close, o)
+            ax.bar(index, height=heights, bottom=bottoms, width=width, color=colors_body, alpha=0.75, linewidth=0.0)
+        except Exception:
+            ax.plot(index, close, color="#1f77b4", linewidth=1.2, label="Close")
+    else:
+        ax.plot(index, close, color="#1f77b4", linewidth=1.2, label="Close")
     colors = {
         "bottom": "#2ca02c",
         "top": "#d62728",
@@ -1911,6 +1941,7 @@ def topbot_eval(
     extra_timeframes: str = typer.Option("4H,1D,1W"),
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "plot" / "xgb_eval")),
     device: str = typer.Option("auto"),
+    candles: bool = typer.Option(False, help="Plot OHLC candles instead of line"),
 ):
     # Load data
     path = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange) or _find_data_file(userdir, pair, timeframe, prefer_exchange)
@@ -1947,7 +1978,10 @@ def topbot_eval(
         "bottom": (p_bottom >= 0.6).astype(int),
         "top": (p_topp >= 0.6).astype(int),
     }
-    _plot_price_with_events(idx, close, ev, title=f"Price with Top/Bottom signals {pair} {timeframe}", out_path=os.path.join(root, "topbot_events.png"))
+    o = feats["open"].astype(float).to_numpy() if "open" in feats.columns else raw["open"].astype(float).to_numpy()
+    hi = feats["high"].astype(float).to_numpy() if "high" in feats.columns else raw["high"].astype(float).to_numpy()
+    lo = feats["low"].astype(float).to_numpy() if "low" in feats.columns else raw["low"].astype(float).to_numpy()
+    _plot_price_with_events(idx, close, ev, title=f"Price with Top/Bottom signals {pair} {timeframe}", out_path=os.path.join(root, "topbot_events.png"), o=o, h=hi, l=lo, use_candles=bool(_coerce_opt(candles, False)))
     # Feature importance
     _plot_feature_importance(bot_clf, bot_cols or list(feats.columns), out_path=os.path.join(root, "fi_bottom.png"), title="Feature importance - Bottom")
     _plot_feature_importance(top_clf, top_cols or list(feats.columns), out_path=os.path.join(root, "fi_top.png"), title="Feature importance - Top")
@@ -1967,6 +2001,7 @@ def logret_eval(
     extra_timeframes: str = typer.Option("4H,1D,1W"),
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "plot" / "xgb_eval")),
     device: str = typer.Option("auto"),
+    candles: bool = typer.Option(False, help="Plot OHLC candles instead of line"),
 ):
     path = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange) or _find_data_file(userdir, pair, timeframe, prefer_exchange)
     if not path:
@@ -2005,6 +2040,18 @@ def logret_eval(
     _plot_regdir_shading(idx, close, reg_dir, title=f"Price with reg_direction shading {pair} {timeframe}", out_path=os.path.join(root, "logret_regdir.png"))
     # Class band with strong-signal markers
     _plot_logret_classes(idx, close, pr, classes=[-2,-1,0,1,2], title=f"Logret class band + strong signals {pair} {timeframe}", out_path=os.path.join(root, "logret_class_band.png"), strong_thr=0.55)
+    # Optional candles for class markers (overlay events by threshold)
+    try:
+        if bool(_coerce_opt(candles, False)):
+            o = feats["open"].astype(float).to_numpy() if "open" in feats.columns else raw["open"].astype(float).to_numpy()
+            hi = feats["high"].astype(float).to_numpy() if "high" in feats.columns else raw["high"].astype(float).to_numpy()
+            lo = feats["low"].astype(float).to_numpy() if "low" in feats.columns else raw["low"].astype(float).to_numpy()
+            strong = (np.max(pr, axis=1) >= 0.55).astype(int)
+            up_evt = ((np.argmax(pr, axis=1) >= 3) & (strong == 1)).astype(int)
+            dn_evt = ((np.argmax(pr, axis=1) <= 1) & (strong == 1)).astype(int)
+            _plot_price_with_events(idx, close, {"trend_up": up_evt, "trend_dn": dn_evt}, title=f"Candles + strong logret signals {pair} {timeframe}", out_path=os.path.join(root, "logret_events_candles.png"), o=o, h=hi, l=lo, use_candles=True)
+    except Exception:
+        pass
     _plot_feature_importance(logret_clf, logret_cols or list(feats.columns), out_path=os.path.join(root, "fi_logret.png"), title="Feature importance - Logret")
     typer.echo(json.dumps({"outdir": root, "samples": int(T)}, indent=2))
 
@@ -2028,6 +2075,7 @@ def meta_eval(
     extra_timeframes: str = typer.Option("4H,1D,1W"),
     device: str = typer.Option("auto"),
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "plot" / "xgb_eval")),
+    candles: bool = typer.Option(False, help="Plot OHLC candles instead of line"),
 ):
     # Load data and features
     path = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange) or _find_data_file(userdir, pair, timeframe, prefer_exchange)
@@ -2126,7 +2174,23 @@ def meta_eval(
         band = _np.clip(meta_score.astype(float), -1.0, 1.0).reshape(1, Tn)
         ax.imshow(band, aspect='auto', cmap='RdYlGn', alpha=0.18,
                   extent=[0, Tn, float(_np.nanmin(close)), float(_np.nanmax(close))])
-        ax.plot(range(Tn), close, color='#1f77b4', linewidth=1.0)
+        # Optional candles overlay
+        if bool(_coerce_opt(candles, False)):
+            o = feats["open"].astype(float).to_numpy() if "open" in feats.columns else raw["open"].astype(float).to_numpy()
+            hi = feats["high"].astype(float).to_numpy() if "high" in feats.columns else raw["high"].astype(float).to_numpy()
+            lo = feats["low"].astype(float).to_numpy() if "low" in feats.columns else raw["low"].astype(float).to_numpy()
+            try:
+                up = (close >= o)
+                colors_body = _np.where(up, "#2ca02c", "#d62728")
+                width = 0.8
+                ax.vlines(range(Tn), lo, hi, color=colors_body, linewidth=0.8, alpha=0.9)
+                heights = _np.abs(close - o)
+                bottoms = _np.minimum(close, o)
+                ax.bar(range(Tn), height=heights, bottom=bottoms, width=0.7, color=colors_body, alpha=0.6, linewidth=0.0)
+            except Exception:
+                ax.plot(range(Tn), close, color='#1f77b4', linewidth=1.0)
+        else:
+            ax.plot(range(Tn), close, color='#1f77b4', linewidth=1.0)
         ax.set_title(f"Meta regime shading (+1 long / -1 short) {pair} {timeframe}")
         ax.grid(alpha=0.25)
         _safe_savefig(fig, os.path.join(root, "meta_regime.png"))
@@ -2155,6 +2219,7 @@ def trendchange_eval(
     p_thr: float = typer.Option(0.6, help="Threshold for marking predicted trend changes"),
     min_gap_bars: int = typer.Option(8, help="Min separation between displayed events (peak picking)"),
     peak_window: int = typer.Option(3, help="Local max window for eventization of probabilities"),
+    candles: bool = typer.Option(False, help="Plot OHLC candles instead of line"),
 ):
     path = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange) or _find_data_file(userdir, pair, timeframe, prefer_exchange)
     if not path:
@@ -2224,7 +2289,10 @@ def trendchange_eval(
                 else:
                     tc_dn[i] = 1
         ev = {"tc_up": tc_up, "tc_dn": tc_dn}
-    _plot_price_with_events(idx, close, ev, title=f"Price with predicted trend changes {pair} {timeframe}", out_path=os.path.join(root, "trendchange_events.png"))
+    o = feats["open"].astype(float).to_numpy() if "open" in feats.columns else raw["open"].astype(float).to_numpy()
+    hi = feats["high"].astype(float).to_numpy() if "high" in feats.columns else raw["high"].astype(float).to_numpy()
+    lo = feats["low"].astype(float).to_numpy() if "low" in feats.columns else raw["low"].astype(float).to_numpy()
+    _plot_price_with_events(idx, close, ev, title=f"Price with predicted trend changes {pair} {timeframe}", out_path=os.path.join(root, "trendchange_events.png"), o=o, h=hi, l=lo, use_candles=bool(_coerce_opt(candles, False)))
     _plot_feature_importance(clf, cols or list(feats.columns), out_path=os.path.join(root, "fi_trendchange.png"), title="Feature importance - TrendChange")
     typer.echo(json.dumps({"outdir": root, "samples": int(T)}, indent=2))
 
