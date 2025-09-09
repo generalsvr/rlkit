@@ -220,6 +220,12 @@ def _plot_price_with_events(index, close: np.ndarray, events: Dict[str, np.ndarr
         "top": "#d62728",
         "up_sig": "#17becf",
         "dn_sig": "#9467bd",
+        "tc_up": "#2ca02c",
+        "tc_dn": "#d62728",
+        "trend_up": "#2ca02c",
+        "trend_dn": "#d62728",
+        "buy": "#2ca02c",
+        "sell": "#d62728",
     }
     for name, mask in events.items():
         if mask is None:
@@ -1387,6 +1393,101 @@ def _label_trend_change_within_horizon(y_top: np.ndarray, y_bot: np.ndarray, hor
     return y
 
 
+def _compute_atr_norm_fast(feats: pd.DataFrame, raw: pd.DataFrame) -> np.ndarray:
+    if "atr" in feats.columns:
+        try:
+            a = feats["atr"].astype(float).to_numpy()
+            if np.any(np.isfinite(a)):
+                return a
+        except Exception:
+            pass
+    # Fallback compute
+    high = feats["high"].astype(float).to_numpy() if "high" in feats.columns else raw["high"].astype(float).to_numpy()
+    low = feats["low"].astype(float).to_numpy() if "low" in feats.columns else raw["low"].astype(float).to_numpy()
+    close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
+    tr1 = high - low
+    tr2 = np.abs(high - np.roll(close, 1))
+    tr3 = np.abs(low - np.roll(close, 1))
+    tr = np.maximum.reduce([tr1, tr2, tr3])
+    tr[0] = high[0] - low[0]
+    atr = pd.Series(tr).ewm(alpha=1/14, adjust=False).mean().to_numpy() / (close + 1e-12)
+    return atr
+
+
+def _strong_pivot_mask(
+    close: np.ndarray,
+    atr_norm: np.ndarray,
+    y_top: np.ndarray,
+    y_bot: np.ndarray,
+    post_h: int,
+    pre_h: int,
+    thr_mult: float,
+    pre_mult: float,
+) -> np.ndarray:
+    T = int(len(close))
+    Hf = int(max(1, post_h))
+    Hb = int(max(1, pre_h))
+    strong = np.zeros(T, dtype=bool)
+    for k in np.flatnonzero((y_top == 1) | (y_bot == 1)):
+        c0 = float(close[k])
+        atr0 = float(atr_norm[k]) if np.isfinite(atr_norm[k]) else 0.0
+        if atr0 <= 0.0:
+            continue
+        # Pre-move magnitude (build-up)
+        j0 = max(0, k - Hb)
+        pre_move = 0.0
+        if y_top[k] == 1:
+            pre_move = (c0 - float(np.min(close[j0:k+1]))) / (c0 + 1e-12)
+        else:
+            pre_move = (float(np.max(close[j0:k+1])) - c0) / (c0 + 1e-12)
+        if pre_move < (pre_mult * atr0):
+            continue
+        # Post reaction magnitude (follow-through)
+        j1 = min(T, k + Hf + 1)
+        if (j1 - (k+1)) <= 0:
+            continue
+        if y_top[k] == 1:
+            post_move = (c0 - float(np.min(close[k+1:j1]))) / (c0 + 1e-12)
+        else:
+            post_move = (float(np.max(close[k+1:j1])) - c0) / (c0 + 1e-12)
+        if post_move >= (thr_mult * atr0):
+            strong[k] = True
+    return strong
+
+
+def _label_trendchange_strong(
+    close: np.ndarray,
+    atr_norm: np.ndarray,
+    y_top: np.ndarray,
+    y_bot: np.ndarray,
+    horizon: int,
+    pre_h: int,
+    thr_mult: float,
+    pre_mult: float,
+    anchor_offset: int,
+    mode: str = "anchor",
+) -> np.ndarray:
+    # Identify strong pivots
+    strong = _strong_pivot_mask(close, atr_norm, y_top, y_bot, post_h=int(horizon), pre_h=int(pre_h), thr_mult=float(thr_mult), pre_mult=float(pre_mult))
+    piv_idx = np.flatnonzero(strong)
+    T = int(len(close))
+    y = np.zeros(T, dtype=int)
+    m = str(mode).lower().strip()
+    if m == "window":
+        H = int(max(1, horizon))
+        for t in range(T):
+            r1 = t + 1
+            r2 = min(T, t + H + 1)
+            if r1 < r2:
+                if np.any(strong[r1:r2]):
+                    y[t] = 1
+    else:  # anchor mode: set a single positive at fixed lead before each strong pivot
+        off = int(max(0, anchor_offset))
+        for k in piv_idx:
+            t = int(max(0, k - off))
+            y[t] = 1
+    return y
+
 @app.command("trendchange-train")
 def trendchange_train(
     pair: str = typer.Option("BTC/USDT"),
@@ -1402,7 +1503,12 @@ def trendchange_train(
     left_bars: int = typer.Option(3),
     right_bars: int = typer.Option(3),
     min_gap_bars: int = typer.Option(4),
-    horizon: int = typer.Option(8, help="Bars ahead to look for first pivot (trend change)"),
+    horizon: int = typer.Option(8, help="Bars ahead to look for strong pivot reaction"),
+    label_mode: str = typer.Option("anchor", help="anchor|window: sparse anchor labels or window labels"),
+    thr_mult: float = typer.Option(1.8, help="ATR-multiple for post-pivot reaction strength"),
+    pre_h: int = typer.Option(16, help="Bars to measure pre-move build-up before pivot"),
+    pre_mult: float = typer.Option(1.0, help="ATR-multiple for pre-move build-up"),
+    anchor_offset: int = typer.Option(2, help="Bars before pivot to place positive label in anchor mode"),
     # XGB
     device: str = typer.Option("auto"),
     n_estimators: int = typer.Option(600),
@@ -1461,6 +1567,11 @@ def trendchange_train(
     n_trials = int(_coerce_opt(n_trials, 0))
     sampler = str(_coerce_opt(sampler, "tpe"))
     seed = int(_coerce_opt(seed, 42))
+    label_mode = str(_coerce_opt(label_mode, "anchor"))
+    thr_mult = float(_coerce_opt(thr_mult, 1.8))
+    pre_h = int(_coerce_opt(pre_h, 16))
+    pre_mult = float(_coerce_opt(pre_mult, 1.0))
+    anchor_offset = int(_coerce_opt(anchor_offset, 2))
 
     feats = make_features(raw, mode=feature_mode, basic_lookback=basic_lookback, extra_timeframes=(etf or None)).reset_index(drop=True)
     if str(ae_path).strip():
@@ -1478,8 +1589,20 @@ def trendchange_train(
             typer.echo(f"AE embeddings failed (TrendChange), proceeding without: {e}")
 
     close = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
+    atrn = _compute_atr_norm_fast(feats, raw)
     yb, yt = _label_pivots(close, int(left_bars), int(right_bars), int(min_gap_bars))
-    y_change = _label_trend_change_within_horizon(yt, yb, int(horizon))
+    y_change = _label_trendchange_strong(
+        close=close,
+        atr_norm=atrn,
+        y_top=yt,
+        y_bot=yb,
+        horizon=int(horizon),
+        pre_h=int(pre_h),
+        thr_mult=float(thr_mult),
+        pre_mult=float(pre_mult),
+        anchor_offset=int(anchor_offset),
+        mode=str(label_mode),
+    )
 
     T = len(feats)
     valid = max(0, T - int(horizon))
@@ -1487,6 +1610,11 @@ def trendchange_train(
         raise ValueError("Not enough data to train TrendChange.")
     X = feats.iloc[:valid, :].copy()
     y = y_change[:valid]
+
+    # Ensure class balance is not degenerate
+    pos = int(np.sum(y == 1))
+    if pos < 50:
+        typer.echo(f"Warning: very few positives for TrendChange ({pos}). Consider lowering thr_mult or pre_mult, or switch label_mode to 'window'.")
 
     # Split time-based
     cut = int(max(200, min(valid - 50, int(valid * 0.8))))
@@ -2025,6 +2153,8 @@ def trendchange_eval(
     outdir: str = typer.Option(str(Path(__file__).resolve().parent / "plot" / "xgb_eval")),
     device: str = typer.Option("auto"),
     p_thr: float = typer.Option(0.6, help="Threshold for marking predicted trend changes"),
+    min_gap_bars: int = typer.Option(8, help="Min separation between displayed events (peak picking)"),
+    peak_window: int = typer.Option(3, help="Local max window for eventization of probabilities"),
 ):
     path = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange) or _find_data_file(userdir, pair, timeframe, prefer_exchange)
     if not path:
@@ -2050,7 +2180,50 @@ def trendchange_eval(
     root = _ts_outdir(str(_coerce_opt(outdir, str(Path(__file__).resolve().parent / "plot" / "xgb_eval"))), prefix="trendchange")
     thr_val = float(_coerce_opt(p_thr, 0.6))
     _plot_prob_series(idx, {"p_change": p_change}, thresholds={"thr": thr_val}, title=f"Trend change probability {pair} {timeframe}", out_path=os.path.join(root, "trendchange_probs.png"))
-    ev = {"trend_change_pred": (p_change >= thr_val).astype(int)}
+    # Peak-pick events for clearer signals
+    try:
+        gap = int(_coerce_opt(min_gap_bars, 8))
+        win = int(max(1, _coerce_opt(peak_window, 3)))
+        Tn = len(p_change)
+        peaks = np.zeros(Tn, dtype=int)
+        last = -10**9
+        for i in range(Tn):
+            j0 = max(0, i - win)
+            j1 = min(Tn, i + win + 1)
+            pc = p_change[i]
+            if pc >= thr_val and i - last >= gap and pc == np.max(p_change[j0:j1]):
+                peaks[i] = 1
+                last = i
+        # Classify peaks by local slope to color green/red
+        slope = np.gradient(close.astype(float))
+        tc_up = np.zeros(Tn, dtype=int)
+        tc_dn = np.zeros(Tn, dtype=int)
+        for i in np.flatnonzero(peaks == 1):
+            # Compare next vs prev price to infer direction change
+            prev_idx = max(0, i-1)
+            next_idx = min(Tn-1, i+1)
+            d = close[next_idx] - close[prev_idx]
+            if d >= 0:
+                tc_up[i] = 1
+            else:
+                tc_dn[i] = 1
+        ev = {"tc_up": tc_up, "tc_dn": tc_dn}
+    except Exception:
+        mask = (p_change >= thr_val).astype(int)
+        # Fallback coloring by slope sign
+        Tn = len(mask)
+        tc_up = np.zeros(Tn, dtype=int)
+        tc_dn = np.zeros(Tn, dtype=int)
+        for i in range(Tn):
+            if mask[i] == 1:
+                prev_idx = max(0, i-1)
+                next_idx = min(Tn-1, i+1)
+                d = close[next_idx] - close[prev_idx]
+                if d >= 0:
+                    tc_up[i] = 1
+                else:
+                    tc_dn[i] = 1
+        ev = {"tc_up": tc_up, "tc_dn": tc_dn}
     _plot_price_with_events(idx, close, ev, title=f"Price with predicted trend changes {pair} {timeframe}", out_path=os.path.join(root, "trendchange_events.png"))
     _plot_feature_importance(clf, cols or list(feats.columns), out_path=os.path.join(root, "fi_trendchange.png"), title="Feature importance - TrendChange")
     typer.echo(json.dumps({"outdir": root, "samples": int(T)}, indent=2))
