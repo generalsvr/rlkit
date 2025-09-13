@@ -396,7 +396,11 @@ def _train_xgb_classifier(
 
     evals = []
     if int(X_val.shape[0]) > 0 and int(X_val.shape[0]) == int(y_val.shape[0]):
-        evals = [(X_val, y_val)]
+        # Only include eval set when both classes are present to avoid AUC warnings
+        has_pos = bool(np.sum(y_val == 1) > 0)
+        has_neg = bool(np.sum(y_val == 0) > 0)
+        if has_pos and has_neg:
+            evals = [(X_val, y_val)]
     model.fit(X_tr, y_tr, eval_set=evals, verbose=False)
 
     metrics: Dict[str, float] = {}

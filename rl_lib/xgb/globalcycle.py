@@ -308,11 +308,16 @@ def globalcycle_train(
                 X_t = feats.iloc[:valid_t, :]
                 # choose a validation split that contains some positives
                 def _choose_cut(yb_arr: np.ndarray, yt_arr: np.ndarray, vt: int) -> int:
-                    for frac in [0.8, 0.85, 0.9, 0.75, 0.7]:
+                    # Require both classes appear in validation for at least one side
+                    for frac in [0.8, 0.85, 0.9, 0.75, 0.7, 0.65]:
                         cut = int(max(150, min(vt - 50, int(vt * frac))))
-                        yb_va = yb_arr[cut:]
-                        yt_va = yt_arr[cut:]
-                        if (int(np.sum(yb_va == 1)) >= 2) or (int(np.sum(yt_va == 1)) >= 2):
+                        if cut >= vt - 1:
+                            continue
+                        yb_va = yb_arr[cut:vt]
+                        yt_va = yt_arr[cut:vt]
+                        has_bot = (np.sum(yb_va == 1) > 0) and (np.sum(yb_va == 0) > 0)
+                        has_top = (np.sum(yt_va == 1) > 0) and (np.sum(yt_va == 0) > 0)
+                        if has_bot or has_top:
                             return cut
                     return -1
                 cut_t = _choose_cut(yb_t, yt_t, valid_t)
