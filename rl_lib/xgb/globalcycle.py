@@ -306,7 +306,18 @@ def globalcycle_train(
                 if valid_t < 300:
                     return float('-inf')
                 X_t = feats.iloc[:valid_t, :]
-                cut_t = int(max(150, min(valid_t - 50, int(valid_t * 0.8))))
+                # choose a validation split that contains some positives
+                def _choose_cut(yb_arr: np.ndarray, yt_arr: np.ndarray, vt: int) -> int:
+                    for frac in [0.8, 0.85, 0.9, 0.75, 0.7]:
+                        cut = int(max(150, min(vt - 50, int(vt * frac))))
+                        yb_va = yb_arr[cut:]
+                        yt_va = yt_arr[cut:]
+                        if (int(np.sum(yb_va == 1)) >= 2) or (int(np.sum(yt_va == 1)) >= 2):
+                            return cut
+                    return -1
+                cut_t = _choose_cut(yb_t, yt_t, valid_t)
+                if cut_t < 0:
+                    return float('-inf')
                 X_tr_t = X_t.iloc[:cut_t, :].values
                 X_va_t = X_t.iloc[cut_t:, :].values
                 yb_tr_t, yb_va_t = yb_t[:cut_t], yb_t[cut_t:]
