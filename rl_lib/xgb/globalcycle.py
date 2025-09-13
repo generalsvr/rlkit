@@ -167,6 +167,7 @@ def globalcycle_train(
     reg_lambda: float = typer.Option(1.0),
     n_jobs: int = typer.Option(0),
     n_trials: int = typer.Option(0, "--n-trials", "--n_trials", help="If >0, run Optuna tuning"),
+    tune_labels: bool = typer.Option(True, help="When tuning, also search labeling params"),
     sampler: str = typer.Option("tpe", help="tpe|random"),
     seed: int = typer.Option(42),
     outdir: str = typer.Option(str(Path(__file__).resolve().parents[2] / "models" / "xgb_stack")),
@@ -281,12 +282,90 @@ def globalcycle_train(
                 "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 1.0),
                 "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 2.0),
             }
-            _, _, score = _fit_eval(params)
+            if bool(tune_labels):
+                # sample label parameters around seeds
+                win_t = trial.suggest_int("window", max(8, int(window) - 8), min(60, int(window) + 12))
+                hor_t = trial.suggest_int("horizon", max(50, int(horizon * 0.5)), min(2880, int(horizon * 2)))
+                dfrac_t = trial.suggest_float("down_frac", max(0.10, float(down_frac) - 0.10), min(0.50, float(down_frac) + 0.15))
+                ufrac_t = trial.suggest_float("up_frac", max(0.10, float(up_frac) - 0.10), min(0.50, float(up_frac) + 0.15))
+                beps_t = trial.suggest_float("breakout_eps", 0.003, 0.02)
+                mp_t = trial.suggest_int("min_persist", max(10, int(min_persist) - 10), min(60, int(min_persist) + 20))
+                ms_t = trial.suggest_int("min_separation", max(24, int(min_separation) - 48), min(240, int(min_separation) + 96))
+                sm_t = trial.suggest_int("smooth_window", 0, max(144, int(smooth_window) + 72))
+                # rebuild labels
+                yb_t, yt_t = _label_global_cycle_extrema(
+                    c,
+                    window=int(win_t), horizon=int(hor_t),
+                    down_frac=float(dfrac_t), up_frac=float(ufrac_t),
+                    breakout_eps=float(beps_t), min_persist=int(mp_t),
+                    min_separation=int(ms_t), smooth_window=int(sm_t),
+                )
+                valid_t = max(0, len(feats) - int(hor_t))
+                if valid_t < 300:
+                    return float('-inf')
+                X_t = feats.iloc[:valid_t, :]
+                cut_t = int(max(150, min(valid_t - 50, int(valid_t * 0.8))))
+                X_tr_t = X_t.iloc[:cut_t, :].values
+                X_va_t = X_t.iloc[cut_t:, :].values
+                yb_tr_t, yb_va_t = yb_t[:cut_t], yb_t[cut_t:]
+                yt_tr_t, yt_va_t = yt_t[:cut_t], yt_t[cut_t:]
+                bm, m1 = _train_xgb_classifier(
+                    X_tr_t, yb_tr_t, X_va_t, yb_va_t, device_v,
+                    n_estimators=int(params["n_estimators"]), max_depth=int(params["max_depth"]),
+                    min_child_weight=float(params["min_child_weight"]), learning_rate=float(params["learning_rate"]),
+                    subsample=float(params["subsample"]), colsample_bytree=float(params["colsample_bytree"]),
+                    reg_alpha=float(params["reg_alpha"]), reg_lambda=float(params["reg_lambda"]), n_jobs=int(n_jobs),
+                    objective="binary:logistic",
+                )
+                tm, m2 = _train_xgb_classifier(
+                    X_tr_t, yt_tr_t, X_va_t, yt_va_t, device_v,
+                    n_estimators=int(params["n_estimators"]), max_depth=int(params["max_depth"]),
+                    min_child_weight=float(params["min_child_weight"]), learning_rate=float(params["learning_rate"]),
+                    subsample=float(params["subsample"]), colsample_bytree=float(params["colsample_bytree"]),
+                    reg_alpha=float(params["reg_alpha"]), reg_lambda=float(params["reg_lambda"]), n_jobs=int(n_jobs),
+                    objective="binary:logistic",
+                )
+                from sklearn.metrics import average_precision_score as _aps
+                try:
+                    ap_b = float(_aps(yb_va_t, bm.predict_proba(X_va_t)[:, 1]))
+                    ap_t = float(_aps(yt_va_t, tm.predict_proba(X_va_t)[:, 1]))
+                except Exception:
+                    ap_b = float('nan'); ap_t = float('nan')
+                score = float(np.nanmean([ap_b, ap_t]))
+            else:
+                _, _, score = _fit_eval(params)
+            return score
             return score
         study = optuna.create_study(direction="maximize", sampler=smp)
         typer.echo(f"Optuna GlobalCycle trials: {n_trials}")
         study.optimize(objective, n_trials=int(n_trials))
         best_params = study.best_params
+        # propagate best label params if tuned
+        if bool(tune_labels):
+            window = int(best_params.get("window", window))
+            horizon = int(best_params.get("horizon", horizon))
+            down_frac = float(best_params.get("down_frac", down_frac))
+            up_frac = float(best_params.get("up_frac", up_frac))
+            breakout_eps = float(best_params.get("breakout_eps", breakout_eps))
+            min_persist = int(best_params.get("min_persist", min_persist))
+            min_separation = int(best_params.get("min_separation", min_separation))
+            smooth_window = int(best_params.get("smooth_window", smooth_window))
+            yb_full, yt_full = _label_global_cycle_extrema(
+                c,
+                window=int(window), horizon=int(horizon),
+                down_frac=float(down_frac), up_frac=float(up_frac),
+                breakout_eps=float(breakout_eps), min_persist=int(min_persist),
+                min_separation=int(min_separation), smooth_window=int(smooth_window),
+            )
+            valid_len = max(0, len(feats) - int(horizon))
+            X = feats.iloc[:valid_len, :]
+            yb = yb_full[:valid_len]
+            yt = yt_full[:valid_len]
+            cut = int(max(150, min(valid_len - 50, int(valid_len * 0.8))))
+            X_tr = X.iloc[:cut, :].values
+            X_val = X.iloc[cut:, :].values
+            yb_tr, yb_val = yb[:cut], yb[cut:]
+            yt_tr, yt_val = yt[:cut], yt[cut:]
         bot_model, top_model, best_score = _fit_eval(best_params)
         typer.echo(f"Best GlobalCycle mean AUPRC: {best_score:.6f}")
     else:
