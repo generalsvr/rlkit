@@ -265,6 +265,8 @@ def globalcycle_train(
             objective="binary:logistic",
         )
         val = float(np.nanmean([float(m1.get("auprc", float("nan"))), float(m2.get("auprc", float("nan")))]))
+        if not np.isfinite(val):
+            val = float('-inf')
         return bot_m, top_m, val
 
     if int(n_trials) and n_trials > 0:
@@ -326,12 +328,22 @@ def globalcycle_train(
                     objective="binary:logistic",
                 )
                 from sklearn.metrics import average_precision_score as _aps
-                try:
-                    ap_b = float(_aps(yb_va_t, bm.predict_proba(X_va_t)[:, 1]))
-                    ap_t = float(_aps(yt_va_t, tm.predict_proba(X_va_t)[:, 1]))
-                except Exception:
-                    ap_b = float('nan'); ap_t = float('nan')
-                score = float(np.nanmean([ap_b, ap_t]))
+                # Guard: require both classes present in validation for each side
+                score_vals: list[float] = []
+                if int(X_va_t.shape[0]) > 0:
+                    if 0 < int(np.sum(yb_va_t == 1)) < int(yb_va_t.shape[0]):
+                        try:
+                            score_vals.append(float(_aps(yb_va_t, bm.predict_proba(X_va_t)[:, 1])))
+                        except Exception:
+                            pass
+                    if 0 < int(np.sum(yt_va_t == 1)) < int(yt_va_t.shape[0]):
+                        try:
+                            score_vals.append(float(_aps(yt_va_t, tm.predict_proba(X_va_t)[:, 1])))
+                        except Exception:
+                            pass
+                if not score_vals:
+                    return float('-inf')
+                score = float(np.mean(score_vals))
             else:
                 _, _, score = _fit_eval(params)
             return score
