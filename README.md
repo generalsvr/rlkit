@@ -218,11 +218,12 @@ Train XGBoost models for market prediction with hierarchical stacking:
 ```bash
 python xgb_trainer.py train-all \
   --pair BTC/USDT --timeframe 1h \
-  --userdir freqtrade_userdir --timerange 20190101- \
+  --userdir freqtrade_userdir --timerange 20160101- \
   --prefer-exchange bybit \
   --outdir ./models/xgb_stack \
   --optuna-trials 40 \
   --cv-splits 5 --cv-scheme expanding --cv-val-size 2000 --perm-test 500 \
+  --no-ae-enable \
   --auto-backtest True --backtest-timerange 20240101-
 ```
 
@@ -230,6 +231,7 @@ python xgb_trainer.py train-all \
 
 **TopBot (Pivot Detection)**:
 ```bash
+
 python xgb_trainer.py topbot-train \
   --pair BTC/USDT --timeframe 1h \
   --userdir freqtrade_userdir --timerange 20190101- \
