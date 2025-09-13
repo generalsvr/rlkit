@@ -207,6 +207,8 @@ def impulse_eval(
     extra_timeframes: str = typer.Option("4H,1D,1W"),
     outdir: str = typer.Option(str(Path(__file__).resolve().parents[3] / "plot" / "xgb_eval")),
     device: str = typer.Option("auto"),
+    up_thr: float = typer.Option(0.6, help="Probability threshold for up trigger"),
+    dn_thr: float = typer.Option(0.6, help="Probability threshold for down trigger"),
 ):
     path = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange) or _find_data_file(userdir, pair, timeframe, prefer_exchange)  # type: ignore
     if not path:
@@ -232,11 +234,13 @@ def impulse_eval(
     p_up1 = p_up[:, 1] if (p_up is not None and p_up.ndim == 2 and p_up.shape[1] >= 2) else np.zeros(T)
     p_dn1 = p_dn[:, 1] if (p_dn is not None and p_dn.ndim == 2 and p_dn.shape[1] >= 2) else np.zeros(T)
 
+    ut = float(_coerce_opt(up_thr, 0.6))
+    dt = float(_coerce_opt(dn_thr, 0.6))
     root = _ts_outdir(str(_coerce_opt(outdir, str(Path(__file__).resolve().parents[3] / "plot" / "xgb_eval"))), prefix="impulse")
-    _plot_prob_series(idx, {"p_up": p_up1, "p_dn": p_dn1}, thresholds=None, title=f"Impulse probabilities {pair} {timeframe}", out_path=os.path.join(root, "impulse_probs.png"))
+    _plot_prob_series(idx, {"p_up": p_up1, "p_dn": p_dn1}, thresholds={"p_up": ut, "p_dn": dt}, title=f"Impulse probabilities {pair} {timeframe}", out_path=os.path.join(root, "impulse_probs.png"))
     ev = {
-        "up_sig": (p_up1 >= 0.6).astype(int),
-        "dn_sig": (p_dn1 >= 0.6).astype(int),
+        "up_sig": (p_up1 >= ut).astype(int),
+        "dn_sig": (p_dn1 >= dt).astype(int),
     }
     _plot_price_with_events(idx, close, ev, title=f"Price with impulse signals {pair} {timeframe}", out_path=os.path.join(root, "impulse_events.png"))
     _plot_feature_importance(up_clf, up_cols or list(feats.columns), out_path=os.path.join(root, "fi_impulse_up.png"), title="Feature importance - Impulse Up")

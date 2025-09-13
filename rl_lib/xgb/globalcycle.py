@@ -460,6 +460,8 @@ def globalcycle_eval(
     outdir: str = typer.Option(str(Path(__file__).resolve().parents[2] / "plot" / "xgb_eval")),
     device: str = typer.Option("auto"),
     candles: bool = typer.Option(False, help="Plot OHLC candles instead of line"),
+    bot_thr: float = typer.Option(0.6, help="Probability threshold for bottom trigger"),
+    top_thr: float = typer.Option(0.6, help="Probability threshold for top trigger"),
 ):
     path = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange) or _find_data_file(userdir, pair, timeframe, prefer_exchange)  # type: ignore
     if not path:
@@ -485,11 +487,13 @@ def globalcycle_eval(
     p_bottom = p_bot[:, 1] if (p_bot is not None and p_bot.ndim == 2 and p_bot.shape[1] >= 2) else np.zeros(T)
     p_topp = p_top[:, 1] if (p_top is not None and p_top.ndim == 2 and p_top.shape[1] >= 2) else np.zeros(T)
 
+    bt = float(_coerce_opt(bot_thr, 0.6))
+    tt = float(_coerce_opt(top_thr, 0.6))
     root = _ts_outdir(str(_coerce_opt(outdir, str(Path(__file__).resolve().parents[2] / "plot" / "xgb_eval"))), prefix="globalcycle")
-    _plot_prob_series(idx, {"p_bottom": p_bottom, "p_top": p_topp}, thresholds=None, title=f"GlobalCycle Probabilities {pair} {timeframe}", out_path=os.path.join(root, "globalcycle_probs.png"))
+    _plot_prob_series(idx, {"p_bottom": p_bottom, "p_top": p_topp}, thresholds={"p_bottom": bt, "p_top": tt}, title=f"GlobalCycle Probabilities {pair} {timeframe}", out_path=os.path.join(root, "globalcycle_probs.png"))
     ev = {
-        "bottom": (p_bottom >= 0.6).astype(int),
-        "top": (p_topp >= 0.6).astype(int),
+        "bottom": (p_bottom >= bt).astype(int),
+        "top": (p_topp >= tt).astype(int),
     }
     o = feats["open"].astype(float).to_numpy() if "open" in feats.columns else raw["open"].astype(float).to_numpy()
     hi = feats["high"].astype(float).to_numpy() if "high" in feats.columns else raw["high"].astype(float).to_numpy()
