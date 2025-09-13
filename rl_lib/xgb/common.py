@@ -358,6 +358,18 @@ def _train_xgb_classifier(
     from sklearn.metrics import average_precision_score, f1_score, accuracy_score
 
     dev = _resolve_device(device)
+    # Align shapes defensively
+    def _align_xy(X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        Xn = np.asarray(X)
+        yn = np.asarray(y).reshape(-1)
+        n = int(min(Xn.shape[0], yn.shape[0]))
+        if n <= 0:
+            return Xn[:0, :], yn[:0]
+        return Xn[:n, :], yn[:n]
+
+    X_tr, y_tr = _align_xy(X_tr, y_tr)
+    X_val, y_val = _align_xy(X_val, y_val)
+
     kwargs = dict(
         tree_method="hist",
         device=dev,
@@ -376,30 +388,37 @@ def _train_xgb_classifier(
     if objective.startswith("multi:"):
         model = xgb.XGBClassifier(objective=objective, num_class=int(max(2, num_class)), **kwargs)
     else:
+        # Class imbalance weight for binary
         pos = float(np.sum(y_tr == 1))
         neg = float(np.sum(y_tr == 0))
         spw = float(max(1.0, (neg / max(1.0, pos))))
         model = xgb.XGBClassifier(objective=objective, scale_pos_weight=spw, **kwargs)
 
-    model.fit(X_tr, y_tr, eval_set=[(X_val, y_val)], verbose=False)
+    evals = []
+    if int(X_val.shape[0]) > 0 and int(X_val.shape[0]) == int(y_val.shape[0]):
+        evals = [(X_val, y_val)]
+    model.fit(X_tr, y_tr, eval_set=evals, verbose=False)
 
     metrics: Dict[str, float] = {}
     if objective.startswith("multi:"):
-        p = model.predict_proba(X_val)
-        y_hat = np.argmax(p, axis=1)
+        p = model.predict_proba(X_val) if int(X_val.shape[0]) > 0 else np.zeros((0, int(max(2, num_class))))
+        y_hat = np.argmax(p, axis=1) if p.size else np.array([], dtype=int)
         try:
-            metrics["acc"] = float(accuracy_score(y_val, y_hat))
+            metrics["acc"] = float(accuracy_score(y_val, y_hat)) if y_hat.size else float("nan")
         except Exception:
             metrics["acc"] = float("nan")
     else:
-        p = model.predict_proba(X_val)[:, 1]
-        y_hat = (p >= 0.5).astype(int)
-        try:
-            metrics["auprc"] = float(average_precision_score(y_val, p))
-            metrics["f1"] = float(f1_score(y_val, y_hat))
-            metrics["acc"] = float(accuracy_score(y_val, y_hat))
-        except Exception:
-            metrics["auprc"] = metrics.get("auprc", float("nan"))
+        if int(X_val.shape[0]) > 0:
+            p = model.predict_proba(X_val)[:, 1]
+            y_hat = (p >= 0.5).astype(int)
+            try:
+                metrics["auprc"] = float(average_precision_score(y_val, p))
+                metrics["f1"] = float(f1_score(y_val, y_hat))
+                metrics["acc"] = float(accuracy_score(y_val, y_hat))
+            except Exception:
+                metrics["auprc"] = metrics.get("auprc", float("nan"))
+        else:
+            metrics["auprc"] = float("nan")
     return model, metrics
 
 
