@@ -247,6 +247,15 @@ def make_features(
         # MACD
         macd_line = (ema_fast - ema_slow) / (c + 1e-12)
         macd_signal = pd.Series(macd_line).ewm(span=9, adjust=False).mean().to_numpy()
+        # Deceleration/curvature
+        try:
+            d_lr_slope_90_60 = pd.Series(lr_slope_90).diff(60).fillna(0.0).to_numpy()
+        except Exception:
+            d_lr_slope_90_60 = np.zeros_like(lr_slope_90)
+        try:
+            ema_slow_curvature = np.diff(ema_slow, n=2, prepend=ema_slow[0], append=ema_slow[-1]) / (c + 1e-12)
+        except Exception:
+            ema_slow_curvature = np.zeros_like(c)
         # Stochastic Oscillator
         hh = pd.Series(h).rolling(14, min_periods=1).max().to_numpy()
         ll = pd.Series(l).rolling(14, min_periods=1).min().to_numpy()
@@ -387,6 +396,8 @@ def make_features(
                 return 0.0
             return float(np.abs(np.mean(tail)))
         expected_shortfall = pd.Series(logret).rolling(128, min_periods=32).apply(lambda a: _es_alpha(a, 0.05), raw=True).fillna(0.0).to_numpy()
+        es_trend_20 = pd.Series(expected_shortfall).ewm(span=20, adjust=False).mean() - pd.Series(expected_shortfall).ewm(span=60, adjust=False).mean()
+        es_trend_20 = es_trend_20.fillna(0.0).to_numpy()
 
         feats = pd.DataFrame({
             "open": base["open"].values,
@@ -413,6 +424,8 @@ def make_features(
             "lr_slope_90": lr_slope_90,
             "macd_line": macd_line,
             "macd_signal": macd_signal,
+            "d_lr_slope_90_60": d_lr_slope_90_60,
+            "ema_slow_curvature": ema_slow_curvature,
             "stoch_k": stoch_k,
             "stoch_d": stoch_d,
             "roc_10": roc_10,
@@ -454,6 +467,7 @@ def make_features(
             # Risk mgmt
             "drawdown_z_64": drawdown_z,
             "expected_shortfall_0_05_128": expected_shortfall,
+            "es_trend_20": es_trend_20,
         }, index=base.index)
 
         # ADX (14) normalized
@@ -508,6 +522,15 @@ def make_features(
             feats["rlte_sell_pocket_gap"] = sell_gap.astype(float)
             feats["rlte_price_inside_buy"] = price_inside_buy.astype(float)
             feats["rlte_price_inside_sell"] = price_inside_sell.astype(float)
+            # RLTE densities and run lengths over 60 bars
+            try:
+                rb = pd.Series(feats["rlte_in_buy_pocket"]).rolling(60, min_periods=5).mean().fillna(0.0).to_numpy()
+                rs = pd.Series(feats["rlte_in_sell_pocket"]).rolling(60, min_periods=5).mean().fillna(0.0).to_numpy()
+                feats["rlte_buy_density_60"] = rb
+                feats["rlte_sell_density_60"] = rs
+            except Exception:
+                feats["rlte_buy_density_60"] = 0.0
+                feats["rlte_sell_density_60"] = 0.0
         except Exception:
             # If RLTE computation fails, add zeros to preserve schema
             feats["rlte_reg90"] = 0.0
@@ -546,6 +569,52 @@ def make_features(
         feats["MA200D"] = ma200d
         feats["MA50D"] = ma50d
         feats["MA20W"] = ma20w
+
+        # Long-horizon valuation and cycle distance (daily/weekly aligned)
+        try:
+            if isinstance(base.index, pd.DatetimeIndex):
+                close_series = base["close"].astype(float)
+                daily_close = close_series.resample("1D").last()
+                # Rolling daily ATH/ATL and distances
+                ath_365 = daily_close.rolling(365, min_periods=5).max().reindex(base.index).ffill()
+                atl_365 = daily_close.rolling(365, min_periods=5).min().reindex(base.index).ffill()
+                feats["dist_ATH_365D"] = (ath_365.to_numpy() - c) / (np.maximum(ath_365.to_numpy(), 1e-12))
+                feats["dist_ATL_365D"] = (c - atl_365.to_numpy()) / (np.maximum(atl_365.to_numpy(), 1e-12))
+                # Days since ATH/ATL (approximate via window argmax/argmin position)
+                dc = daily_close
+                def _days_since_extreme(s: pd.Series, win: int, mode: str) -> pd.Series:
+                    def _pos(a: np.ndarray) -> float:
+                        if a.size == 0:
+                            return 0.0
+                        idx = int(np.argmax(a)) if mode == "max" else int(np.argmin(a))
+                        return float(win - 1 - idx)
+                    return s.rolling(win, min_periods=5).apply(_pos, raw=True)
+                ds_ath = _days_since_extreme(dc, 365, "max").reindex(base.index).ffill().fillna(0.0)
+                ds_atl = _days_since_extreme(dc, 365, "min").reindex(base.index).ffill().fillna(0.0)
+                feats["days_since_ATH_365D"] = ds_ath.to_numpy()
+                feats["days_since_ATL_365D"] = ds_atl.to_numpy()
+                # Drawdown over daily horizons
+                dd365 = (ath_365.to_numpy() - c) / (np.maximum(ath_365.to_numpy(), 1e-12))
+                # 730D uses weekly proxy if fewer bars exist
+                weekly_close = close_series.resample("1W").last()
+                ath_730 = weekly_close.rolling(104, min_periods=5).max().reindex(base.index).ffill()
+                dd730 = (ath_730.to_numpy() - c) / (np.maximum(ath_730.to_numpy(), 1e-12))
+                feats["drawdown_365D"] = dd365
+                feats["drawdown_730D"] = dd730
+            else:
+                feats["dist_ATH_365D"] = 0.0
+                feats["dist_ATL_365D"] = 0.0
+                feats["days_since_ATH_365D"] = 0.0
+                feats["days_since_ATL_365D"] = 0.0
+                feats["drawdown_365D"] = 0.0
+                feats["drawdown_730D"] = 0.0
+        except Exception:
+            feats["dist_ATH_365D"] = 0.0
+            feats["dist_ATL_365D"] = 0.0
+            feats["days_since_ATH_365D"] = 0.0
+            feats["days_since_ATL_365D"] = 0.0
+            feats["drawdown_365D"] = 0.0
+            feats["drawdown_730D"] = 0.0
 
     # Add higher timeframe features (resampled and forward-filled) if requested
     if extra_timeframes:
@@ -681,6 +750,26 @@ def make_features(
                 except Exception:
                     # If resampling fails, skip this timeframe silently
                     continue
+            # After processing all HTFs, compute TF agreement composites
+            try:
+                def _col(name: str) -> np.ndarray:
+                    return feats[name].astype(float).to_numpy() if name in feats.columns else np.zeros(len(feats), dtype=float)
+                ema_list = [np.sign(_col("ema_fast_ratio"))]
+                rsi_list = [(_col("rsi") > 0.5).astype(float)]
+                if any(c.startswith("4H_") for c in feats.columns):
+                    ema_list.append(np.sign(_col("4H_ema_fast_ratio")))
+                    rsi_list.append((_col("4H_rsi") > 0.5).astype(float))
+                if any(c.startswith("1D_") for c in feats.columns):
+                    ema_list.append(np.sign(_col("1D_ema_fast_ratio")))
+                    rsi_list.append((_col("1D_rsi") > 0.5).astype(float))
+                if any(c.startswith("1W_") for c in feats.columns):
+                    ema_list.append(np.sign(_col("1W_ema_fast_ratio")))
+                    rsi_list.append((_col("1W_rsi") > 0.5).astype(float))
+                feats["tf_trend_agreement"] = np.mean(np.vstack(ema_list), axis=0)
+                feats["tf_rsi_agreement"] = np.mean(np.vstack(rsi_list), axis=0)
+            except Exception:
+                feats["tf_trend_agreement"] = 0.0
+                feats["tf_rsi_agreement"] = 0.0
         else:
             # Non-datetime index: ignore extra timeframes to avoid misalignment
             pass
