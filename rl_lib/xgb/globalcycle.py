@@ -309,6 +309,22 @@ def globalcycle_train(
     top_model.save_model(_ensure_outdir(top_path))
     _save_feature_columns(bot_path, list(feats.columns))
     _save_feature_columns(top_path, list(feats.columns))
+    # Save label meta for eval reproducibility
+    try:
+        meta = {
+            "window": int(window),
+            "horizon": int(horizon),
+            "down_frac": float(down_frac),
+            "up_frac": float(up_frac),
+            "breakout_eps": float(breakout_eps),
+            "min_persist": int(min_persist),
+            "min_separation": int(min_separation),
+            "smooth_window": int(smooth_window),
+        }
+        with open(os.path.join(outdir, "globalcycle_meta.json"), "w") as f:
+            json.dump(meta, f, indent=2)
+    except Exception:
+        pass
 
     try:
         from sklearn.metrics import average_precision_score as _aps
