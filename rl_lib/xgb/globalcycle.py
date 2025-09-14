@@ -462,7 +462,21 @@ def globalcycle_eval(
     candles: bool = typer.Option(False, help="Plot OHLC candles instead of line"),
     bot_thr: float = typer.Option(0.6, help="Probability threshold for bottom trigger"),
     top_thr: float = typer.Option(0.6, help="Probability threshold for top trigger"),
+    autodownload: bool = typer.Option(True, help="Auto-download required datasets including HTFs"),
 ):
+    # Ensure base TF and HTFs are available
+    if autodownload:
+        _ = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange)
+        # Map extra_timeframes to lowercase variants expected by downloader
+        try:
+            etf_opt = str(_coerce_opt(extra_timeframes, "4H,1D,1W"))
+            for tf in [s.strip().lower() for s in etf_opt.split(",") if s.strip()]:
+                try:
+                    _ensure_dataset(userdir, pair, tf, prefer_exchange, timerange)
+                except Exception:
+                    pass
+        except Exception:
+            pass
     path = _ensure_dataset(userdir, pair, timeframe, prefer_exchange, timerange) or _find_data_file(userdir, pair, timeframe, prefer_exchange)  # type: ignore
     if not path:
         raise FileNotFoundError("Dataset not found for evaluation.")
