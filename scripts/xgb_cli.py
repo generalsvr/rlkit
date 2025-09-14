@@ -6,7 +6,7 @@ from rl_lib.xgb.topbot import topbot_train, topbot_eval
 from rl_lib.xgb.logret import logret_train, logret_eval
 from rl_lib.xgb.trendchange import trendchange_train, trendchange_eval
 from rl_lib.xgb.impulse import impulse_train, impulse_eval
-from rl_lib.xgb.globalcycle import globalcycle_train, globalcycle_eval
+from rl_lib.xgb.globalcycle import globalcycle_train, globalcycle_eval, globalcycle_train_multi
 
 
 app = typer.Typer(add_completion=False)
@@ -23,6 +23,7 @@ app.command("impulse-train")(impulse_train)
 app.command("impulse-eval")(impulse_eval)
 app.command("globalcycle-train")(globalcycle_train)
 app.command("globalcycle-eval")(globalcycle_eval)
+app.command("globalcycle-train-multi")(globalcycle_train_multi)
 
 
 if __name__ == "__main__":

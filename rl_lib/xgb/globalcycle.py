@@ -143,7 +143,7 @@ def globalcycle_train(
     timeframe: str = typer.Option("1h"),
     userdir: str = typer.Option(str(Path(__file__).resolve().parents[2] / "freqtrade_userdir")),
     timerange: str = typer.Option("20190101-"),
-    prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
+    prefer_exchange: str = typer.Option("bybit", "--prefer-exchange"),
     feature_mode: str = typer.Option("full"),
     basic_lookback: int = typer.Option(64),
     extra_timeframes: str = typer.Option("4H,1D,1W"),
@@ -451,7 +451,7 @@ def globalcycle_eval(
     timeframe: str = typer.Option("1h"),
     userdir: str = typer.Option(str(Path(__file__).resolve().parents[2] / "freqtrade_userdir")),
     timerange: str = typer.Option("20240101-"),
-    prefer_exchange: str = typer.Option("bybit", "--prefer-exchange", "--prefer_exchange"),
+    prefer_exchange: str = typer.Option("bybit", "--prefer-exchange"),
     bot_path: str = typer.Option(str(Path(__file__).resolve().parents[2] / "models" / "xgb_stack" / "best_global_bottom.json")),
     top_path: str = typer.Option(str(Path(__file__).resolve().parents[2] / "models" / "xgb_stack" / "best_global_top.json")),
     feature_mode: str = typer.Option("full"),
@@ -508,4 +508,306 @@ def globalcycle_eval(
         pass
     typer.echo(json.dumps({"outdir": root, "samples": int(T)}, indent=2))
 
+
+@app.command("globalcycle-train-multi")
+def globalcycle_train_multi(
+    pairs: str = typer.Option("BTC/USDT,ETH/USDT", help="Comma-separated list of pairs"),
+    timeframe: str = typer.Option("1h"),
+    userdir: str = typer.Option(str(Path(__file__).resolve().parents[2] / "freqtrade_userdir")),
+    timerange: str = typer.Option("20190101-"),
+    prefer_exchange: str = typer.Option("binance", "--prefer-exchange"),
+    feature_mode: str = typer.Option("full"),
+    basic_lookback: int = typer.Option(64),
+    extra_timeframes: str = typer.Option("4H,1D,1W"),
+    ae_path: str = typer.Option("", help="Optional AE manifest (.json) to append embeddings"),
+    # Label params
+    window: int = typer.Option(14),
+    horizon: int = typer.Option(200),
+    down_frac: float = typer.Option(0.30),
+    up_frac: float = typer.Option(0.30),
+    breakout_eps: float = typer.Option(0.01),
+    min_persist: int = typer.Option(20),
+    min_separation: int = typer.Option(45),
+    smooth_window: int = typer.Option(0),
+    # XGB params
+    device: str = typer.Option("auto"),
+    n_estimators: int = typer.Option(700),
+    max_depth: int = typer.Option(6),
+    min_child_weight: float = typer.Option(1.0),
+    learning_rate: float = typer.Option(0.05),
+    subsample: float = typer.Option(0.8),
+    colsample_bytree: float = typer.Option(0.8),
+    reg_alpha: float = typer.Option(0.0),
+    reg_lambda: float = typer.Option(1.0),
+    n_jobs: int = typer.Option(0),
+    # Optuna
+    n_trials: int = typer.Option(0, "--n-trials", help="If >0, run Optuna tuning across pairs"),
+    tune_labels: bool = typer.Option(True, help="When tuning, also search labeling params"),
+    sampler: str = typer.Option("tpe", help="tpe|random"),
+    seed: int = typer.Option(42),
+    outdir: str = typer.Option(str(Path(__file__).resolve().parents[2] / "models" / "xgb_stack")),
+    autodownload: bool = typer.Option(True),
+):
+    # Parse pairs
+    plist = [p.strip() for p in str(pairs).split(",") if p.strip()]
+    if not plist:
+        raise ValueError("No pairs provided.")
+
+    # Accumulators per pair (store full features, not trimmed; labels computed per horizon)
+    feats_all: list[pd.DataFrame] = []
+    close_all: list[np.ndarray] = []
+    cols_union: set[str] = set()
+
+    # Common knobs
+    feature_mode_v = _coerce_opt(feature_mode, "full")
+    basic_lookback_v = int(_coerce_opt(basic_lookback, 64))
+    device_v = str(_coerce_opt(device, "auto"))
+    etf = [s.strip() for s in extra_timeframes.split(",") if s.strip()]
+
+    for pr in plist:
+        try:
+            if autodownload:
+                _ = _ensure_dataset(userdir, pr, timeframe, prefer_exchange, timerange)
+                for tf in ["4h", "1d", "1w"]:
+                    try:
+                        _ensure_dataset(userdir, pr, tf, prefer_exchange, timerange)
+                    except Exception:
+                        pass
+            path = _find_data_file(userdir, pr, timeframe, prefer_exchange=prefer_exchange)  # type: ignore
+            if not path:
+                typer.echo(f"WARN: Dataset not found for {pr}. Skipping.")
+                continue
+            raw = _load_ohlcv(path)  # type: ignore
+            raw = _slice_timerange_df(raw, timerange)  # type: ignore
+            feats = make_features(raw, mode=feature_mode_v, basic_lookback=basic_lookback_v, extra_timeframes=(etf or None)).reset_index(drop=True)
+            if str(ae_path).strip():
+                try:
+                    import json as _json
+                    with open(ae_path, "r") as _f:
+                        _man = _json.load(_f)
+                    if bool(_man.get("raw_htf", False)):
+                        ae_df = compute_embeddings_from_raw(raw, ae_manifest_path=str(ae_path), device=str(device_v), out_col_prefix="ae")
+                        ae_df = ae_df.reindex(index=feats.index).fillna(0.0)
+                    else:
+                        ae_df = compute_embeddings(feats, ae_manifest_path=str(ae_path), device=str(device_v), out_col_prefix="ae", window=None)
+                    feats = feats.join(ae_df, how="left")
+                except Exception as e:
+                    typer.echo(f"AE embeddings failed for {pr} (GlobalCycle-Multi), proceeding without: {e}")
+
+            c = feats["close"].astype(float).to_numpy() if "close" in feats.columns else raw["close"].astype(float).to_numpy()
+            feats_all.append(feats)
+            close_all.append(c)
+            cols_union.update(list(feats.columns))
+        except Exception as e:
+            typer.echo(f"WARN: Failed on pair {pr}: {e}")
+            continue
+
+    if not feats_all:
+        raise ValueError("No usable datasets. Check pairs/timeframe/timerange/exchange.")
+
+    # Harmonize columns across pairs (union)
+    union_cols = sorted(list(cols_union))
+
+    def _choose_cut(yb_arr: np.ndarray, yt_arr: np.ndarray, vt: int) -> int:
+        for frac in [0.8, 0.85, 0.9, 0.75, 0.7, 0.65]:
+            cut = int(max(150, min(vt - 50, int(vt * frac))))
+            if cut >= vt - 1:
+                continue
+            yb_va = yb_arr[cut:vt]
+            yt_va = yt_arr[cut:vt]
+            has_bot = (np.sum(yb_va == 1) > 0) and (np.sum(yb_va == 0) > 0)
+            has_top = (np.sum(yt_va == 1) > 0) and (np.sum(yt_va == 0) > 0)
+            if has_bot or has_top:
+                return cut
+        return -1
+
+    def _build_xy(lbl_window: int, lbl_horizon: int, dfrac: float, ufrac: float, beps: float, mp: int, ms: int, smw: int):
+        X_tr_list: list[np.ndarray] = []
+        X_val_list: list[np.ndarray] = []
+        yb_tr_list: list[np.ndarray] = []
+        yb_val_list: list[np.ndarray] = []
+        yt_tr_list: list[np.ndarray] = []
+        yt_val_list: list[np.ndarray] = []
+        used = 0
+        for feats, c in zip(feats_all, close_all):
+            yb_full, yt_full = _label_global_cycle_extrema(
+                c,
+                window=int(lbl_window), horizon=int(lbl_horizon),
+                down_frac=float(dfrac), up_frac=float(ufrac),
+                breakout_eps=float(beps), min_persist=int(mp),
+                min_separation=int(ms), smooth_window=int(smw),
+            )
+            valid = max(0, len(feats) - int(lbl_horizon))
+            if valid < 300:
+                continue
+            X = feats.iloc[:valid, :].reindex(columns=union_cols).fillna(0.0)
+            cut = _choose_cut(yb_full[:valid], yt_full[:valid], valid)
+            if cut < 0:
+                continue
+            X_tr_list.append(X.iloc[:cut, :].values)
+            X_val_list.append(X.iloc[cut:, :].values)
+            yb_tr_list.append(yb_full[:cut])
+            yb_val_list.append(yb_full[cut:valid])
+            yt_tr_list.append(yt_full[:cut])
+            yt_val_list.append(yt_full[cut:valid])
+            used += 1
+        if used == 0:
+            return None
+        return (
+            np.vstack(X_tr_list), np.vstack(X_val_list),
+            np.concatenate(yb_tr_list), np.concatenate(yb_val_list),
+            np.concatenate(yt_tr_list), np.concatenate(yt_val_list),
+        )
+
+    # Tuning
+    best_params: Dict[str, Any] | None = None
+    if int(n_trials) and n_trials > 0:
+        import optuna
+        from optuna.samplers import TPESampler, RandomSampler
+        smp = RandomSampler(seed=int(seed)) if str(sampler).lower() == "random" else TPESampler(seed=int(seed))
+
+        def objective(trial: "optuna.trial.Trial") -> float:
+            params = {
+                "n_estimators": trial.suggest_int("n_estimators", 300, 1200, step=50),
+                "max_depth": trial.suggest_int("max_depth", 3, 10),
+                "min_child_weight": trial.suggest_float("min_child_weight", 0.5, 10.0, log=True),
+                "learning_rate": trial.suggest_float("learning_rate", 1e-3, 0.2, log=True),
+                "subsample": trial.suggest_float("subsample", 0.5, 1.0),
+                "colsample_bytree": trial.suggest_float("colsample_bytree", 0.5, 1.0),
+                "reg_alpha": trial.suggest_float("reg_alpha", 0.0, 1.0),
+                "reg_lambda": trial.suggest_float("reg_lambda", 0.0, 2.0),
+            }
+            if bool(tune_labels):
+                win_t = trial.suggest_int("window", max(8, int(window) - 8), min(60, int(window) + 12))
+                hor_t = trial.suggest_int("horizon", max(50, int(horizon * 0.5)), min(2880, int(horizon * 2)))
+                dfrac_t = trial.suggest_float("down_frac", max(0.10, float(down_frac) - 0.10), min(0.50, float(down_frac) + 0.15))
+                ufrac_t = trial.suggest_float("up_frac", max(0.10, float(up_frac) - 0.10), min(0.50, float(up_frac) + 0.15))
+                beps_t = trial.suggest_float("breakout_eps", 0.003, 0.02)
+                mp_t = trial.suggest_int("min_persist", max(10, int(min_persist) - 10), min(60, int(min_persist) + 20))
+                ms_t = trial.suggest_int("min_separation", max(24, int(min_separation) - 48), min(240, int(min_separation) + 96))
+                sm_t = trial.suggest_int("smooth_window", 0, max(144, int(smooth_window) + 72))
+            else:
+                win_t, hor_t = int(window), int(horizon)
+                dfrac_t, ufrac_t = float(down_frac), float(up_frac)
+                beps_t = float(breakout_eps)
+                mp_t, ms_t, sm_t = int(min_persist), int(min_separation), int(smooth_window)
+
+            built = _build_xy(win_t, hor_t, dfrac_t, ufrac_t, beps_t, mp_t, ms_t, sm_t)
+            if built is None:
+                return float('-inf')
+            Xtr, Xva, ybtr, ybva, yttr, ytva = built
+            bm, m1 = _train_xgb_classifier(
+                Xtr, ybtr, Xva, ybva, device_v,
+                n_estimators=int(params["n_estimators"]), max_depth=int(params["max_depth"]),
+                min_child_weight=float(params["min_child_weight"]), learning_rate=float(params["learning_rate"]),
+                subsample=float(params["subsample"]), colsample_bytree=float(params["colsample_bytree"]),
+                reg_alpha=float(params["reg_alpha"]), reg_lambda=float(params["reg_lambda"]), n_jobs=int(n_jobs),
+                objective="binary:logistic",
+            )
+            tm, m2 = _train_xgb_classifier(
+                Xtr, yttr, Xva, ytva, device_v,
+                n_estimators=int(params["n_estimators"]), max_depth=int(params["max_depth"]),
+                min_child_weight=float(params["min_child_weight"]), learning_rate=float(params["learning_rate"]),
+                subsample=float(params["subsample"]), colsample_bytree=float(params["colsample_bytree"]),
+                reg_alpha=float(params["reg_alpha"]), reg_lambda=float(params["reg_lambda"]), n_jobs=int(n_jobs),
+                objective="binary:logistic",
+            )
+            from sklearn.metrics import average_precision_score as _aps
+            vals: list[float] = []
+            if 0 < int(np.sum(ybva == 1)) < int(ybva.shape[0]):
+                try:
+                    vals.append(float(_aps(ybva, bm.predict_proba(Xva)[:, 1])))
+                except Exception:
+                    pass
+            if 0 < int(np.sum(ytva == 1)) < int(ytva.shape[0]):
+                try:
+                    vals.append(float(_aps(ytva, tm.predict_proba(Xva)[:, 1])))
+                except Exception:
+                    pass
+            if not vals:
+                return float('-inf')
+            return float(np.mean(vals))
+
+        study = optuna.create_study(direction="maximize", sampler=smp)
+        typer.echo(f"Optuna GlobalCycle Multi trials: {n_trials}")
+        study.optimize(objective, n_trials=int(n_trials))
+        best_params = study.best_params
+
+        # If tuned labels, update seeds
+        if bool(tune_labels):
+            window = int(best_params.get("window", window))
+            horizon = int(best_params.get("horizon", horizon))
+            down_frac = float(best_params.get("down_frac", down_frac))
+            up_frac = float(best_params.get("up_frac", up_frac))
+            breakout_eps = float(best_params.get("breakout_eps", breakout_eps))
+            min_persist = int(best_params.get("min_persist", min_persist))
+            min_separation = int(best_params.get("min_separation", min_separation))
+            smooth_window = int(best_params.get("smooth_window", smooth_window))
+
+    # Final build using (possibly tuned) label params
+    built_final = _build_xy(int(window), int(horizon), float(down_frac), float(up_frac), float(breakout_eps), int(min_persist), int(min_separation), int(smooth_window))
+    if built_final is None:
+        raise ValueError("No valid train/val splits across pairs with the given label parameters.")
+    X_tr, X_val, yb_tr, yb_val, yt_tr, yt_val = built_final
+
+    # Final XGB params (either tuned or base)
+    if best_params is None:
+        best_params = dict(
+            n_estimators=int(n_estimators), max_depth=int(max_depth), min_child_weight=float(min_child_weight),
+            learning_rate=float(learning_rate), subsample=float(subsample), colsample_bytree=float(colsample_bytree),
+            reg_alpha=float(reg_alpha), reg_lambda=float(reg_lambda)
+        )
+
+    # Train two classifiers
+    bot_model, _ = _train_xgb_classifier(
+        X_tr, yb_tr, X_val, yb_val, device_v,
+        n_estimators=int(best_params["n_estimators"]),
+        max_depth=int(best_params["max_depth"]),
+        min_child_weight=float(best_params["min_child_weight"]),
+        learning_rate=float(best_params["learning_rate"]),
+        subsample=float(best_params["subsample"]),
+        colsample_bytree=float(best_params["colsample_bytree"]),
+        reg_alpha=float(best_params["reg_alpha"]),
+        reg_lambda=float(best_params["reg_lambda"]),
+        n_jobs=int(n_jobs),
+        objective="binary:logistic",
+    )
+    top_model, _ = _train_xgb_classifier(
+        X_tr, yt_tr, X_val, yt_val, device_v,
+        n_estimators=int(best_params["n_estimators"]),
+        max_depth=int(best_params["max_depth"]),
+        min_child_weight=float(best_params["min_child_weight"]),
+        learning_rate=float(best_params["learning_rate"]),
+        subsample=float(best_params["subsample"]),
+        colsample_bytree=float(best_params["colsample_bytree"]),
+        reg_alpha=float(best_params["reg_alpha"]),
+        reg_lambda=float(best_params["reg_lambda"]),
+        n_jobs=int(n_jobs),
+        objective="binary:logistic",
+    )
+
+    os.makedirs(outdir, exist_ok=True)
+    bot_path = os.path.join(outdir, "best_global_bottom.json")
+    top_path = os.path.join(outdir, "best_global_top.json")
+    bot_model.save_model(_ensure_outdir(bot_path))
+    top_model.save_model(_ensure_outdir(top_path))
+    _save_feature_columns(bot_path, union_cols)
+    _save_feature_columns(top_path, union_cols)
+
+    try:
+        from sklearn.metrics import average_precision_score as _aps
+        p_b = bot_model.predict_proba(X_val)[:, 1]
+        p_t = top_model.predict_proba(X_val)[:, 1]
+        m_bot = {"auprc": float(_aps(yb_val, p_b))}
+        m_top = {"auprc": float(_aps(yt_val, p_t))}
+    except Exception:
+        m_bot = {}
+        m_top = {}
+
+    typer.echo(json.dumps({
+        "bottom": {"path": bot_path, **m_bot},
+        "top": {"path": top_path, **m_top},
+        "pairs": plist,
+        "union_cols": len(union_cols)
+    }, indent=2))
 
