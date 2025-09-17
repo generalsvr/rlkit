@@ -542,6 +542,167 @@ def make_features(
             feats["rlte_price_inside_buy"] = 0.0
             feats["rlte_price_inside_sell"] = 0.0
 
+        # GBM (Black-Scholes-style) probability features using EMA drift and EWMA volatility
+        try:
+            # Log-returns per bar
+            logret = np.diff(np.log(c + 1e-12), prepend=np.log(c[0] + 1e-12))
+            s_lr = pd.Series(logret)
+            # Drift per bar via short EMA of returns (Pine default smoothing=3)
+            mu_ema_3 = s_lr.ewm(span=3, adjust=False).mean().fillna(0.0).to_numpy()
+            # Alternate drift via simple rolling mean (252)
+            mu_sma_252 = s_lr.rolling(252, min_periods=20).mean().fillna(0.0).to_numpy()
+            # Volatility per bar via EWMA variance with alpha_prev=0.94 (i.e., pandas alpha=0.06)
+            ret2 = pd.Series(np.square(logret))
+            ewma_var = ret2.ewm(alpha=(1.0 - 0.94), adjust=False).mean().fillna(0.0).to_numpy()
+            sigma_ewma = np.sqrt(np.maximum(0.0, ewma_var))
+            # Fallback rolling std (252)
+            sigma_roll = s_lr.rolling(252, min_periods=20).std().fillna(0.0).to_numpy()
+            # Choose stable sigma
+            sigma = np.where(sigma_ewma > 0.0, sigma_ewma, sigma_roll)
+            feats["gbm_mu_ema_3"] = mu_ema_3.astype(float)
+            feats["gbm_mu_sma_252"] = mu_sma_252.astype(float)
+            feats["gbm_sigma_ewma_094"] = sigma_ewma.astype(float)
+            feats["gbm_sigma_roll_252"] = sigma_roll.astype(float)
+
+            # Probabilities P(S_T > K) for selected horizons and multipliers
+            horizons = [12, 24, 48]
+            multipliers = [1.01, 1.02, 1.05]
+            for T in horizons:
+                T_f = float(max(1, int(T)))
+                sig_T = sigma * np.sqrt(T_f)
+                mu_T = mu_ema_3  # use EMA drift as default
+                # Upward targets
+                for m in multipliers:
+                    K = c * float(m)
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        z = np.where(sig_T > 0.0,
+                                     (np.log(K / (c + 1e-12)) - (mu_T - 0.5 * np.square(sigma)) * T_f) / (sig_T + 1e-18),
+                                     1e9)
+                    # Normal CDF via erf
+                    z_scaled = z / np.sqrt(2.0)
+                    erf_vals = np.vectorize(np.math.erf)(z_scaled)
+                    cdf = 0.5 * (1.0 + erf_vals)
+                    p_up = 1.0 - cdf
+                    feats[f"gbm_p_up_T{int(T)}_m{str(m).replace('.', '_')}"] = np.clip(p_up, 0.0, 1.0).astype(float)
+                # Downward targets (probability to be above a lower K is trivially ~1; instead model prob to be below K)
+                for dm in [0.99, 0.98]:
+                    Kd = c * float(dm)
+                    with np.errstate(divide='ignore', invalid='ignore'):
+                        z_d = np.where(sig_T > 0.0,
+                                       (np.log(Kd / (c + 1e-12)) - (mu_T - 0.5 * np.square(sigma)) * T_f) / (sig_T + 1e-18),
+                                       1e9)
+                    z_d_scaled = z_d / np.sqrt(2.0)
+                    erf_d_vals = np.vectorize(np.math.erf)(z_d_scaled)
+                    cdf_d = 0.5 * (1.0 + erf_d_vals)
+                    p_below = cdf_d
+                    feats[f"gbm_p_below_T{int(T)}_m{str(dm).replace('.', '_')}"] = np.clip(p_below, 0.0, 1.0).astype(float)
+        except Exception:
+            # Provide zeros if GBM calc fails
+            feats["gbm_mu_ema_3"] = 0.0
+            feats["gbm_mu_sma_252"] = 0.0
+            feats["gbm_sigma_ewma_094"] = 0.0
+            feats["gbm_sigma_roll_252"] = 0.0
+            feats["gbm_p_up_T24_m1_01"] = 0.0
+            feats["gbm_p_up_T24_m1_02"] = 0.0
+            feats["gbm_p_up_T48_m1_02"] = 0.0
+
+        # RLTE Confluence modules (A-D) inspired by Pine: signals as binary features
+        try:
+            # Base series
+            reg = feats["rlte_reg90"].astype(float).to_numpy() if "rlte_reg90" in feats.columns else c.astype(float)
+            rsi_n = feats["rsi"].astype(float).to_numpy() if "rsi" in feats.columns else compute_rsi(c, 14) / 100.0
+            atr_pct = feats["atr"].astype(float).to_numpy() if "atr" in feats.columns else np.zeros_like(c)
+            atr_price = atr_pct * c
+            ema5 = pd.Series(c).ewm(span=5, adjust=False).mean().to_numpy()
+            slope_lr90 = feats["lr_slope_90"].astype(float).to_numpy() if "lr_slope_90" in feats.columns else np.zeros_like(c)
+            # BB on price (30, mult from Pine=1.0 for confluence script)
+            bb_len = 30
+            bb_mult = 1.0
+            bb_mid = pd.Series(c).rolling(bb_len, min_periods=1).mean()
+            bb_std = pd.Series(c).rolling(bb_len, min_periods=1).std().fillna(0.0)
+            bb_u = (bb_mid + bb_mult * bb_std).to_numpy()
+            bb_l = (bb_mid - bb_mult * bb_std).to_numpy()
+            # ATR channel on reg
+            rlU = reg + 1.8 * atr_price
+            rlL = reg - 1.8 * atr_price
+            # Helpers
+            body = np.abs(c - o)
+            lowerW = np.minimum(o, c) - l
+            upperW = h - np.maximum(o, c)
+            bullHammer = (lowerW > 1.5 * body) & (c > o)
+            bearStar = (upperW > 1.5 * body) & (c < o)
+            # Trend gate via SMA200 or slope
+            ma200 = pd.Series(c).rolling(200, min_periods=1).mean().to_numpy()
+            allowBottom = (c > ma200) | (slope_lr90 > 0.0)
+            allowTop = (c < ma200) | (slope_lr90 < 0.0)
+
+            # Cross helpers
+            def _crossover(series: np.ndarray, thr: float) -> np.ndarray:
+                prev = np.concatenate([[series[0]], series[:-1]])
+                return (prev < thr) & (series >= thr)
+            def _crossunder(series: np.ndarray, thr: float) -> np.ndarray:
+                prev = np.concatenate([[series[0]], series[:-1]])
+                return (prev > thr) & (series <= thr)
+
+            # Module A: RL + BB reversal around reg line
+            pocketBuyA = reg < bb_l
+            pocketSellA = reg > bb_u
+            # Use zero-threshold crossover on (close - reg)
+            sigBotA = pocketBuyA & _crossover(c - reg, 0.0)
+            sigTopA = pocketSellA & _crossunder(c - reg, 0.0)
+
+            # Module B: RL + ATR + RSI/EMA5
+            rawBotB = c < rlL
+            rawTopB = c > rlU
+            sigBotB = rawBotB & (( _crossover(rsi_n, 0.30) ) | (_crossover(c - ema5, 0.0))) & (slope_lr90 >= 0.0)
+            sigTopB = rawTopB & (( _crossunder(rsi_n, 0.70) ) | (_crossunder(c - ema5, 0.0))) & (slope_lr90 <= 0.0)
+
+            # Module C: Residual Z-score extremes
+            res = c - reg
+            res_mean = pd.Series(res).rolling(60, min_periods=10).mean().fillna(0.0).to_numpy()
+            res_std = pd.Series(res).rolling(60, min_periods=10).std().replace(0.0, 1e-8).to_numpy()
+            z = (res - res_mean) / res_std
+            sigBotC = (z <= -2.0) & (bullHammer | _crossover(c - ema5, 0.0))
+            sigTopC = (z >=  2.0) & (bearStar   | _crossunder(c - ema5, 0.0))
+
+            # Module D: Donchian exhaustion
+            donLen = 55
+            donLow = pd.Series(l).rolling(donLen, min_periods=10).min().fillna(method='backfill').to_numpy()
+            donHigh = pd.Series(h).rolling(donLen, min_periods=10).max().fillna(method='backfill').to_numpy()
+            sigBotD = (l <= donLow) & (rsi_n < 0.35) & ((c > o) | _crossover(c - ema5, 0.0))
+            sigTopD = (h >= donHigh) & (rsi_n > 0.65) & ((c < o) | _crossunder(c - ema5, 0.0))
+
+            bA = sigBotA & allowBottom
+            bB = sigBotB & allowBottom
+            bC = sigBotC & allowBottom
+            bD = sigBotD & allowBottom
+            tA = sigTopA & allowTop
+            tB = sigTopB & allowTop
+            tC = sigTopC & allowTop
+            tD = sigTopD & allowTop
+
+            feats["confl_bA"] = bA.astype(float)
+            feats["confl_bB"] = bB.astype(float)
+            feats["confl_bC"] = bC.astype(float)
+            feats["confl_bD"] = bD.astype(float)
+            feats["confl_tA"] = tA.astype(float)
+            feats["confl_tB"] = tB.astype(float)
+            feats["confl_tC"] = tC.astype(float)
+            feats["confl_tD"] = tD.astype(float)
+            feats["confl_bot_score"] = (bA.astype(int) + bB.astype(int) + bC.astype(int) + bD.astype(int)).astype(float)
+            feats["confl_top_score"] = (tA.astype(int) + tB.astype(int) + tC.astype(int) + tD.astype(int)).astype(float)
+        except Exception:
+            feats["confl_bA"] = 0.0
+            feats["confl_bB"] = 0.0
+            feats["confl_bC"] = 0.0
+            feats["confl_bD"] = 0.0
+            feats["confl_tA"] = 0.0
+            feats["confl_tB"] = 0.0
+            feats["confl_tC"] = 0.0
+            feats["confl_tD"] = 0.0
+            feats["confl_bot_score"] = 0.0
+            feats["confl_top_score"] = 0.0
+
         # Multi-timeframe moving averages inspired by Pine script (daily/weekly)
         # Compute on resampled closes and forward-fill to align with base index
         if isinstance(base.index, pd.DatetimeIndex):
