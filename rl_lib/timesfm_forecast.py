@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, asdict
+import inspect
 from typing import Dict, List, Optional, Sequence, Tuple, Any
 
 import numpy as np
@@ -111,6 +112,23 @@ def _quantile_labels(levels: Optional[Sequence[float]], count: int) -> List[str]
     labels = ["mean"]
     labels.extend(f"q{i+1}" for i in range(max(0, count - 1)))
     return labels[:count]
+
+
+def _filter_forecast_kwargs(config_cls: Any, kwargs: Dict[str, Any]) -> Tuple[Dict[str, Any], List[str]]:
+    """Drop kwargs not accepted by ForecastConfig for backward compatibility."""
+    try:
+        params = set(inspect.signature(config_cls).parameters.keys())
+    except (TypeError, ValueError):
+        # Fallback: assume everything allowed when signature unavailable
+        return dict(kwargs), []
+    filtered = {}
+    ignored: List[str] = []
+    for key, value in kwargs.items():
+        if key in params:
+            filtered[key] = value
+        else:
+            ignored.append(key)
+    return filtered, ignored
 
 
 def _plot_forecast_windows(
@@ -238,7 +256,8 @@ def run_timesfm_forecast(params: TimesFMForecastParams) -> Dict[str, Any]:
         for k, v in params.compile_flags.items():
             if v is not None:
                 compile_kwargs[k] = v
-    model.compile(timesfm.ForecastConfig(**compile_kwargs))
+    filtered_kwargs, ignored_keys = _filter_forecast_kwargs(timesfm.ForecastConfig, compile_kwargs)
+    model.compile(timesfm.ForecastConfig(**filtered_kwargs))
 
     feats, target_cols = _prepare_features(params)
     time_index = feats.index
@@ -321,6 +340,7 @@ def run_timesfm_forecast(params: TimesFMForecastParams) -> Dict[str, Any]:
     outdir = params.outdir
     preds_path = None
     meta_path = None
+    ignored_map = {k: compile_kwargs[k] for k in ignored_keys} if ignored_keys else {}
     if outdir:
         os.makedirs(outdir, exist_ok=True)
         if params.save_csv and records:
@@ -328,8 +348,11 @@ def run_timesfm_forecast(params: TimesFMForecastParams) -> Dict[str, Any]:
             pd.DataFrame.from_records(records).to_csv(preds_path, index=False)
         if params.save_json:
             meta_path = os.path.join(outdir, "timesfm_summary.json")
+            payload = {"params": asdict(params), "reports": reports}
+            if ignored_map:
+                payload["ignored_compile_kwargs"] = ignored_map
             with open(meta_path, "w") as f:
-                json.dump({"params": asdict(params), "reports": reports}, f, indent=2)
+                json.dump(payload, f, indent=2)
 
     return {
         "params": asdict(params),
@@ -338,4 +361,5 @@ def run_timesfm_forecast(params: TimesFMForecastParams) -> Dict[str, Any]:
         "predictions_path": preds_path,
         "summary_path": meta_path,
         "plot_paths": plot_paths,
+        "ignored_compile_kwargs": ignored_map,
     }
