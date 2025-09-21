@@ -73,6 +73,8 @@ def forecast(
     outdir: Optional[str] = typer.Option(None, help="Directory to persist predictions/summary"),
     save_csv: bool = typer.Option(True),
     save_json: bool = typer.Option(True),
+    make_plots: bool = typer.Option(False, help="Save evaluation plots (requires matplotlib)", show_default=True),
+    plot_windows: int = typer.Option(3, help="Number of most recent windows to plot"),
 ):
     """Run TimesFM 2.5 forecasts over market data slices."""
 
@@ -100,6 +102,8 @@ def forecast(
         outdir=str(outdir) if outdir else None,
         save_csv=bool(save_csv),
         save_json=bool(save_json),
+        make_plots=bool(make_plots),
+        plot_windows=int(plot_windows),
     )
 
     try:

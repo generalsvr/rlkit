@@ -44,6 +44,8 @@ class TimesFMForecastParams:
     outdir: Optional[str] = None
     save_csv: bool = True
     save_json: bool = True
+    make_plots: bool = False
+    plot_windows: int = 3
 
 
 class TimesFMNotAvailableError(RuntimeError):
@@ -109,6 +111,66 @@ def _quantile_labels(levels: Optional[Sequence[float]], count: int) -> List[str]
     labels = ["mean"]
     labels.extend(f"q{i+1}" for i in range(max(0, count - 1)))
     return labels[:count]
+
+
+def _plot_forecast_windows(
+    target: str,
+    series: np.ndarray,
+    time_index: pd.Index,
+    anchors: Sequence[int],
+    context: int,
+    horizon: int,
+    point_arr: np.ndarray,
+    target_arr: np.ndarray,
+    q_arr: Optional[np.ndarray],
+    outdir: str,
+    max_windows: int,
+) -> List[str]:
+    if not anchors:
+        return []
+    try:
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return []
+
+    os.makedirs(outdir, exist_ok=True)
+    limit = max(1, int(max_windows))
+    sel = list(range(max(0, len(anchors) - limit), len(anchors)))
+    saved: List[str] = []
+    for idx in sel:
+        anchor = int(anchors[idx])
+        ctx_start = max(0, anchor - context)
+        ctx_end = anchor
+        fut_end = min(len(series), anchor + horizon)
+        ctx_times = time_index[ctx_start:ctx_end]
+        fut_times = time_index[anchor:fut_end]
+        ctx_vals = series[ctx_start:ctx_end]
+        fut_actual = target_arr[idx][: len(fut_times)]
+        fut_pred = point_arr[idx][: len(fut_times)]
+
+        fig, ax = plt.subplots(figsize=(12, 5))
+        if len(ctx_times) > 0:
+            ax.plot(ctx_times, ctx_vals, color="#7f7f7f", linewidth=1.0, linestyle="--", label="Context")
+        ax.plot(fut_times, fut_actual, color="#1f77b4", linewidth=1.2, label="Actual")
+        ax.plot(fut_times, fut_pred, color="#d62728", linewidth=1.2, label="Prediction")
+
+        if q_arr is not None and q_arr.shape[-1] >= 3:
+            lower = q_arr[idx][: len(fut_times), 1]
+            upper = q_arr[idx][: len(fut_times), -1]
+            ax.fill_between(fut_times, lower, upper, color="#ff9896", alpha=0.3, label="Quantile band")
+
+        ax.set_title(f"TimesFM forecast for {target} (anchor={anchor})")
+        ax.grid(alpha=0.3)
+        ax.legend(loc="best")
+        fname = f"timesfm_{target}_win{idx}_anchor{anchor}.png"
+        fpath = os.path.join(outdir, fname)
+        fig.savefig(fpath, dpi=140, bbox_inches="tight")
+        plt.close(fig)
+        saved.append(fpath)
+    return saved
 
 
 def _compute_metrics(pred: np.ndarray, target: np.ndarray) -> Dict[str, Any]:
@@ -183,6 +245,7 @@ def run_timesfm_forecast(params: TimesFMForecastParams) -> Dict[str, Any]:
 
     reports: Dict[str, Any] = {}
     records: List[Dict[str, Any]] = []
+    plot_paths: Dict[str, List[str]] = {}
     for col in target_cols:
         series = feats[col].astype(float).to_numpy(copy=False)
         contexts, targets, anchors = _build_windows(
@@ -237,6 +300,24 @@ def run_timesfm_forecast(params: TimesFMForecastParams) -> Dict[str, Any]:
                         rec[f"quantile_{label}"] = float(q_arr[row_idx, h_step, q_idx])
                 records.append(rec)
 
+        if params.make_plots and params.outdir:
+            plot_files = _plot_forecast_windows(
+                target=col,
+                series=series,
+                time_index=time_index,
+                anchors=anchors,
+                context=params.context_length,
+                horizon=params.horizon,
+                point_arr=point_arr,
+                target_arr=target_arr,
+                q_arr=q_arr,
+                outdir=params.outdir,
+                max_windows=params.plot_windows,
+            )
+            if plot_files:
+                plot_paths[col] = plot_files
+                reports[col]["plot_paths"] = plot_files
+
     outdir = params.outdir
     preds_path = None
     meta_path = None
@@ -256,4 +337,5 @@ def run_timesfm_forecast(params: TimesFMForecastParams) -> Dict[str, Any]:
         "num_records": len(records),
         "predictions_path": preds_path,
         "summary_path": meta_path,
+        "plot_paths": plot_paths,
     }

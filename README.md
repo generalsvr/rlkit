@@ -413,14 +413,15 @@ freqtrade backtesting \
 - Requires `pip install timesfm==2.5.0` (optional dependency).
 - Generates multi-horizon forecasts and quantiles using Google's TimesFM 2.5 foundation model.
 
-Example:
+Example (forecasts + CSV + plots):
 ```bash
 python timesfm_forecaster.py forecast \
   --pair BTC/USDT --timeframe 1h \
   --timerange 20190101-20240101 \
   --context-length 4096 --horizon 96 --max-windows 320 \
   --quantile-levels 0.1,0.5,0.9 \
-  --outdir freqtrade_userdir/timesfm_eval
+  --outdir freqtrade_userdir/timesfm_eval \
+  --make-plots --plot-windows 5
 ```
 
-Outputs `timesfm_summary.json` (metrics/config) and `timesfm_predictions.csv` (per-horizon forecasts) under the chosen `outdir`.
+Outputs `timesfm_summary.json` (metrics/config) and `timesfm_predictions.csv` (per-horizon forecasts) under the chosen `outdir`, plus per-target PNGs comparing actual vs predicted paths for the most recent windows when `--make-plots` is set.
