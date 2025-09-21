@@ -425,3 +425,5 @@ python timesfm_forecaster.py \
 ```
 
 Outputs `timesfm_summary.json` (metrics/config) and `timesfm_predictions.csv` (per-horizon forecasts) under the chosen `outdir`, plus per-target PNGs comparing actual vs predicted paths for the most recent windows when `--make-plots` is set.
+
+- Missing datasets are fetched automatically with Freqtrade download-data; opt out via `--no-autodownload`.

@@ -72,6 +72,7 @@ def forecast(
     save_json: bool = typer.Option(True),
     make_plots: bool = typer.Option(False, help="Save evaluation plots (requires matplotlib)", show_default=True),
     plot_windows: int = typer.Option(3, help="Number of most recent windows to plot"),
+    autodownload: bool = typer.Option(True, help="Fetch missing OHLCV via freqtrade download-data"),
 ):
     """Run TimesFM 2.5 forecasts over market data slices."""
 
@@ -101,6 +102,7 @@ def forecast(
         save_json=bool(save_json),
         make_plots=bool(make_plots),
         plot_windows=int(plot_windows),
+        autodownload=bool(autodownload),
     )
 
     try:

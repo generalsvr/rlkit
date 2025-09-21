@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from dataclasses import dataclass, asdict
 import inspect
 from typing import Dict, List, Optional, Sequence, Tuple, Any
@@ -47,6 +48,7 @@ class TimesFMForecastParams:
     save_json: bool = True
     make_plots: bool = False
     plot_windows: int = 3
+    autodownload: bool = True
 
 
 class TimesFMNotAvailableError(RuntimeError):
@@ -213,7 +215,7 @@ def _compute_metrics(pred: np.ndarray, target: np.ndarray) -> Dict[str, Any]:
 
 
 def _prepare_features(params: TimesFMForecastParams) -> Tuple[pd.DataFrame, List[str]]:
-    path = _find_data_file(params.userdir, params.pair, params.timeframe, prefer_exchange=params.prefer_exchange)
+    path = _ensure_dataset(params)
     if not path:
         raise FileNotFoundError(
             f"No dataset found for {params.pair} {params.timeframe} within {params.userdir}/data"
@@ -233,6 +235,50 @@ def _prepare_features(params: TimesFMForecastParams) -> Tuple[pd.DataFrame, List
         if col not in feats.columns:
             raise ValueError(f"Target column '{col}' not present in feature dataframe.")
     return feats, target_cols
+
+
+def _ensure_dataset(params: TimesFMForecastParams) -> Optional[str]:
+    path = _find_data_file(params.userdir, params.pair, params.timeframe, prefer_exchange=params.prefer_exchange)
+    if path and os.path.exists(path):
+        return path
+    if not params.autodownload:
+        return path
+
+    exchange = params.prefer_exchange or "bybit"
+    timerange = params.timerange or "20190101-"
+    userdir = params.userdir
+    pair = params.pair
+    timeframe = params.timeframe
+
+    os.makedirs(userdir, exist_ok=True)
+    variants = [pair]
+    up = pair.upper()
+    if ":" not in pair and (up.endswith("/USDT") or up.endswith("_USDT")):
+        variants.append(f"{pair}:USDT")
+
+    last_err: Optional[Exception] = None
+    for pv in variants:
+        cmd = [
+            "freqtrade", "download-data",
+            "--pairs", pv,
+            "--timeframes", timeframe,
+            "--userdir", userdir,
+            "--timerange", timerange,
+            "--exchange", exchange,
+            "--data-format-ohlcv", "parquet",
+        ]
+        try:
+            print(f"[TimesFM] Downloading dataset via Freqtrade: {' '.join(cmd)}")
+            subprocess.run(cmd, check=True)
+        except Exception as exc:
+            last_err = exc
+        found = _find_data_file(userdir, pv, timeframe, prefer_exchange=exchange)
+        if found and os.path.exists(found):
+            return found
+
+    if last_err is not None:
+        print(f"[TimesFM] Dataset download attempts failed for variants {variants}: {last_err}")
+    return _find_data_file(userdir, pair, timeframe, prefer_exchange=exchange)
 
 
 def run_timesfm_forecast(params: TimesFMForecastParams) -> Dict[str, Any]:
