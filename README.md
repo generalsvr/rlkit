@@ -7,7 +7,7 @@ pip install -r requirements.txt
 pip install -r requirements.extra.txt
 pip install freqtrade
 
-apt update && apt install build-essential wget && cd /tmp && wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && tar -xzf ta-lib-0.4.0-src.tar.gz && cd ta-lib/ && ./configure --prefix=/usr && make && make install && ldconfig && cd /workspace && git clone https://github.com/generalsvr/rlkit && cd rlkit && pip install stable-baselines3[extra] && pip install -r requirements.txt
+apt update && apt install build-essential wget && cd /tmp && wget http://prdownloads.sourceforge.net/ta-lib/ta-lib-0.4.0-src.tar.gz && tar -xzf ta-lib-0.4.0-src.tar.gz && cd ta-lib/ && ./configure --prefix=/usr && make && make install && ldconfig && cd /workspace && git clone https://github.com/generalsvr/rlkit && cd rlkit && pip install stable-baselines3[extra] && pip install -r requirements.txt && git clone https://github.com/google-research/timesfm.git && cd timesfm && pip install -e . && cd ..
 ```
 
 ### Futures Mode (USDT-M, offline OHLCV)
@@ -408,3 +408,19 @@ freqtrade backtesting \
 - **CPU runs**: set `--device cpu`
 - **XGB charts not generating**: ensure matplotlib is installed (`pip install matplotlib`)
 
+
+### TimesFM 2.5 Forecasting (experimental)
+- Requires `pip install timesfm==2.5.0` (optional dependency).
+- Generates multi-horizon forecasts and quantiles using Google's TimesFM 2.5 foundation model.
+
+Example:
+```bash
+python timesfm_forecaster.py forecast \
+  --pair BTC/USDT --timeframe 1h \
+  --timerange 20190101-20240101 \
+  --context-length 4096 --horizon 96 --max-windows 320 \
+  --quantile-levels 0.1,0.5,0.9 \
+  --outdir freqtrade_userdir/timesfm_eval
+```
+
+Outputs `timesfm_summary.json` (metrics/config) and `timesfm_predictions.csv` (per-horizon forecasts) under the chosen `outdir`.
