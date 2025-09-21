@@ -427,3 +427,27 @@ python timesfm_forecaster.py \
 Outputs `timesfm_summary.json` (metrics/config) and `timesfm_predictions.csv` (per-horizon forecasts) under the chosen `outdir`, plus per-target PNGs comparing actual vs predicted paths for the most recent windows when `--make-plots` is set.
 
 - Missing datasets are fetched automatically with Freqtrade download-data; opt out via `--no-autodownload`.
+
+### Residual Calibrator (bias correction)
+- Train a lightweight linear residual model on the forecast errors to debias TimesFM predictions:
+```bash
+python timesfm_calibrator.py \
+  --pair BTC/USDT --timeframe 1h \
+  --timerange 20170101-20230101 \
+  --context-length 4096 --horizon 96 --max-windows 320 \
+  --train-ratio 0.75 --alpha 10.0 \
+  --model-out models/timesfm_calibrator.json \
+  --outdir freqtrade_userdir/timesfm_calib
+```
+
+- Apply the saved calibrator during inference:
+```bash
+python timesfm_forecaster.py \
+  --pair BTC/USDT --timeframe 1h \
+  --timerange 20230101-20240101 \
+  --context-length 4096 --horizon 96 --max-windows 320 \
+  --outdir freqtrade_userdir/timesfm_eval \
+  --calibrator-path models/timesfm_calibrator.json
+```
+
+The calibrator shifts each horizon's prediction using a ridge-style linear model fitted on the feature set at the forecast anchor. Validation diagnostics (base vs calibrated metrics, CSVs) are written under the chosen `outdir` when training.

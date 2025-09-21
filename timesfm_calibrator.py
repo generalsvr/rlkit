@@ -8,9 +8,9 @@ import sys
 import typer
 
 from rl_lib.timesfm_forecast import (
-    TimesFMForecastParams,
+    ResidualCalibratorParams,
     TimesFMNotAvailableError,
-    run_timesfm_forecast,
+    train_residual_calibrator,
 )
 
 
@@ -46,7 +46,7 @@ def _load_json_flags(payload: Optional[str]) -> Optional[dict]:
         raise typer.BadParameter(f"Failed to parse JSON compile flags: {exc}") from exc
 
 
-def forecast(
+def train(
     pair: str = typer.Option("BTC/USDT"),
     timeframe: str = typer.Option("1h"),
     userdir: str = typer.Option(str(Path(__file__).resolve().parent / "freqtrade_userdir")),
@@ -61,23 +61,24 @@ def forecast(
     stride: int = typer.Option(1),
     max_windows: int = typer.Option(256),
     normalize_inputs: bool = typer.Option(True),
-    use_quantile_head: bool = typer.Option(True, help="Enable continuous quantile head"),
+    use_quantile_head: bool = typer.Option(True),
     force_flip_invariance: bool = typer.Option(True),
     infer_is_positive: bool = typer.Option(True),
     fix_quantile_crossing: bool = typer.Option(True),
     quantile_levels: Optional[str] = typer.Option(None, help="Comma separated quantile levels e.g. 0.1,0.5,0.9"),
     compile_flags: Optional[str] = typer.Option(None, help="Additional ForecastConfig kwargs as JSON string"),
-    outdir: Optional[str] = typer.Option(None, help="Directory to persist predictions/summary"),
-    save_csv: bool = typer.Option(True),
-    save_json: bool = typer.Option(True),
-    make_plots: bool = typer.Option(False, help="Save evaluation plots (requires matplotlib)", show_default=True),
-    plot_windows: int = typer.Option(3, help="Number of most recent windows to plot"),
+    outdir: Optional[str] = typer.Option(None, help="Directory to persist validation CSV diagnostics"),
     autodownload: bool = typer.Option(True, help="Fetch missing OHLCV via freqtrade download-data"),
-    calibrator_path: Optional[str] = typer.Option(None, help="Apply residual calibrator bundle to forecasts"),
+    calibrator_features: Optional[str] = typer.Option(None, help="Optional subset of feature columns for calibrator"),
+    train_ratio: float = typer.Option(0.7, help="Fraction of samples for training (rest for validation)"),
+    alpha: float = typer.Option(1.0, help="L2 regularization strength for residual model"),
+    model_out: str = typer.Option(str(Path(__file__).resolve().parent / "models" / "timesfm_calibrator.json")),
+    save_val_csv: bool = typer.Option(True, help="Write validation residual diagnostics CSV"),
 ):
-    """Run TimesFM 2.5 forecasts over market data slices."""
+    if not (0.0 < train_ratio <= 1.0):
+        raise typer.BadParameter("train-ratio must be in (0, 1].")
 
-    params = TimesFMForecastParams(
+    params = ResidualCalibratorParams(
         userdir=str(userdir),
         pair=str(pair),
         timeframe=str(timeframe),
@@ -99,16 +100,16 @@ def forecast(
         quantile_levels=_csv_to_float_list(quantile_levels),
         compile_flags=_load_json_flags(compile_flags),
         outdir=str(outdir) if outdir else None,
-        save_csv=bool(save_csv),
-        save_json=bool(save_json),
-        make_plots=bool(make_plots),
-        plot_windows=int(plot_windows),
         autodownload=bool(autodownload),
-        calibrator_path=str(calibrator_path) if calibrator_path else None,
+        train_ratio=float(train_ratio),
+        alpha=float(alpha),
+        model_out_path=str(model_out),
+        calibrator_feature_columns=_csv_to_list(calibrator_features),
+        save_val_csv=bool(save_val_csv),
     )
 
     try:
-        report = run_timesfm_forecast(params)
+        report = train_residual_calibrator(params)
     except TimesFMNotAvailableError as exc:
         typer.secho(str(exc), fg=typer.colors.RED)
         raise typer.Exit(code=1)
@@ -116,6 +117,6 @@ def forecast(
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "forecast":
+    if len(sys.argv) > 1 and sys.argv[1] == "train":
         sys.argv.pop(1)
-    typer.run(forecast)
+    typer.run(train)
