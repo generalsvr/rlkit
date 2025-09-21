@@ -415,7 +415,7 @@ freqtrade backtesting \
 
 Example (forecasts + CSV + plots):
 ```bash
-python timesfm_forecaster.py forecast \
+python timesfm_forecaster.py \
   --pair BTC/USDT --timeframe 1h \
   --timerange 20190101-20240101 \
   --context-length 4096 --horizon 96 --max-windows 320 \

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from typing import List, Optional
+import sys
 
 import typer
 
@@ -11,9 +12,6 @@ from rl_lib.timesfm_forecast import (
     TimesFMNotAvailableError,
     run_timesfm_forecast,
 )
-
-
-app = typer.Typer(add_completion=False)
 
 
 def _csv_to_list(text: Optional[str]) -> Optional[List[str]]:
@@ -48,7 +46,6 @@ def _load_json_flags(payload: Optional[str]) -> Optional[dict]:
         raise typer.BadParameter(f"Failed to parse JSON compile flags: {exc}") from exc
 
 
-@app.command()
 def forecast(
     pair: str = typer.Option("BTC/USDT"),
     timeframe: str = typer.Option("1h"),
@@ -115,4 +112,6 @@ def forecast(
 
 
 if __name__ == "__main__":
-    app()
+    if len(sys.argv) > 1 and sys.argv[1] == "forecast":
+        sys.argv.pop(1)
+    typer.run(forecast)
